@@ -22,6 +22,12 @@ type Query struct {
 	Season   int
 	Episode  int
 	Language language.Tag
+
+	// Path is the video file's filesystem path. Providers that derive their
+	// own hash or lookup key from the video's actual bytes (e.g.
+	// OpenSubtitles' moviehash — see CONTEXT.md's Provider entry) read it
+	// directly from this path; Providers with no such need may ignore it.
+	Path string
 }
 
 // Provider is an external subtitle source Sublime can query for Candidates
