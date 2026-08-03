@@ -1,0 +1,103 @@
+// Package config loads and validates Sublime's declarative config file
+// (`/config/config.yaml` in production), and reads Provider secrets from
+// their designated environment variables.
+package config
+
+import (
+	"bytes"
+	"fmt"
+	"os"
+
+	"golang.org/x/text/language"
+	"gopkg.in/yaml.v3"
+
+	"github.com/aaronkyriesenbach/sublime/internal/domain"
+)
+
+// Config is Sublime's validated, in-memory configuration.
+type Config struct {
+	Libraries []domain.Library
+}
+
+// rawConfig mirrors config.yaml's on-disk shape before validation and
+// conversion into domain types. KnownFields decoding on this struct is what
+// rejects a stray `providers:` section: Provider secrets come from env vars
+// only (see ProviderSecrets), never the config file.
+type rawConfig struct {
+	Libraries []rawLibrary `yaml:"libraries"`
+}
+
+type rawLibrary struct {
+	Name      string   `yaml:"name"`
+	Path      string   `yaml:"path"`
+	Languages []string `yaml:"languages"`
+}
+
+// Load reads, parses, and validates the config file at path.
+func Load(path string) (*Config, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("reading config file %q: %w", path, err)
+	}
+
+	var raw rawConfig
+	dec := yaml.NewDecoder(bytes.NewReader(data))
+	dec.KnownFields(true)
+	if err := dec.Decode(&raw); err != nil {
+		return nil, fmt.Errorf("parsing config file %q: %w", path, err)
+	}
+
+	return fromRaw(raw)
+}
+
+func fromRaw(raw rawConfig) (*Config, error) {
+	if len(raw.Libraries) == 0 {
+		return nil, fmt.Errorf("config must define at least one library")
+	}
+
+	seenNames := make(map[string]struct{}, len(raw.Libraries))
+	libraries := make([]domain.Library, 0, len(raw.Libraries))
+
+	for i, rl := range raw.Libraries {
+		lib, err := libraryFromRaw(rl)
+		if err != nil {
+			return nil, fmt.Errorf("library at index %d: %w", i, err)
+		}
+
+		if _, exists := seenNames[lib.Name]; exists {
+			return nil, fmt.Errorf("duplicate library name %q", lib.Name)
+		}
+		seenNames[lib.Name] = struct{}{}
+
+		libraries = append(libraries, lib)
+	}
+
+	return &Config{Libraries: libraries}, nil
+}
+
+func libraryFromRaw(rl rawLibrary) (domain.Library, error) {
+	if rl.Name == "" {
+		return domain.Library{}, fmt.Errorf("missing required field %q", "name")
+	}
+	if rl.Path == "" {
+		return domain.Library{}, fmt.Errorf("missing required field %q", "path")
+	}
+	if len(rl.Languages) == 0 {
+		return domain.Library{}, fmt.Errorf("library %q: must list at least one language", rl.Name)
+	}
+
+	languages := make([]language.Tag, 0, len(rl.Languages))
+	for _, tag := range rl.Languages {
+		parsed, err := language.Parse(tag)
+		if err != nil {
+			return domain.Library{}, fmt.Errorf("library %q: invalid BCP 47 language tag %q: %w", rl.Name, tag, err)
+		}
+		languages = append(languages, parsed)
+	}
+
+	return domain.Library{
+		Name:      rl.Name,
+		Path:      rl.Path,
+		Languages: languages,
+	}, nil
+}
