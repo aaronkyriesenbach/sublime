@@ -8,6 +8,11 @@ import (
 
 const defaultConfigPath = "/config/config.yaml"
 
+// defaultAPIAddr is the base URL CLI thin-client subcommands (status,
+// reprocess, libraries) talk to when --api isn't given: the default
+// address `serve` binds to.
+const defaultAPIAddr = "http://localhost:8080"
+
 // NewRootCommand builds Sublime's root cobra command with all subcommands
 // attached.
 func NewRootCommand() *cobra.Command {
@@ -20,7 +25,13 @@ func NewRootCommand() *cobra.Command {
 	var configPath string
 	root.PersistentFlags().StringVar(&configPath, "config", defaultConfigPath, "path to config.yaml")
 
-	root.AddCommand(newLibrariesCommand(&configPath))
+	var apiAddr string
+	root.PersistentFlags().StringVar(&apiAddr, "api", defaultAPIAddr, "base URL of a running sublime serve daemon's HTTP API")
+
+	root.AddCommand(newLibrariesCommand(&apiAddr))
+	root.AddCommand(newStatusCommand(&apiAddr))
+	root.AddCommand(newReprocessCommand(&apiAddr))
+	root.AddCommand(newServeCommand(&configPath))
 
 	return root
 }
