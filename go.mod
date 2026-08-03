@@ -3,6 +3,7 @@ module github.com/aaronkyriesenbach/sublime
 go 1.26.5
 
 require (
+	github.com/cespare/xxhash/v2 v2.3.0
 	github.com/spf13/cobra v1.10.2
 	golang.org/x/text v0.40.0
 	gopkg.in/yaml.v3 v3.0.1
