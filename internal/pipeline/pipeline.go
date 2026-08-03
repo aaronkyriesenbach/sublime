@@ -77,6 +77,22 @@ const (
 	outcomeFailed
 )
 
+// RunOption configures how Run or RunFile process files.
+type RunOption func(*runConfig)
+
+type runConfig struct {
+	force bool
+}
+
+// WithForce bypasses the Marker+Content-Hash gate so every (file, language)
+// pair is searched, downloaded, synced, and stripped again regardless of
+// prior state. Used for manual reprocessing; normal scans and
+// watch-triggered runs should leave it unset so already-synced files are
+// skipped.
+func WithForce() RunOption {
+	return func(c *runConfig) { c.force = true }
+}
+
 // Result summarizes what the pipeline did for one Library run.
 type Result struct {
 	// FilesScanned is the total number of video files found in the Library.
@@ -104,10 +120,26 @@ type Result struct {
 // Run processes every video file in lib, syncing subtitles for each of
 // lib.Languages. It returns after all files have been processed (or ctx is
 // cancelled).
-func (p *Pipeline) Run(ctx context.Context, lib domain.Library) (Result, error) {
+func (p *Pipeline) Run(ctx context.Context, lib domain.Library, opts ...RunOption) (Result, error) {
 	videos, err := p.scanLibrary(lib.Path)
 	if err != nil {
 		return Result{}, fmt.Errorf("pipeline: scanning library %q: %w", lib.Name, err)
+	}
+	return p.runFiles(ctx, lib, videos, opts...)
+}
+
+// RunFile processes a single video file within lib for each of
+// lib.Languages, without scanning the rest of the Library. It's the
+// entrypoint triggers use for fsnotify watch events and single-file manual
+// reprocessing, where a full Library scan would be wasteful.
+func (p *Pipeline) RunFile(ctx context.Context, lib domain.Library, videoPath string, opts ...RunOption) (Result, error) {
+	return p.runFiles(ctx, lib, []string{videoPath}, opts...)
+}
+
+func (p *Pipeline) runFiles(ctx context.Context, lib domain.Library, videos []string, opts ...RunOption) (Result, error) {
+	var cfg runConfig
+	for _, opt := range opts {
+		opt(&cfg)
 	}
 
 	result := Result{
@@ -162,7 +194,7 @@ func (p *Pipeline) Run(ctx context.Context, lib domain.Library) (Result, error) 
 				default:
 				}
 
-				result, syncErr := p.processFile(ctx, lib, j.videoPath, j.lang)
+				result, syncErr := p.processFile(ctx, lib, j.videoPath, j.lang, cfg.force)
 				outcomes <- outcome{
 					key:     fmt.Sprintf("%s:%s", j.videoPath, j.lang),
 					outcome: result,
@@ -196,6 +228,12 @@ func (p *Pipeline) Run(ctx context.Context, lib domain.Library) (Result, error) 
 	return result, nil
 }
 
+// IsVideoFile reports whether path has a file extension the pipeline
+// recognizes as a video file.
+func IsVideoFile(path string) bool {
+	return videoExtensions[strings.ToLower(filepath.Ext(path))]
+}
+
 // scanLibrary walks lib.Path and returns the absolute paths of all video
 // files found.
 func (p *Pipeline) scanLibrary(root string) ([]string, error) {
@@ -207,8 +245,7 @@ func (p *Pipeline) scanLibrary(root string) ([]string, error) {
 		if d.IsDir() {
 			return nil
 		}
-		ext := strings.ToLower(filepath.Ext(path))
-		if videoExtensions[ext] {
+		if IsVideoFile(path) {
 			videos = append(videos, path)
 		}
 		return nil
@@ -226,6 +263,7 @@ func (p *Pipeline) processFile(
 	lib domain.Library,
 	videoPath string,
 	lang language.Tag,
+	force bool,
 ) (processOutcome, error) {
 	hash, err := media.ComputeContentHash(videoPath)
 	if err != nil {
@@ -244,15 +282,17 @@ func (p *Pipeline) processFile(
 	dir := filepath.Dir(videoPath)
 	stem := strings.TrimSuffix(filepath.Base(videoPath), filepath.Ext(videoPath))
 
-	needsFetch, err := strip.NeedsFetch(dir, stem, lang, hash)
-	if err != nil {
-		return outcomeFailed, fmt.Errorf("checking marker gate: %w", err)
-	}
-	if !needsFetch {
-		if err := p.Store.MarkSynced(ctx, file.ID, lang); err != nil {
-			return outcomeFailed, fmt.Errorf("marking already-synced file: %w", err)
+	if !force {
+		needsFetch, err := strip.NeedsFetch(dir, stem, lang, hash)
+		if err != nil {
+			return outcomeFailed, fmt.Errorf("checking marker gate: %w", err)
 		}
-		return outcomeSkipped, nil
+		if !needsFetch {
+			if err := p.Store.MarkSynced(ctx, file.ID, lang); err != nil {
+				return outcomeFailed, fmt.Errorf("marking already-synced file: %w", err)
+			}
+			return outcomeSkipped, nil
+		}
 	}
 
 	candidates, err := p.Provider.Search(ctx, queryFromPath(videoPath, lang))
