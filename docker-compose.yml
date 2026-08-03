@@ -1,0 +1,16 @@
+services:
+  sublime:
+    build: .
+    # image: ghcr.io/aaronkyriesenbach/sublime:latest
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./config.yaml:/config/config.yaml:ro
+      - ./data:/data
+      - /path/to/movies:/media/movies
+      - /path/to/tv:/media/tv
+    environment:
+      SUBLIME_OPENSUBTITLES_API_KEY: ${SUBLIME_OPENSUBTITLES_API_KEY}
+      SUBLIME_OPENSUBTITLES_USERNAME: ${SUBLIME_OPENSUBTITLES_USERNAME}
+      SUBLIME_OPENSUBTITLES_PASSWORD: ${SUBLIME_OPENSUBTITLES_PASSWORD}
+    restart: unless-stopped

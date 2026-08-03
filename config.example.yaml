@@ -1,0 +1,17 @@
+# Example Sublime config. Mount this (or your own copy) at /config/config.yaml.
+# See CONTEXT.md for the full domain vocabulary (Library, Strip, etc.).
+
+libraries:
+  - name: movies
+    path: /media/movies
+    languages: [en]
+    # strip_scope: all   # default; "per_language" strips only Sublime-managed languages
+
+  - name: tv
+    path: /media/tv
+    languages: [en, pt-BR]
+
+# Provider secrets are never set here — pass them as environment variables:
+#   SUBLIME_OPENSUBTITLES_API_KEY
+#   SUBLIME_OPENSUBTITLES_USERNAME
+#   SUBLIME_OPENSUBTITLES_PASSWORD
