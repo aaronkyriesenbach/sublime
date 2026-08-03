@@ -28,9 +28,10 @@ type rawConfig struct {
 }
 
 type rawLibrary struct {
-	Name      string   `yaml:"name"`
-	Path      string   `yaml:"path"`
-	Languages []string `yaml:"languages"`
+	Name       string   `yaml:"name"`
+	Path       string   `yaml:"path"`
+	Languages  []string `yaml:"languages"`
+	StripScope string   `yaml:"strip_scope"`
 }
 
 // Load reads, parses, and validates the config file at path.
@@ -95,9 +96,32 @@ func libraryFromRaw(rl rawLibrary) (domain.Library, error) {
 		languages = append(languages, parsed)
 	}
 
+	stripScope, err := stripScopeFromRaw(rl.Name, rl.StripScope)
+	if err != nil {
+		return domain.Library{}, err
+	}
+
 	return domain.Library{
-		Name:      rl.Name,
-		Path:      rl.Path,
-		Languages: languages,
+		Name:       rl.Name,
+		Path:       rl.Path,
+		Languages:  languages,
+		StripScope: stripScope,
 	}, nil
+}
+
+// stripScopeFromRaw defaults an empty strip_scope to domain.StripScopeAll and
+// rejects anything other than the two recognized values.
+func stripScopeFromRaw(libraryName, raw string) (domain.StripScope, error) {
+	if raw == "" {
+		return domain.StripScopeAll, nil
+	}
+
+	scope := domain.StripScope(raw)
+	switch scope {
+	case domain.StripScopeAll, domain.StripScopePerLanguage:
+		return scope, nil
+	default:
+		return "", fmt.Errorf("library %q: invalid strip_scope %q (must be %q or %q)",
+			libraryName, raw, domain.StripScopeAll, domain.StripScopePerLanguage)
+	}
 }

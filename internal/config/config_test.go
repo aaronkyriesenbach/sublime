@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/aaronkyriesenbach/sublime/internal/config"
+	"github.com/aaronkyriesenbach/sublime/internal/domain"
 )
 
 func writeConfig(t *testing.T, contents string) string {
@@ -172,5 +173,57 @@ func TestLoad_NoLibraries(t *testing.T) {
 	_, err := config.Load(path)
 	if err == nil {
 		t.Fatal("expected an error for an empty libraries list, got nil")
+	}
+}
+
+func TestLoad_StripScopeDefaultsToAll(t *testing.T) {
+	path := writeConfig(t, `
+libraries:
+  - name: movies
+    path: /media/movies
+    languages: [en]
+`)
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+
+	if got := cfg.Libraries[0].StripScope; got != domain.StripScopeAll {
+		t.Errorf("expected default strip_scope %q, got %q", domain.StripScopeAll, got)
+	}
+}
+
+func TestLoad_StripScopePerLanguage(t *testing.T) {
+	path := writeConfig(t, `
+libraries:
+  - name: movies
+    path: /media/movies
+    languages: [en]
+    strip_scope: per_language
+`)
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+
+	if got := cfg.Libraries[0].StripScope; got != domain.StripScopePerLanguage {
+		t.Errorf("expected strip_scope %q, got %q", domain.StripScopePerLanguage, got)
+	}
+}
+
+func TestLoad_InvalidStripScope(t *testing.T) {
+	path := writeConfig(t, `
+libraries:
+  - name: movies
+    path: /media/movies
+    languages: [en]
+    strip_scope: everything
+`)
+
+	_, err := config.Load(path)
+	if err == nil {
+		t.Fatal("expected an error for an invalid strip_scope, got nil")
 	}
 }
