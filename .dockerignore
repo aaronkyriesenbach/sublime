@@ -1,0 +1,24 @@
+# Version control and CI/editor metadata — irrelevant to the build.
+.git/
+.github/
+
+# Documentation and process files — not needed inside the image.
+docs/
+*.md
+
+# Test fixtures and Go test artifacts — not needed for the production
+# binary; keeps the build context small and avoids invalidating layer
+# caches on unrelated fixture changes.
+testdata/
+*.test
+*.out
+
+# Local build output, if any exists on the host.
+/sublime
+/bin/
+
+# Editor/OS cruft.
+.vscode/
+.idea/
+*.swp
+.DS_Store
