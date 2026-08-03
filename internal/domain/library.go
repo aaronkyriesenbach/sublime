@@ -23,4 +23,25 @@ type Library struct {
 	// IETF BCP 47 tags. Provider-agnostic: each Provider adapter is
 	// responsible for translating a tag into whatever its own API expects.
 	Languages []language.Tag
+
+	// StripScope controls how much of a file's existing (non-Sublime)
+	// subtitles a Strip pass removes for this Library. See CONTEXT.md's
+	// "Strip" entry.
+	StripScope StripScope
 }
+
+// StripScope controls how much of a file's existing subtitles a Strip pass
+// removes.
+type StripScope string
+
+const (
+	// StripScopeAll removes every non-Sublime embedded stream and
+	// non-Sublime sidecar for the file, regardless of language. This is
+	// the default when a Library doesn't set StripScope explicitly.
+	StripScopeAll StripScope = "all"
+
+	// StripScopePerLanguage only touches the embedded stream(s)/sidecar(s)
+	// for the language currently being fetched; other-language subtitles
+	// are left alone.
+	StripScopePerLanguage StripScope = "per_language"
+)
