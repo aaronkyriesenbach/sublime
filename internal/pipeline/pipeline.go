@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -45,6 +46,19 @@ type Pipeline struct {
 	// WorkerCount is the number of concurrent workers for CPU/IO-bound
 	// operations. Zero means runtime.NumCPU().
 	WorkerCount int
+
+	// Logger receives per-file outcome logging (failures and no-candidate
+	// terminal states) as Run/RunFile process a Library. Defaults to
+	// slog.Default() if nil.
+	Logger *slog.Logger
+}
+
+// logger returns p.Logger, or slog.Default() if it isn't set.
+func (p *Pipeline) logger() *slog.Logger {
+	if p.Logger != nil {
+		return p.Logger
+	}
+	return slog.Default()
 }
 
 // Stripper is the subset of strip.FFStripper the pipeline needs, extracted
@@ -170,9 +184,10 @@ func (p *Pipeline) runFiles(ctx context.Context, lib domain.Library, videos []st
 	close(jobs)
 
 	type outcome struct {
-		key     string
-		outcome processOutcome
-		err     error
+		videoPath string
+		lang      language.Tag
+		outcome   processOutcome
+		err       error
 	}
 
 	outcomes := make(chan outcome, cap(jobs))
@@ -186,19 +201,21 @@ func (p *Pipeline) runFiles(ctx context.Context, lib domain.Library, videos []st
 				select {
 				case <-ctx.Done():
 					outcomes <- outcome{
-						key:     fmt.Sprintf("%s:%s", j.videoPath, j.lang),
-						outcome: outcomeFailed,
-						err:     ctx.Err(),
+						videoPath: j.videoPath,
+						lang:      j.lang,
+						outcome:   outcomeFailed,
+						err:       ctx.Err(),
 					}
 					continue
 				default:
 				}
 
-				result, syncErr := p.processFile(ctx, lib, j.videoPath, j.lang, cfg.force)
+				res, syncErr := p.processFile(ctx, lib, j.videoPath, j.lang, cfg.force)
 				outcomes <- outcome{
-					key:     fmt.Sprintf("%s:%s", j.videoPath, j.lang),
-					outcome: result,
-					err:     syncErr,
+					videoPath: j.videoPath,
+					lang:      j.lang,
+					outcome:   res,
+					err:       syncErr,
 				}
 			}
 		}()
@@ -214,14 +231,18 @@ func (p *Pipeline) runFiles(ctx context.Context, lib domain.Library, videos []st
 		case outcomeFailed:
 			result.Failed++
 			if o.err != nil {
-				result.Errors[o.key] = o.err
+				result.Errors[fmt.Sprintf("%s:%s", o.videoPath, o.lang)] = o.err
 			}
+			p.logger().Error("subtitle sync failed",
+				"library", lib.Name, "path", o.videoPath, "language", o.lang.String(), "error", o.err)
 		case outcomeSkipped:
 			result.Skipped++
 		case outcomeSynced:
 			result.Synced++
 		case outcomeTerminal:
 			result.NoCandidate++
+			p.logger().Warn("no candidate cleared the scoring cutoff",
+				"library", lib.Name, "path", o.videoPath, "language", o.lang.String())
 		}
 	}
 
@@ -295,7 +316,13 @@ func (p *Pipeline) processFile(
 		}
 	}
 
-	candidates, err := p.Provider.Search(ctx, queryFromPath(videoPath, lang))
+	query, queryErr := queryFromPath(videoPath, lang)
+	if queryErr != nil {
+		p.logger().Warn("filename metadata unparseable; falling back to hash-only search",
+			"library", lib.Name, "path", videoPath, "language", lang.String(), "error", queryErr)
+	}
+
+	candidates, err := p.Provider.Search(ctx, query)
 	if err != nil {
 		if markErr := p.Store.MarkFailed(ctx, file.ID, lang, domain.FailureRetrievalFailed); markErr != nil {
 			return outcomeFailed, errors.Join(err, markErr)
@@ -397,11 +424,14 @@ func (p *Pipeline) syncSubtitle(ctx context.Context, videoPath string, candidate
 	return syncedContent, nil
 }
 
-// queryFromPath builds a provider.Query from a video's path and target language.
-func queryFromPath(videoPath string, lang language.Tag) provider.Query {
+// queryFromPath builds a provider.Query from a video's path and target
+// language. When the filename can't be parsed (see scoring.Parse), it
+// returns a degraded, path-only Query — hash search can still work off
+// Path alone — plus the parse error, for the caller to log.
+func queryFromPath(videoPath string, lang language.Tag) (provider.Query, error) {
 	info, err := scoring.Parse(filepath.Base(videoPath))
 	if err != nil {
-		return provider.Query{Language: lang, Path: videoPath}
+		return provider.Query{Language: lang, Path: videoPath}, err
 	}
 	return provider.Query{
 		Title:    info.Title,
@@ -410,5 +440,5 @@ func queryFromPath(videoPath string, lang language.Tag) provider.Query {
 		Episode:  info.Episode,
 		Language: lang,
 		Path:     videoPath,
-	}
+	}, nil
 }

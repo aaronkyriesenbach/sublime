@@ -188,3 +188,33 @@ func TestScore_CosmeticMismatchBothPresentScoresZero(t *testing.T) {
 		t.Errorf("Score(...) score = %d, want %d (mismatched source contributes 0)", score, want)
 	}
 }
+
+func TestScore_EpisodeWithUnknownYearEligibleOnTitleAndSeasonEpisode(t *testing.T) {
+	info := scoring.Info{ContentType: media.Episode, Title: "Community", Season: 2, Episode: 1}
+	candidate := domain.Candidate{Title: "Community", Year: 2010, Season: 2, Episode: 1}
+
+	score, eligible := scoring.Score(info, candidate)
+
+	if !eligible {
+		t.Fatalf("Score(...) eligible = false, want true: title+season/episode is the full identity when the video's year is unknown")
+	}
+	if want := 64 + 16; score != want {
+		t.Errorf("Score(...) score = %d, want %d (title+season/episode; the candidate's year must not be scored against an unknown video year)", score, want)
+	}
+}
+
+// TestScore_EpisodeWithUnknownYearStillRejectsWrongEpisode is the
+// regression guard for the fix: dropping year from an episode's cutoff
+// when the video's year is unknown must not let a Candidate's own year
+// compensate for a season/episode mismatch — season/episode must remain a
+// hard identity gate.
+func TestScore_EpisodeWithUnknownYearStillRejectsWrongEpisode(t *testing.T) {
+	info := scoring.Info{ContentType: media.Episode, Title: "Community", Season: 2, Episode: 1}
+	candidate := domain.Candidate{Title: "Community", Year: 2010, Season: 2, Episode: 5}
+
+	_, eligible := scoring.Score(info, candidate)
+
+	if eligible {
+		t.Errorf("Score(...) eligible = true, want false: wrong episode number must reject the candidate even when the video's year is unknown")
+	}
+}

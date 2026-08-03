@@ -66,9 +66,11 @@ type Info struct {
 // Parse extracts a video's identity and cosmetic metadata from its
 // filename, reusing media.Classify for content-type/season/episode
 // detection and a bespoke token parser for everything else. It returns an
-// error wrapping ErrIdentityAttribute if title, year, or (for episodes)
-// season/episode can't be extracted; cosmetic attributes never cause an
-// error — an unrecognized one is simply left empty.
+// error wrapping ErrIdentityAttribute if title or (for episodes)
+// season/episode can't be extracted. A year is also required for movies,
+// but not for episodes, where Season/Episode already disambiguates the
+// file and a filename commonly omits it; cosmetic attributes never cause
+// an error — an unrecognized one is simply left empty.
 func Parse(filename string) (Info, error) {
 	base := filepath.Base(filename)
 	stem := strings.TrimSuffix(base, filepath.Ext(base))
@@ -99,11 +101,23 @@ func Parse(filename string) (Info, error) {
 			year, _ = strconv.Atoi(tokens[i])
 		}
 	}
-	if yearIdx == -1 {
-		return Info{}, fmt.Errorf("%w: year not found in %q", ErrIdentityAttribute, filename)
+
+	// A year is a required identity attribute for movies (see CONTEXT.md's
+	// Candidate entry) — titles alone don't disambiguate remakes/re-releases
+	// that share a title across different years. Episodes are different:
+	// Season/Episode already disambiguates the file within its show, and TV
+	// release filenames very commonly omit a year altogether, so its absence
+	// there falls back to the metadata run's start (the episode token, or a
+	// cosmetic tag) as the title boundary instead of erroring.
+	titleEnd := yearIdx
+	if titleEnd == -1 {
+		if !isEpisode {
+			return Info{}, fmt.Errorf("%w: year not found in %q", ErrIdentityAttribute, filename)
+		}
+		titleEnd = metaStart
 	}
 
-	title := strings.Join(tokens[:yearIdx], " ")
+	title := strings.Join(tokens[:titleEnd], " ")
 	if title == "" {
 		return Info{}, fmt.Errorf("%w: title not found in %q", ErrIdentityAttribute, filename)
 	}

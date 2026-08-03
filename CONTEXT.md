@@ -17,7 +17,7 @@ A machine-readable record embedded inside a Sublime-produced subtitle file (not 
 _Avoid_: Tag, signature, fingerprint
 
 **Content Hash**:
-A fast, fixed-cost hash Sublime computes for a video file (independent of file size) used to detect whether a file's content has changed, and to bind a Marker to the exact file version it was synced against. Owned by Sublime, not any Provider — a Provider may independently derive whatever hash or query key it needs from the file for its own matching, which may or may not resemble the Content Hash.
+A fast, fixed-cost hash Sublime computes for a video file (independent of file size) used to detect whether a file's content has changed, and to bind a Marker to the exact file version it was synced against. Owned by Sublime, not any Provider — a Provider may independently derive whatever hash or query key it needs from the file for its own matching, which may or may not resemble the Content Hash. Captured only once Strip's embedded-stream removal has finished for that sync pass: Strip mutates the file, so a hash taken before it runs would never match the file's settled state, and a Marker or state-store record bound to that earlier hash would misread Sublime's own edit as an external content change on the next scan.
 _Avoid_: Checksum, fingerprint, provider hash
 
 **Candidate**:
