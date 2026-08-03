@@ -7,6 +7,7 @@ package pipeline
 
 import (
 	"fmt"
+	"log/slog"
 
 	"github.com/aaronkyriesenbach/sublime/internal/config"
 	"github.com/aaronkyriesenbach/sublime/internal/provider/opensubtitles"
@@ -27,6 +28,10 @@ type ProductionConfig struct {
 	// WorkerCount is the number of concurrent workers for CPU/IO-bound
 	// operations. Zero means runtime.NumCPU().
 	WorkerCount int
+
+	// Logger receives per-file outcome logging. Defaults to slog.Default()
+	// if nil — see Pipeline.Logger.
+	Logger *slog.Logger
 }
 
 // NewProduction constructs a Pipeline wired to real implementations:
@@ -49,5 +54,6 @@ func NewProduction(cfg ProductionConfig) (*Pipeline, error) {
 		SyncEngine:  alass.New(),
 		Stripper:    strip.NewFFStripper(),
 		WorkerCount: cfg.WorkerCount,
+		Logger:      cfg.Logger,
 	}, nil
 }

@@ -7,10 +7,7 @@ services:
     volumes:
       - ./config.yaml:/config/config.yaml:ro
       - ./data:/data
-      - /path/to/movies:/media/movies
-      - /path/to/tv:/media/tv
-    environment:
-      SUBLIME_OPENSUBTITLES_API_KEY: ${SUBLIME_OPENSUBTITLES_API_KEY}
-      SUBLIME_OPENSUBTITLES_USERNAME: ${SUBLIME_OPENSUBTITLES_USERNAME}
-      SUBLIME_OPENSUBTITLES_PASSWORD: ${SUBLIME_OPENSUBTITLES_PASSWORD}
+      - ./movies:/media/movies
+      - ./tv:/media/tv
+    env_file: .env
     restart: unless-stopped

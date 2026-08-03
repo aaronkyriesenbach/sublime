@@ -112,6 +112,7 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 	p, err := pipeline.NewProduction(pipeline.ProductionConfig{
 		Store:   st,
 		Secrets: secrets.OpenSubtitles,
+		Logger:  logger,
 	})
 	if err != nil {
 		return fmt.Errorf("constructing pipeline: %w", err)

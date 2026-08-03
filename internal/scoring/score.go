@@ -33,7 +33,7 @@ func Score(info Info, candidate domain.Candidate) (score int, eligible bool) {
 	score += cosmeticScore(weightResolution, info.Resolution, candidate.Resolution)
 	score += cosmeticScore(weightCodec, info.Codec, candidate.Codec)
 
-	return score, score >= identityCutoff(isEpisode)
+	return score, score >= identityCutoff(info)
 }
 
 // cosmeticScore returns weight when both sides are non-empty and match

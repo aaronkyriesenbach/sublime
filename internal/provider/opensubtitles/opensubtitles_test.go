@@ -68,6 +68,17 @@ func searchItem(release, title string, year, season, episode int, fileIDs ...int
 	}
 }
 
+// searchEpisodeItem is searchItem's episode counterpart: OpenSubtitles'
+// feature_details.title is the episode's own title, not the show's — the
+// show title only appears as feature_details.parent_title (see
+// candidatesFromResponse).
+func searchEpisodeItem(release, parentTitle, episodeTitle string, year, season, episode int, fileIDs ...int) map[string]any {
+	item := searchItem(release, episodeTitle, year, season, episode, fileIDs...)
+	fd := item["attributes"].(map[string]any)["feature_details"].(map[string]any)
+	fd["parent_title"] = parentTitle
+	return item
+}
+
 func searchResponse(items ...map[string]any) map[string]any {
 	return map[string]any{"data": items}
 }
@@ -256,6 +267,35 @@ func TestSearch_MultipleFilesPerItem_YieldsOneCandidateEach(t *testing.T) {
 	}
 	if len(candidates) != 2 {
 		t.Fatalf("got %d candidates, want 2 (one per file)", len(candidates))
+	}
+}
+
+// TestSearch_EpisodeCandidateUsesParentTitleNotEpisodeTitle guards a real
+// bug: OpenSubtitles' feature_details.title for an episode result is the
+// *episode's* own title (e.g. "Anthropology 101"), not the show's — the
+// show title Sublime's filename parsing always extracts (e.g. "Community")
+// only appears as feature_details.parent_title. Candidate.Title must use
+// parent_title for episodes, or every episode candidate silently fails
+// scoring's title comparison and never gets selected.
+func TestSearch_EpisodeCandidateUsesParentTitleNotEpisodeTitle(t *testing.T) {
+	mock := newMockServer(t)
+	mock.on(http.MethodGet, "/subtitles", jsonHandler(http.StatusOK, searchResponse(
+		searchEpisodeItem("Community.S02E01.Anthropology.101.HDTV.x264-GROUP", "Community", "Anthropology 101", 2010, 2, 1, 999),
+	)))
+
+	clock := &fakeClock{}
+	p := newTestProvider(t, mock, clock)
+
+	query := provider.Query{Title: "Community", Season: 2, Episode: 1, Path: writeVideoFile(t)}
+	candidates, err := p.Search(context.Background(), query)
+	if err != nil {
+		t.Fatalf("Search() error = %v", err)
+	}
+	if len(candidates) != 1 {
+		t.Fatalf("got %d candidates, want 1", len(candidates))
+	}
+	if candidates[0].Title != "Community" {
+		t.Errorf("candidate Title = %q, want %q (the show's title, not the episode's)", candidates[0].Title, "Community")
 	}
 }
 

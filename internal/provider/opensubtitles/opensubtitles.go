@@ -267,13 +267,18 @@ func candidatesFromResponse(resp searchResponseBody, hashMatch bool) []domain.Ca
 		fd := item.Attributes.FeatureDetails
 		source, releaseGroup, resolution, codec := parseCosmetics(item.Attributes.Release)
 
+		title := fd.Title
+		if fd.ParentTitle != "" {
+			title = fd.ParentTitle
+		}
+
 		for _, file := range item.Attributes.Files {
 			if file.FileID == 0 {
 				continue
 			}
 			candidates = append(candidates, domain.Candidate{
 				ID:           strconv.Itoa(file.FileID),
-				Title:        fd.Title,
+				Title:        title,
 				Year:         fd.Year,
 				Season:       fd.SeasonNumber,
 				Episode:      fd.EpisodeNumber,

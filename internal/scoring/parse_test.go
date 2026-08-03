@@ -83,6 +83,27 @@ func TestParse_EpisodeSceneRelease(t *testing.T) {
 	}
 }
 
+// TestParse_EpisodeWithoutYearIsNotAnIdentityFailure guards the fix for TV
+// filenames — unlike movies, a missing year is not fatal for an episode:
+// Season/Episode already disambiguates it within its show, and this naming
+// style (no year at all) is extremely common for TV rips.
+func TestParse_EpisodeWithoutYearIsNotAnIdentityFailure(t *testing.T) {
+	info, err := scoring.Parse("Community - S02E01 - Anthropology 101.mkv")
+	if err != nil {
+		t.Fatalf("Parse(...) error = %v, want nil", err)
+	}
+
+	want := scoring.Info{
+		ContentType: media.Episode,
+		Title:       "Community",
+		Season:      2,
+		Episode:     1,
+	}
+	if info != want {
+		t.Errorf("Parse(...) = %+v, want %+v", info, want)
+	}
+}
+
 func TestParse_MissingYearIsIdentityFailure(t *testing.T) {
 	_, err := scoring.Parse("Some.Movie.Title.mkv")
 

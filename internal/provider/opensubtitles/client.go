@@ -284,6 +284,15 @@ type featureDetails struct {
 	Year          int    `json:"year"`
 	SeasonNumber  int    `json:"season_number"`
 	EpisodeNumber int    `json:"episode_number"`
+
+	// ParentTitle is the show's own title for an episode result (e.g.
+	// "Community") — Title above is the *episode's* title instead (e.g.
+	// "Anthropology 101") and is empty/absent for movies, which have no
+	// parent. See candidatesFromResponse: Sublime's filename-derived
+	// Info.Title is always the show's title for episodes, never the
+	// individual episode's, so scoring must compare against ParentTitle,
+	// not Title, whenever it's present.
+	ParentTitle string `json:"parent_title"`
 }
 
 type subtitleFile struct {

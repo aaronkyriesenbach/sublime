@@ -1,7 +1,10 @@
 package pipeline_test
 
 import (
+	"bytes"
 	"context"
+	"errors"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -602,5 +605,137 @@ func TestPipeline_RunFileProcessesSingleFile(t *testing.T) {
 	video2Sidecar := filepath.Join(libDir, "Movie.Two.2021.HDTV.x264-GRP.en.srt")
 	if _, err := os.Stat(video2Sidecar); !os.IsNotExist(err) {
 		t.Errorf("video2 sidecar should not exist, stat err = %v", err)
+	}
+}
+
+// TestPipeline_LogsFailureWithUnderlyingError guards the observability fix:
+// a per-file failure must be logged with the real underlying error, not
+// just silently recorded as a coarse status in the store.
+func TestPipeline_LogsFailureWithUnderlyingError(t *testing.T) {
+	libDir := t.TempDir()
+
+	videoName := "Test.Movie.2024.HDTV.x264-FAKEGROUP.mp4"
+	videoPath := filepath.Join(libDir, videoName)
+
+	srcVideo := filepath.Join("..", "..", "testdata", "integration", "video", "sample.mp4")
+	videoContent, err := os.ReadFile(srcVideo)
+	if err != nil {
+		t.Fatalf("reading source video: %v", err)
+	}
+	if err := os.WriteFile(videoPath, videoContent, 0o644); err != nil {
+		t.Fatalf("writing video to library: %v", err)
+	}
+
+	dbPath := filepath.Join(t.TempDir(), "sublime.db")
+	st, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("opening store: %v", err)
+	}
+	defer func() { _ = st.Close() }()
+
+	wantErr := errors.New("provider unavailable: connection refused")
+	fakeProvider := &provider.Fake{
+		SearchFunc: func(ctx context.Context, q provider.Query) ([]domain.Candidate, error) {
+			return nil, wantErr
+		},
+	}
+
+	lib := domain.Library{
+		Name:       "test-library",
+		Path:       libDir,
+		Languages:  []language.Tag{language.English},
+		StripScope: domain.StripScopeAll,
+	}
+
+	var logBuf bytes.Buffer
+	p := &pipeline.Pipeline{
+		Store:       st,
+		Provider:    fakeProvider,
+		SyncEngine:  &syncengine.FakeSyncEngine{},
+		Stripper:    &pipeline.FakeStripper{},
+		WorkerCount: 1,
+		Logger:      slog.New(slog.NewTextHandler(&logBuf, nil)),
+	}
+
+	ctx := context.Background()
+	result, err := p.Run(ctx, lib)
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if result.Failed != 1 {
+		t.Fatalf("Failed = %d, want 1", result.Failed)
+	}
+
+	logOutput := logBuf.String()
+	for _, want := range []string{"library=test-library", "path=" + videoPath, "connection refused"} {
+		if !strings.Contains(logOutput, want) {
+			t.Errorf("log output = %q, want it to contain %q", logOutput, want)
+		}
+	}
+}
+
+// TestPipeline_LogsNoCandidateOutcome guards the same observability fix for
+// the no-candidate terminal state, which records no error but should still
+// surface in logs — not just as a queryable store status.
+func TestPipeline_LogsNoCandidateOutcome(t *testing.T) {
+	libDir := t.TempDir()
+
+	videoName := "Test.Movie.2024.HDTV.x264-FAKEGROUP.mp4"
+	videoPath := filepath.Join(libDir, videoName)
+
+	srcVideo := filepath.Join("..", "..", "testdata", "integration", "video", "sample.mp4")
+	videoContent, err := os.ReadFile(srcVideo)
+	if err != nil {
+		t.Fatalf("reading source video: %v", err)
+	}
+	if err := os.WriteFile(videoPath, videoContent, 0o644); err != nil {
+		t.Fatalf("writing video to library: %v", err)
+	}
+
+	dbPath := filepath.Join(t.TempDir(), "sublime.db")
+	st, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("opening store: %v", err)
+	}
+	defer func() { _ = st.Close() }()
+
+	fakeProvider := &provider.Fake{
+		SearchFunc: func(ctx context.Context, q provider.Query) ([]domain.Candidate, error) {
+			return []domain.Candidate{{ID: "wrong-candidate", Title: "Wrong Title", Year: 1999}}, nil
+		},
+	}
+
+	lib := domain.Library{
+		Name:       "test-library",
+		Path:       libDir,
+		Languages:  []language.Tag{language.English},
+		StripScope: domain.StripScopeAll,
+	}
+
+	var logBuf bytes.Buffer
+	p := &pipeline.Pipeline{
+		Store:       st,
+		Provider:    fakeProvider,
+		SyncEngine:  &syncengine.FakeSyncEngine{},
+		Stripper:    &pipeline.FakeStripper{},
+		WorkerCount: 1,
+		Logger:      slog.New(slog.NewTextHandler(&logBuf, nil)),
+	}
+
+	ctx := context.Background()
+	result, err := p.Run(ctx, lib)
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if result.NoCandidate != 1 {
+		t.Fatalf("NoCandidate = %d, want 1", result.NoCandidate)
+	}
+
+	logOutput := logBuf.String()
+	if !strings.Contains(logOutput, "no candidate") {
+		t.Errorf("log output = %q, want it to mention no candidate cleared the cutoff", logOutput)
+	}
+	if !strings.Contains(logOutput, "path="+videoPath) {
+		t.Errorf("log output = %q, want it to contain path=%s", logOutput, videoPath)
 	}
 }
