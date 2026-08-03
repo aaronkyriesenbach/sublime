@@ -435,3 +435,172 @@ func TestPipeline_ScanFindsVideoFiles(t *testing.T) {
 		t.Errorf("Synced = %d, want 2", result.Synced)
 	}
 }
+
+func TestPipeline_RunWithForceReprocessesSyncedFile(t *testing.T) {
+	libDir := t.TempDir()
+
+	videoName := "Test.Movie.2024.HDTV.x264-FAKEGROUP.mp4"
+	videoPath := filepath.Join(libDir, videoName)
+
+	srcVideo := filepath.Join("..", "..", "testdata", "integration", "video", "sample.mp4")
+	videoContent, err := os.ReadFile(srcVideo)
+	if err != nil {
+		t.Fatalf("reading source video: %v", err)
+	}
+	if err := os.WriteFile(videoPath, videoContent, 0o644); err != nil {
+		t.Fatalf("writing video to library: %v", err)
+	}
+
+	dbPath := filepath.Join(t.TempDir(), "sublime.db")
+	st, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("opening store: %v", err)
+	}
+	defer func() { _ = st.Close() }()
+
+	candidateContent := "1\n00:00:00,500 --> 00:00:01,900\nOne two three\n"
+	fakeProvider := &provider.Fake{
+		SearchFunc: func(ctx context.Context, q provider.Query) ([]domain.Candidate, error) {
+			return []domain.Candidate{{ID: "test-candidate", Title: "Test Movie", Year: 2024}}, nil
+		},
+		DownloadFunc: func(ctx context.Context, c domain.Candidate) ([]byte, error) {
+			return []byte(candidateContent), nil
+		},
+	}
+
+	lib := domain.Library{
+		Name:       "test-library",
+		Path:       libDir,
+		Languages:  []language.Tag{language.English},
+		StripScope: domain.StripScopeAll,
+	}
+
+	fakeSyncEngine := &syncengine.FakeSyncEngine{}
+	fakeStripper := &pipeline.FakeStripper{}
+
+	p := &pipeline.Pipeline{
+		Store:       st,
+		Provider:    fakeProvider,
+		SyncEngine:  fakeSyncEngine,
+		Stripper:    fakeStripper,
+		WorkerCount: 1,
+	}
+
+	ctx := context.Background()
+
+	// First run: synced normally.
+	if _, err := p.Run(ctx, lib); err != nil {
+		t.Fatalf("first run: %v", err)
+	}
+
+	// Second run without Force: gate skips it, no Provider/SyncEngine/Stripper calls.
+	fakeSyncEngine.Calls = nil
+	fakeStripper.Calls = nil
+	result2, err := p.Run(ctx, lib)
+	if err != nil {
+		t.Fatalf("second run: %v", err)
+	}
+	if result2.Skipped != 1 {
+		t.Errorf("second run Skipped = %d, want 1", result2.Skipped)
+	}
+	if len(fakeSyncEngine.Calls) != 0 {
+		t.Errorf("second run SyncEngine.Calls = %d, want 0", len(fakeSyncEngine.Calls))
+	}
+
+	// Third run with WithForce: bypasses the gate and reprocesses despite the
+	// valid Marker from the first run.
+	result3, err := p.Run(ctx, lib, pipeline.WithForce())
+	if err != nil {
+		t.Fatalf("forced run: %v", err)
+	}
+	if result3.Synced != 1 {
+		t.Errorf("forced run Synced = %d, want 1", result3.Synced)
+	}
+	if result3.Skipped != 0 {
+		t.Errorf("forced run Skipped = %d, want 0", result3.Skipped)
+	}
+	if len(fakeSyncEngine.Calls) != 1 {
+		t.Errorf("forced run SyncEngine.Calls = %d, want 1", len(fakeSyncEngine.Calls))
+	}
+	if len(fakeStripper.Calls) != 1 {
+		t.Errorf("forced run Stripper.Calls = %d, want 1", len(fakeStripper.Calls))
+	}
+}
+
+func TestPipeline_RunFileProcessesSingleFile(t *testing.T) {
+	libDir := t.TempDir()
+
+	srcVideo := filepath.Join("..", "..", "testdata", "integration", "video", "sample.mp4")
+	videoContent, err := os.ReadFile(srcVideo)
+	if err != nil {
+		t.Fatalf("reading source video: %v", err)
+	}
+
+	video1 := filepath.Join(libDir, "Movie.One.2020.HDTV.x264-GRP.mp4")
+	video2 := filepath.Join(libDir, "Movie.Two.2021.HDTV.x264-GRP.mp4")
+	if err := os.WriteFile(video1, videoContent, 0o644); err != nil {
+		t.Fatalf("writing video1: %v", err)
+	}
+	if err := os.WriteFile(video2, videoContent, 0o644); err != nil {
+		t.Fatalf("writing video2: %v", err)
+	}
+
+	dbPath := filepath.Join(t.TempDir(), "sublime.db")
+	st, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("opening store: %v", err)
+	}
+	defer func() { _ = st.Close() }()
+
+	searchedPaths := map[string]int{}
+	candidateContent := "1\n00:00:00,500 --> 00:00:01,900\nOne two three\n"
+	fakeProvider := &provider.Fake{
+		SearchFunc: func(ctx context.Context, q provider.Query) ([]domain.Candidate, error) {
+			searchedPaths[q.Path]++
+			return []domain.Candidate{{ID: "candidate", Title: q.Title, Year: q.Year}}, nil
+		},
+		DownloadFunc: func(ctx context.Context, c domain.Candidate) ([]byte, error) {
+			return []byte(candidateContent), nil
+		},
+	}
+
+	lib := domain.Library{
+		Name:       "test-library",
+		Path:       libDir,
+		Languages:  []language.Tag{language.English},
+		StripScope: domain.StripScopeAll,
+	}
+
+	p := &pipeline.Pipeline{
+		Store:       st,
+		Provider:    fakeProvider,
+		SyncEngine:  &syncengine.FakeSyncEngine{},
+		Stripper:    &pipeline.FakeStripper{},
+		WorkerCount: 1,
+	}
+
+	ctx := context.Background()
+	result, err := p.RunFile(ctx, lib, video1)
+	if err != nil {
+		t.Fatalf("RunFile: %v", err)
+	}
+
+	if result.FilesScanned != 1 {
+		t.Errorf("FilesScanned = %d, want 1", result.FilesScanned)
+	}
+	if result.Synced != 1 {
+		t.Errorf("Synced = %d, want 1", result.Synced)
+	}
+	if searchedPaths[video1] != 1 {
+		t.Errorf("searches for video1 = %d, want 1", searchedPaths[video1])
+	}
+	if searchedPaths[video2] != 0 {
+		t.Errorf("searches for video2 = %d, want 0 (RunFile must not touch other files)", searchedPaths[video2])
+	}
+
+	// video2's sidecar should not exist since RunFile only touched video1.
+	video2Sidecar := filepath.Join(libDir, "Movie.Two.2021.HDTV.x264-GRP.en.srt")
+	if _, err := os.Stat(video2Sidecar); !os.IsNotExist(err) {
+		t.Errorf("video2 sidecar should not exist, stat err = %v", err)
+	}
+}
