@@ -3,6 +3,7 @@ package store_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"testing"
 
@@ -351,6 +352,324 @@ func TestMarkFailed_RejectsInvalidReason(t *testing.T) {
 	}
 	if err := s.MarkFailed(ctx, file.ID, en, domain.FailureNone); err == nil {
 		t.Fatal("expected an error when passing FailureNone to MarkFailed, got nil")
+	}
+}
+
+func TestLibrarySummaries_CountsStatusesPerLibrary(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	en := mustLang(t, "en")
+	es := mustLang(t, "es")
+
+	movieA, err := s.UpsertFile(ctx, "movies", "/media/movies/a.mkv", "hash-1")
+	if err != nil {
+		t.Fatalf("UpsertFile: %v", err)
+	}
+	if err := s.EnsureLanguage(ctx, movieA.ID, en); err != nil {
+		t.Fatalf("EnsureLanguage: %v", err)
+	}
+	if err := s.MarkSynced(ctx, movieA.ID, en); err != nil {
+		t.Fatalf("MarkSynced: %v", err)
+	}
+
+	movieB, err := s.UpsertFile(ctx, "movies", "/media/movies/b.mkv", "hash-2")
+	if err != nil {
+		t.Fatalf("UpsertFile: %v", err)
+	}
+	if err := s.EnsureLanguage(ctx, movieB.ID, en); err != nil {
+		t.Fatalf("EnsureLanguage: %v", err)
+	}
+	if err := s.MarkFailed(ctx, movieB.ID, en, domain.FailureNoCandidate); err != nil {
+		t.Fatalf("MarkFailed: %v", err)
+	}
+
+	tvA, err := s.UpsertFile(ctx, "tv", "/media/tv/a.mkv", "hash-3")
+	if err != nil {
+		t.Fatalf("UpsertFile: %v", err)
+	}
+	if err := s.EnsureLanguage(ctx, tvA.ID, es); err != nil {
+		t.Fatalf("EnsureLanguage: %v", err)
+	}
+	// Left pending.
+
+	summaries, err := s.LibrarySummaries(ctx)
+	if err != nil {
+		t.Fatalf("LibrarySummaries: %v", err)
+	}
+
+	byName := map[string]store.LibrarySummary{}
+	for _, sum := range summaries {
+		byName[sum.LibraryName] = sum
+	}
+
+	movies, ok := byName["movies"]
+	if !ok {
+		t.Fatal("expected a summary for \"movies\"")
+	}
+	if movies.Synced != 1 || movies.Failed != 1 || movies.Pending != 0 {
+		t.Errorf("movies summary = %+v, want Synced=1 Failed=1 Pending=0", movies)
+	}
+
+	tv, ok := byName["tv"]
+	if !ok {
+		t.Fatal("expected a summary for \"tv\"")
+	}
+	if tv.Pending != 1 || tv.Synced != 0 || tv.Failed != 0 {
+		t.Errorf("tv summary = %+v, want Pending=1 Synced=0 Failed=0", tv)
+	}
+}
+
+func TestLibrarySummaries_NoFilesYieldsNoEntries(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+
+	summaries, err := s.LibrarySummaries(ctx)
+	if err != nil {
+		t.Fatalf("LibrarySummaries: %v", err)
+	}
+	if len(summaries) != 0 {
+		t.Errorf("expected no summaries for an empty store, got %+v", summaries)
+	}
+}
+
+func TestListFiles_DefaultFilterOmitsFullySyncedFiles(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	en := mustLang(t, "en")
+
+	synced, err := s.UpsertFile(ctx, "movies", "/media/movies/synced.mkv", "hash-1")
+	if err != nil {
+		t.Fatalf("UpsertFile: %v", err)
+	}
+	if err := s.EnsureLanguage(ctx, synced.ID, en); err != nil {
+		t.Fatalf("EnsureLanguage: %v", err)
+	}
+	if err := s.MarkSynced(ctx, synced.ID, en); err != nil {
+		t.Fatalf("MarkSynced: %v", err)
+	}
+
+	failed, err := s.UpsertFile(ctx, "movies", "/media/movies/failed.mkv", "hash-2")
+	if err != nil {
+		t.Fatalf("UpsertFile: %v", err)
+	}
+	if err := s.EnsureLanguage(ctx, failed.ID, en); err != nil {
+		t.Fatalf("EnsureLanguage: %v", err)
+	}
+	if err := s.MarkFailed(ctx, failed.ID, en, domain.FailureRetrievalFailed); err != nil {
+		t.Fatalf("MarkFailed: %v", err)
+	}
+
+	pending, err := s.UpsertFile(ctx, "movies", "/media/movies/pending.mkv", "hash-3")
+	if err != nil {
+		t.Fatalf("UpsertFile: %v", err)
+	}
+	if err := s.EnsureLanguage(ctx, pending.ID, en); err != nil {
+		t.Fatalf("EnsureLanguage: %v", err)
+	}
+
+	files, total, err := s.ListFiles(ctx, store.FileFilter{
+		LibraryName:         "movies",
+		PendingOrFailedOnly: true,
+		Limit:               100,
+	})
+	if err != nil {
+		t.Fatalf("ListFiles: %v", err)
+	}
+	if total != 2 {
+		t.Errorf("total = %d, want 2 (synced file excluded by default)", total)
+	}
+	var gotPaths []string
+	for _, f := range files {
+		gotPaths = append(gotPaths, f.Path)
+	}
+	if len(files) != 2 {
+		t.Fatalf("files = %d, want 2: %v", len(files), gotPaths)
+	}
+	for _, want := range []string{failed.Path, pending.Path} {
+		found := false
+		for _, p := range gotPaths {
+			if p == want {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("expected %q in results, got %v", want, gotPaths)
+		}
+	}
+}
+
+func TestListFiles_StateAllIncludesSyncedFiles(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	en := mustLang(t, "en")
+
+	synced, err := s.UpsertFile(ctx, "movies", "/media/movies/synced.mkv", "hash-1")
+	if err != nil {
+		t.Fatalf("UpsertFile: %v", err)
+	}
+	if err := s.EnsureLanguage(ctx, synced.ID, en); err != nil {
+		t.Fatalf("EnsureLanguage: %v", err)
+	}
+	if err := s.MarkSynced(ctx, synced.ID, en); err != nil {
+		t.Fatalf("MarkSynced: %v", err)
+	}
+
+	files, total, err := s.ListFiles(ctx, store.FileFilter{
+		LibraryName: "movies",
+		Limit:       100,
+	})
+	if err != nil {
+		t.Fatalf("ListFiles: %v", err)
+	}
+	if total != 1 || len(files) != 1 {
+		t.Fatalf("total=%d len(files)=%d, want 1 and 1", total, len(files))
+	}
+	if files[0].Path != synced.Path {
+		t.Errorf("path = %q, want %q", files[0].Path, synced.Path)
+	}
+}
+
+func TestListFiles_ScopesByLibraryName(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	en := mustLang(t, "en")
+
+	movieFile, err := s.UpsertFile(ctx, "movies", "/media/movies/a.mkv", "hash-1")
+	if err != nil {
+		t.Fatalf("UpsertFile: %v", err)
+	}
+	if err := s.EnsureLanguage(ctx, movieFile.ID, en); err != nil {
+		t.Fatalf("EnsureLanguage: %v", err)
+	}
+
+	tvFile, err := s.UpsertFile(ctx, "tv", "/media/tv/a.mkv", "hash-2")
+	if err != nil {
+		t.Fatalf("UpsertFile: %v", err)
+	}
+	if err := s.EnsureLanguage(ctx, tvFile.ID, en); err != nil {
+		t.Fatalf("EnsureLanguage: %v", err)
+	}
+
+	files, total, err := s.ListFiles(ctx, store.FileFilter{
+		LibraryName: "movies",
+		Limit:       100,
+	})
+	if err != nil {
+		t.Fatalf("ListFiles: %v", err)
+	}
+	if total != 1 {
+		t.Fatalf("total = %d, want 1", total)
+	}
+	if len(files) != 1 || files[0].LibraryName != "movies" {
+		t.Fatalf("files = %+v, want a single movies-library file", files)
+	}
+}
+
+func TestListFiles_ScopesByPathPrefix(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	en := mustLang(t, "en")
+
+	inScope, err := s.UpsertFile(ctx, "movies", "/media/movies/sub/a.mkv", "hash-1")
+	if err != nil {
+		t.Fatalf("UpsertFile: %v", err)
+	}
+	if err := s.EnsureLanguage(ctx, inScope.ID, en); err != nil {
+		t.Fatalf("EnsureLanguage: %v", err)
+	}
+
+	outOfScope, err := s.UpsertFile(ctx, "movies", "/media/movies/other/b.mkv", "hash-2")
+	if err != nil {
+		t.Fatalf("UpsertFile: %v", err)
+	}
+	if err := s.EnsureLanguage(ctx, outOfScope.ID, en); err != nil {
+		t.Fatalf("EnsureLanguage: %v", err)
+	}
+
+	files, total, err := s.ListFiles(ctx, store.FileFilter{
+		PathPrefix: "/media/movies/sub",
+		Limit:      100,
+	})
+	if err != nil {
+		t.Fatalf("ListFiles: %v", err)
+	}
+	if total != 1 || len(files) != 1 {
+		t.Fatalf("total=%d len(files)=%d, want 1 and 1", total, len(files))
+	}
+	if files[0].Path != inScope.Path {
+		t.Errorf("path = %q, want %q", files[0].Path, inScope.Path)
+	}
+}
+
+func TestListFiles_ExactPathMatchesAFileNotJustADirectoryPrefix(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	en := mustLang(t, "en")
+
+	target, err := s.UpsertFile(ctx, "movies", "/media/movies/a.mkv", "hash-1")
+	if err != nil {
+		t.Fatalf("UpsertFile: %v", err)
+	}
+	if err := s.EnsureLanguage(ctx, target.ID, en); err != nil {
+		t.Fatalf("EnsureLanguage: %v", err)
+	}
+
+	files, total, err := s.ListFiles(ctx, store.FileFilter{
+		PathPrefix: target.Path,
+		Limit:      100,
+	})
+	if err != nil {
+		t.Fatalf("ListFiles: %v", err)
+	}
+	if total != 1 || len(files) != 1 {
+		t.Fatalf("total=%d len(files)=%d, want 1 and 1", total, len(files))
+	}
+}
+
+func TestListFiles_PaginatesWithLimitAndOffset(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	en := mustLang(t, "en")
+
+	paths := []string{
+		"/media/movies/a.mkv",
+		"/media/movies/b.mkv",
+		"/media/movies/c.mkv",
+	}
+	for i, p := range paths {
+		f, err := s.UpsertFile(ctx, "movies", p, fmt.Sprintf("hash-%d", i))
+		if err != nil {
+			t.Fatalf("UpsertFile: %v", err)
+		}
+		if err := s.EnsureLanguage(ctx, f.ID, en); err != nil {
+			t.Fatalf("EnsureLanguage: %v", err)
+		}
+	}
+
+	page1, total, err := s.ListFiles(ctx, store.FileFilter{LibraryName: "movies", Limit: 2, Offset: 0})
+	if err != nil {
+		t.Fatalf("ListFiles page 1: %v", err)
+	}
+	if total != 3 {
+		t.Errorf("total = %d, want 3", total)
+	}
+	if len(page1) != 2 {
+		t.Fatalf("page1 = %d, want 2", len(page1))
+	}
+
+	page2, total2, err := s.ListFiles(ctx, store.FileFilter{LibraryName: "movies", Limit: 2, Offset: 2})
+	if err != nil {
+		t.Fatalf("ListFiles page 2: %v", err)
+	}
+	if total2 != 3 {
+		t.Errorf("total2 = %d, want 3", total2)
+	}
+	if len(page2) != 1 {
+		t.Fatalf("page2 = %d, want 1", len(page2))
+	}
+
+	if page1[0].Path == page2[0].Path {
+		t.Error("expected page1 and page2 to return different files")
 	}
 }
 
