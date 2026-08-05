@@ -35,3 +35,31 @@ _Avoid_: Aligner, sync tool
 **Sync**:
 Actively re-timing a retrieved subtitle's timestamps to align with a video's actual audio, using audio-based alignment — not merely placing a file next to the video. Always performed, even after a successful hash match, since a claimed match can still be mistimed.
 _Avoid_: Match, align (as a standalone term — use Sync)
+
+**Sync Status**:
+The lifecycle state of a single (file, language) pair: Pending, In Progress, Synced, or Failed. Owned by the state store, not any Provider or Sync Engine.
+_Avoid_: State, status (too generic on their own — always qualify as Sync Status)
+
+**Found**:
+The moment a video file is first recorded by the state store — via a Library scan's directory walk or a file-system watch event for a brand-new path — registering it and fanning out a Pending Sync Status for each of its Library's configured languages. Logged once per file, not per language.
+_Avoid_: Discovered, scanned, indexed
+
+**Changed**:
+The moment an already-tracked file's Content Hash is observed to differ from its last-recorded value (an external edit, e.g. a re-encode), or a manual reprocess request targets it — resetting its existing Sync Statuses back to Pending in place. Distinct from Found: a Changed file was already known to Sublime.
+_Avoid_: Modified, updated, rescanned
+
+**Pending**:
+The Sync Status of a (file, language) pair that has been Found (or reset by a Changed event) but not yet picked up by a worker. Counted for every tracked file regardless of how large the backlog is — not bounded by worker count.
+_Avoid_: Queued, waiting, new
+
+**In Progress**:
+The Sync Status of a (file, language) pair currently checked out by a pipeline worker, from its Marker gate check through a final Synced/Failed outcome. Bounded by the pipeline's worker count — reflects the actual in-flight batch, not the backlog. A Marker-gate hit (already synced, no Provider work needed) skips In Progress entirely and goes straight from Pending to Synced, so In Progress only ever reflects real work. Deliberately not "Syncing" — that would overload Sync's specific re-timing meaning with a much broader in-flight-work meaning.
+_Avoid_: Syncing, processing, active, working
+
+**Synced** (Sync Status):
+The Sync Status of a (file, language) pair whose subtitle is up to date with the file's current Content Hash, whether from a fresh Provider fetch this pass or a prior pass's still-valid Marker.
+_Avoid_: Done, complete
+
+**Failed** (Sync Status):
+The Sync Status of a (file, language) pair whose most recent attempt did not produce a Synced subtitle, paired with a failure reason (no candidate cleared the scoring cutoff, retrieval failed, Sync failed, or an internal error). Not retried until a Changed event resets it.
+_Avoid_: Error, broken
