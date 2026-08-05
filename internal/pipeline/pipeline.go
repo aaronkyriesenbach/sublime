@@ -291,7 +291,7 @@ func (p *Pipeline) processFile(
 		return outcomeFailed, fmt.Errorf("computing content hash: %w", err)
 	}
 
-	file, err := p.Store.UpsertFile(ctx, lib.Name, videoPath, string(hash))
+	file, err := p.Store.ObserveFileContentHash(ctx, lib.Name, videoPath, string(hash))
 	if err != nil {
 		return outcomeFailed, fmt.Errorf("upserting file in store: %w", err)
 	}

@@ -28,9 +28,9 @@ func TestStatus_UnscopedReturnsAllLibrarySummariesOnly(t *testing.T) {
 	ctx := t.Context()
 	en := mustLang(t, "en")
 
-	f, err := st.UpsertFile(ctx, "movies", "/media/movies/a.mkv", "hash-1")
+	f, err := st.ObserveFileContentHash(ctx, "movies", "/media/movies/a.mkv", "hash-1")
 	if err != nil {
-		t.Fatalf("UpsertFile: %v", err)
+		t.Fatalf("ObserveFileContentHash: %v", err)
 	}
 	if err := st.EnsureLanguage(ctx, f.ID, en); err != nil {
 		t.Fatalf("EnsureLanguage: %v", err)
@@ -75,9 +75,9 @@ func TestStatus_ScopedByLibraryDefaultsToPendingAndFailed(t *testing.T) {
 	ctx := t.Context()
 	en := mustLang(t, "en")
 
-	synced, err := st.UpsertFile(ctx, "movies", "/media/movies/synced.mkv", "hash-1")
+	synced, err := st.ObserveFileContentHash(ctx, "movies", "/media/movies/synced.mkv", "hash-1")
 	if err != nil {
-		t.Fatalf("UpsertFile: %v", err)
+		t.Fatalf("ObserveFileContentHash: %v", err)
 	}
 	if err := st.EnsureLanguage(ctx, synced.ID, en); err != nil {
 		t.Fatalf("EnsureLanguage: %v", err)
@@ -86,9 +86,9 @@ func TestStatus_ScopedByLibraryDefaultsToPendingAndFailed(t *testing.T) {
 		t.Fatalf("MarkSynced: %v", err)
 	}
 
-	failed, err := st.UpsertFile(ctx, "movies", "/media/movies/failed.mkv", "hash-2")
+	failed, err := st.ObserveFileContentHash(ctx, "movies", "/media/movies/failed.mkv", "hash-2")
 	if err != nil {
-		t.Fatalf("UpsertFile: %v", err)
+		t.Fatalf("ObserveFileContentHash: %v", err)
 	}
 	if err := st.EnsureLanguage(ctx, failed.ID, en); err != nil {
 		t.Fatalf("EnsureLanguage: %v", err)
@@ -136,9 +136,9 @@ func TestStatus_StateAllIncludesSyncedFiles(t *testing.T) {
 	ctx := t.Context()
 	en := mustLang(t, "en")
 
-	synced, err := st.UpsertFile(ctx, "movies", "/media/movies/synced.mkv", "hash-1")
+	synced, err := st.ObserveFileContentHash(ctx, "movies", "/media/movies/synced.mkv", "hash-1")
 	if err != nil {
-		t.Fatalf("UpsertFile: %v", err)
+		t.Fatalf("ObserveFileContentHash: %v", err)
 	}
 	if err := st.EnsureLanguage(ctx, synced.ID, en); err != nil {
 		t.Fatalf("EnsureLanguage: %v", err)
@@ -172,17 +172,17 @@ func TestStatus_ScopedByPathAppliesADirectoryPrefix(t *testing.T) {
 	ctx := t.Context()
 	en := mustLang(t, "en")
 
-	inScope, err := st.UpsertFile(ctx, "movies", "/media/movies/season1/a.mkv", "hash-1")
+	inScope, err := st.ObserveFileContentHash(ctx, "movies", "/media/movies/season1/a.mkv", "hash-1")
 	if err != nil {
-		t.Fatalf("UpsertFile: %v", err)
+		t.Fatalf("ObserveFileContentHash: %v", err)
 	}
 	if err := st.EnsureLanguage(ctx, inScope.ID, en); err != nil {
 		t.Fatalf("EnsureLanguage: %v", err)
 	}
 
-	outOfScope, err := st.UpsertFile(ctx, "movies", "/media/movies/season2/b.mkv", "hash-2")
+	outOfScope, err := st.ObserveFileContentHash(ctx, "movies", "/media/movies/season2/b.mkv", "hash-2")
 	if err != nil {
-		t.Fatalf("UpsertFile: %v", err)
+		t.Fatalf("ObserveFileContentHash: %v", err)
 	}
 	if err := st.EnsureLanguage(ctx, outOfScope.ID, en); err != nil {
 		t.Fatalf("EnsureLanguage: %v", err)
@@ -217,9 +217,9 @@ func TestStatus_PaginatesWithLimitAndOffset(t *testing.T) {
 	en := mustLang(t, "en")
 
 	for i := range 3 {
-		f, err := st.UpsertFile(ctx, "movies", fileNameForIndex(i), "hash")
+		f, err := st.ObserveFileContentHash(ctx, "movies", fileNameForIndex(i), "hash")
 		if err != nil {
-			t.Fatalf("UpsertFile: %v", err)
+			t.Fatalf("ObserveFileContentHash: %v", err)
 		}
 		if err := st.EnsureLanguage(ctx, f.ID, en); err != nil {
 			t.Fatalf("EnsureLanguage: %v", err)
