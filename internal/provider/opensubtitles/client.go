@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -16,14 +17,16 @@ import (
 
 // apiError represents a non-2xx JSON error response from the OpenSubtitles
 // API. ResetTimeUTC is only populated on the 401-shaped quota-exhaustion
-// response (see QuotaExhaustedError) — it is what lets callers distinguish
-// that from a genuine authentication failure without depending on the
-// response's English message text (issue #13's research: both are plain
-// 401s with an "ordinary-looking" body).
+// response — it is what lets callers distinguish that from a genuine
+// authentication failure without depending on the response's English
+// message text (issue #13's research: both are plain 401s with an
+// "ordinary-looking" body). ObservedAt is the response's own client-clock
+// timestamp, kept for quotaExhaustion's fallback-cooldown calculation.
 type apiError struct {
 	StatusCode   int
 	Message      string
 	ResetTimeUTC string
+	ObservedAt   time.Time
 }
 
 func (e *apiError) Error() string {
@@ -40,19 +43,6 @@ type AuthenticationError struct {
 
 func (e *AuthenticationError) Error() string {
 	return fmt.Sprintf("opensubtitles: authentication failed: %s", e.Message)
-}
-
-// QuotaExhaustedError indicates OpenSubtitles' daily download quota is
-// exhausted for the current window, surfaced as a 401 with a quota-shaped
-// body rather than a real auth failure (issue #13's research). ResetAtUTC
-// is OpenSubtitles' own reported reset time, passed through verbatim.
-type QuotaExhaustedError struct {
-	Message    string
-	ResetAtUTC string
-}
-
-func (e *QuotaExhaustedError) Error() string {
-	return fmt.Sprintf("opensubtitles: download quota exhausted: %s", e.Message)
 }
 
 // client is the low-level HTTP transport for the OpenSubtitles API: request
@@ -197,7 +187,7 @@ func classifyResponse(statusCode int, body []byte, header http.Header, now time.
 
 	retryable := isRetryableStatus(statusCode)
 	oc := outcome{responded: true, retryable: retryable}
-	apiErr := decodeAPIError(statusCode, body)
+	apiErr := decodeAPIError(statusCode, body, now)
 
 	if !retryable {
 		return oc, apiErr
@@ -221,10 +211,60 @@ type errorBody struct {
 	ResetTimeUTC string `json:"reset_time_utc"`
 }
 
-func decodeAPIError(status int, body []byte) *apiError {
+func decodeAPIError(status int, body []byte, observedAt time.Time) *apiError {
 	var eb errorBody
 	_ = json.Unmarshal(body, &eb) // best-effort: a non-JSON body just yields an empty message
-	return &apiError{StatusCode: status, Message: eb.Message, ResetTimeUTC: eb.ResetTimeUTC}
+	return &apiError{StatusCode: status, Message: eb.Message, ResetTimeUTC: eb.ResetTimeUTC, ObservedAt: observedAt}
+}
+
+// quotaFallbackCooldown is the suspension length used when a quota-
+// exhaustion response carries no resume time Sublime can parse (issue
+// #56's fallback resolution).
+const quotaFallbackCooldown = time.Hour
+
+// embeddedResetTimePattern extracts the reset timestamp OpenSubtitles
+// embeds in a 406 response's free-text message, e.g. "...Your quota will
+// be renewed in 00 hours and 57 minutes (2026-08-05 23:59:59 UTC)" — the
+// real-world quota-exhaustion shape (issue #56), distinct from the
+// structured 401+reset_time_utc shape decodeAPIError already captures.
+var embeddedResetTimePattern = regexp.MustCompile(`\((\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) UTC\)`)
+
+func parseEmbeddedResetTime(message string) (time.Time, bool) {
+	match := embeddedResetTimePattern.FindStringSubmatch(message)
+	if match == nil {
+		return time.Time{}, false
+	}
+	t, err := time.Parse("2006-01-02 15:04:05", match[1])
+	if err != nil {
+		return time.Time{}, false
+	}
+	return t.UTC(), true
+}
+
+// quotaExhaustion recognizes both response shapes OpenSubtitles uses for
+// quota exhaustion (issue #56): a 401 with a structured reset_time_utc
+// field, or a 406 with the reset time only embedded in message's free
+// text. It returns the resume time to use — parsed from the response when
+// possible, otherwise quotaFallbackCooldown from apiErr's own observed
+// time — and false if apiErr isn't a quota-exhaustion response at all.
+func quotaExhaustion(apiErr *apiError) (time.Time, bool) {
+	switch apiErr.StatusCode {
+	case http.StatusUnauthorized:
+		if apiErr.ResetTimeUTC == "" {
+			return time.Time{}, false
+		}
+		if t, err := time.Parse(time.RFC3339, apiErr.ResetTimeUTC); err == nil {
+			return t, true
+		}
+		return apiErr.ObservedAt.Add(quotaFallbackCooldown), true
+	case http.StatusNotAcceptable:
+		if t, ok := parseEmbeddedResetTime(apiErr.Message); ok {
+			return t, true
+		}
+		return apiErr.ObservedAt.Add(quotaFallbackCooldown), true
+	default:
+		return time.Time{}, false
+	}
 }
 
 // parseRetryAfter parses a Retry-After header in either of its two HTTP-
