@@ -611,10 +611,11 @@ func TestPipeline_RunFileProcessesSingleFile(t *testing.T) {
 	}
 }
 
-// TestPipeline_LogsFailureWithUnderlyingError guards the observability fix:
-// a per-file failure must be logged with the real underlying error, not
-// just silently recorded as a coarse status in the store.
-func TestPipeline_LogsFailureWithUnderlyingError(t *testing.T) {
+// TestPipeline_LogsStatusChangeForRetrievalFailure guards the uniform
+// "status changed" log line for a Failed landing whose reason isn't
+// no_candidate: it must log at ERROR with from=in_progress, to=failed, and
+// reason=retrieval_failed, replacing the old "subtitle sync failed" line.
+func TestPipeline_LogsStatusChangeForRetrievalFailure(t *testing.T) {
 	libDir := t.TempDir()
 
 	videoName := "Test.Movie.2024.HDTV.x264-FAKEGROUP.mp4"
@@ -670,17 +671,25 @@ func TestPipeline_LogsFailureWithUnderlyingError(t *testing.T) {
 	}
 
 	logOutput := logBuf.String()
-	for _, want := range []string{"library=test-library", "path=" + videoPath, "connection refused"} {
+	for _, want := range []string{
+		"level=ERROR", `msg="status changed"`, "library=test-library", "path=" + videoPath,
+		"language=en", "from=in_progress", "to=failed", "reason=retrieval_failed",
+	} {
 		if !strings.Contains(logOutput, want) {
 			t.Errorf("log output = %q, want it to contain %q", logOutput, want)
 		}
 	}
+	if strings.Contains(logOutput, "subtitle sync failed") {
+		t.Errorf("log output unexpectedly contains the old outcome-specific line:%s", logOutput)
+	}
 }
 
-// TestPipeline_LogsNoCandidateOutcome guards the same observability fix for
-// the no-candidate terminal state, which records no error but should still
-// surface in logs — not just as a queryable store status.
-func TestPipeline_LogsNoCandidateOutcome(t *testing.T) {
+// TestPipeline_LogsStatusChangeForNoCandidate guards the uniform "status
+// changed" log line for a Failed landing whose reason is no_candidate: it
+// must log at WARN (not ERROR) with from=in_progress, to=failed, and
+// reason=no_candidate, replacing the old "no candidate cleared the scoring
+// cutoff" line.
+func TestPipeline_LogsStatusChangeForNoCandidate(t *testing.T) {
 	libDir := t.TempDir()
 
 	videoName := "Test.Movie.2024.HDTV.x264-FAKEGROUP.mp4"
@@ -735,11 +744,216 @@ func TestPipeline_LogsNoCandidateOutcome(t *testing.T) {
 	}
 
 	logOutput := logBuf.String()
-	if !strings.Contains(logOutput, "no candidate") {
-		t.Errorf("log output = %q, want it to mention no candidate cleared the cutoff", logOutput)
+	for _, want := range []string{
+		"level=WARN", `msg="status changed"`, "path=" + videoPath,
+		"language=en", "from=in_progress", "to=failed", "reason=no_candidate",
+	} {
+		if !strings.Contains(logOutput, want) {
+			t.Errorf("log output = %q, want it to contain %q", logOutput, want)
+		}
 	}
-	if !strings.Contains(logOutput, "path="+videoPath) {
-		t.Errorf("log output = %q, want it to contain path=%s", logOutput, videoPath)
+	if strings.Contains(logOutput, "no candidate cleared the scoring cutoff") {
+		t.Errorf("log output unexpectedly contains the old outcome-specific line:%s", logOutput)
+	}
+}
+
+// TestPipeline_TransitionsPendingToInProgressToSynced guards the state
+// machine's normal path: a worker dequeuing a (file, language) job
+// transitions it to In Progress before its Marker gate check, then to
+// Synced on success — each transition emitting exactly one uniform
+// "status changed" log line at INFO.
+func TestPipeline_TransitionsPendingToInProgressToSynced(t *testing.T) {
+	libDir := t.TempDir()
+
+	videoName := "Test.Movie.2024.HDTV.x264-FAKEGROUP.mp4"
+	videoPath := filepath.Join(libDir, videoName)
+
+	srcVideo := filepath.Join("..", "..", "testdata", "integration", "video", "sample.mp4")
+	videoContent, err := os.ReadFile(srcVideo)
+	if err != nil {
+		t.Fatalf("reading source video: %v", err)
+	}
+	if err := os.WriteFile(videoPath, videoContent, 0o644); err != nil {
+		t.Fatalf("writing video to library: %v", err)
+	}
+
+	dbPath := filepath.Join(t.TempDir(), "sublime.db")
+	st, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("opening store: %v", err)
+	}
+	defer func() { _ = st.Close() }()
+
+	candidateContent := "1\n00:00:00,500 --> 00:00:01,900\nOne two three\n"
+	fakeProvider := &provider.Fake{
+		SearchFunc: func(ctx context.Context, q provider.Query) ([]domain.Candidate, error) {
+			return []domain.Candidate{{ID: "candidate", Title: "Test Movie", Year: 2024}}, nil
+		},
+		DownloadFunc: func(ctx context.Context, c domain.Candidate) ([]byte, error) {
+			return []byte(candidateContent), nil
+		},
+	}
+
+	lib := domain.Library{
+		Name:       "test-library",
+		Path:       libDir,
+		Languages:  []language.Tag{language.English},
+		StripScope: domain.StripScopeAll,
+	}
+
+	var logBuf bytes.Buffer
+	p := &pipeline.Pipeline{
+		Store:       st,
+		Provider:    fakeProvider,
+		SyncEngine:  &syncengine.FakeSyncEngine{},
+		Stripper:    &pipeline.FakeStripper{},
+		WorkerCount: 1,
+		Logger:      slog.New(slog.NewTextHandler(&logBuf, nil)),
+	}
+
+	ctx := context.Background()
+	result, err := p.Run(ctx, lib)
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if result.Synced != 1 {
+		t.Fatalf("Synced = %d, want 1; errors: %v", result.Synced, result.Errors)
+	}
+
+	logOutput := logBuf.String()
+	for _, want := range []string{
+		`msg="status changed"`, "from=pending", "to=in_progress",
+		"from=in_progress", "to=synced",
+	} {
+		if !strings.Contains(logOutput, want) {
+			t.Errorf("log output = %q, want it to contain %q", logOutput, want)
+		}
+	}
+	if got := strings.Count(logOutput, `msg="status changed"`); got != 2 {
+		t.Errorf(`"status changed" count = %d, want 2 (pending->in_progress, in_progress->synced):%s`, got, logOutput)
+	}
+	inProgressIdx := strings.Index(logOutput, "to=in_progress")
+	syncedIdx := strings.Index(logOutput, "to=synced")
+	if inProgressIdx == -1 || syncedIdx == -1 || inProgressIdx > syncedIdx {
+		t.Errorf("expected to=in_progress to be logged before to=synced:%s", logOutput)
+	}
+
+	file, found, err := st.GetFile(ctx, lib.Name, videoPath)
+	if err != nil {
+		t.Fatalf("getting file from store: %v", err)
+	}
+	if !found {
+		t.Fatal("file not found in store")
+	}
+	if len(file.Languages) != 1 || file.Languages[0].Status != domain.StatusSynced {
+		t.Fatalf("file.Languages = %+v, want 1 entry with status synced", file.Languages)
+	}
+}
+
+// TestPipeline_MarkerGateFastPathSkipsInProgress guards the Marker-gate-hit
+// fast path: when a valid Marker already exists (no Provider work needed),
+// the (file, language) pair must transition directly from Pending to
+// Synced, never touching In Progress — not even transiently.
+func TestPipeline_MarkerGateFastPathSkipsInProgress(t *testing.T) {
+	libDir := t.TempDir()
+
+	videoName := "Test.Movie.2024.HDTV.x264-FAKEGROUP.mp4"
+	videoPath := filepath.Join(libDir, videoName)
+	if err := os.WriteFile(videoPath, []byte("original video bytes"), 0o644); err != nil {
+		t.Fatalf("writing video to library: %v", err)
+	}
+
+	dbPath := filepath.Join(t.TempDir(), "sublime.db")
+	st, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("opening store: %v", err)
+	}
+	defer func() { _ = st.Close() }()
+
+	candidateContent := "1\n00:00:00,500 --> 00:00:01,900\nOne two three\n"
+	fakeProvider := &provider.Fake{
+		SearchFunc: func(ctx context.Context, q provider.Query) ([]domain.Candidate, error) {
+			return []domain.Candidate{{ID: "test-candidate", Title: "Test Movie", Year: 2024}}, nil
+		},
+		DownloadFunc: func(ctx context.Context, c domain.Candidate) ([]byte, error) {
+			return []byte(candidateContent), nil
+		},
+	}
+
+	lib := domain.Library{
+		Name:       "test-library",
+		Path:       libDir,
+		Languages:  []language.Tag{language.English},
+		StripScope: domain.StripScopeAll,
+	}
+
+	p := &pipeline.Pipeline{
+		Store:       st,
+		Provider:    fakeProvider,
+		SyncEngine:  &syncengine.FakeSyncEngine{},
+		Stripper:    &pipeline.FakeStripper{},
+		WorkerCount: 1,
+	}
+
+	ctx := context.Background()
+	result, err := p.Run(ctx, lib)
+	if err != nil {
+		t.Fatalf("first run: %v", err)
+	}
+	if result.Synced != 1 {
+		t.Fatalf("first run Synced = %d, want 1; errors: %v", result.Synced, result.Errors)
+	}
+
+	// Simulate total state loss: a brand-new, empty state store. The video
+	// and its Marker-bearing sidecar are untouched on disk, so the Marker
+	// gate alone must recognize it as already synced.
+	freshDBPath := filepath.Join(t.TempDir(), "fresh.db")
+	freshStore, err := store.Open(freshDBPath)
+	if err != nil {
+		t.Fatalf("opening fresh store: %v", err)
+	}
+	defer func() { _ = freshStore.Close() }()
+
+	var logBuf bytes.Buffer
+	p2 := &pipeline.Pipeline{
+		Store:       freshStore,
+		Provider:    fakeProvider,
+		SyncEngine:  &syncengine.FakeSyncEngine{},
+		Stripper:    &pipeline.FakeStripper{},
+		WorkerCount: 1,
+		Logger:      slog.New(slog.NewTextHandler(&logBuf, nil)),
+	}
+
+	result2, err := p2.Run(ctx, lib)
+	if err != nil {
+		t.Fatalf("second run: %v", err)
+	}
+	if result2.Skipped != 1 {
+		t.Fatalf("Skipped = %d, want 1 (Marker recognized despite total state loss)", result2.Skipped)
+	}
+
+	logOutput := logBuf.String()
+	for _, want := range []string{`msg="status changed"`, "from=pending", "to=synced"} {
+		if !strings.Contains(logOutput, want) {
+			t.Errorf("log output = %q, want it to contain %q", logOutput, want)
+		}
+	}
+	if got := strings.Count(logOutput, `msg="status changed"`); got != 1 {
+		t.Errorf(`"status changed" count = %d, want exactly 1 (Pending->Synced fast path only):%s`, got, logOutput)
+	}
+	if strings.Contains(logOutput, "in_progress") {
+		t.Errorf("log output unexpectedly mentions in_progress for the marker-gate fast path:%s", logOutput)
+	}
+
+	file, found, err := freshStore.GetFile(ctx, lib.Name, videoPath)
+	if err != nil {
+		t.Fatalf("getting file from store: %v", err)
+	}
+	if !found {
+		t.Fatal("file not found in store")
+	}
+	if len(file.Languages) != 1 || file.Languages[0].Status != domain.StatusSynced {
+		t.Fatalf("file.Languages = %+v, want 1 entry with status synced", file.Languages)
 	}
 }
 
@@ -1276,9 +1490,14 @@ func TestPipeline_StreamingDiscoveryRegistersPendingAheadOfWorkerPickup(t *testi
 		}
 	}()
 
-	wantPending := numFiles * len(lib.Languages)
+	// With WorkerCount=1, exactly one (file, language) job is checked out
+	// as In Progress (blocked in Provider.Search) once the pipeline catches
+	// up to the worker's pickup; every other discovered job must still be
+	// Pending, not swallowed by the worker-count-bounded in-flight batch.
+	wantPending := numFiles*len(lib.Languages) - 1
+	wantInProgress := 1
 	deadline := time.Now().Add(5 * time.Second)
-	var lastPending int
+	var lastPending, lastInProgress int
 	for time.Now().Before(deadline) {
 		summaries, err := st.LibrarySummaries(ctx)
 		if err != nil {
@@ -1287,9 +1506,10 @@ func TestPipeline_StreamingDiscoveryRegistersPendingAheadOfWorkerPickup(t *testi
 		for _, s := range summaries {
 			if s.LibraryName == lib.Name {
 				lastPending = s.Pending
+				lastInProgress = s.InProgress
 			}
 		}
-		if lastPending == wantPending {
+		if lastPending == wantPending && lastInProgress == wantInProgress {
 			break
 		}
 		time.Sleep(5 * time.Millisecond)
@@ -1297,6 +1517,9 @@ func TestPipeline_StreamingDiscoveryRegistersPendingAheadOfWorkerPickup(t *testi
 
 	if lastPending != wantPending {
 		t.Fatalf("Pending = %d, want %d (streaming discovery must register every file ahead of worker pickup, with WorkerCount=1)", lastPending, wantPending)
+	}
+	if lastInProgress != wantInProgress {
+		t.Fatalf("InProgress = %d, want %d (bounded by WorkerCount=1)", lastInProgress, wantInProgress)
 	}
 
 	logMu.Lock()

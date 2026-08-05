@@ -61,6 +61,62 @@ func (p *Pipeline) logger() *slog.Logger {
 	return slog.Default()
 }
 
+// logStatusChange emits the single uniform "status changed" log line for a
+// Sync Status transition (see CONTEXT.md's Sync Status entry) — library,
+// path, language, from, to, and, only when landing on Failed, a reason.
+// Level is INFO for every transition except landing on Failed: WARN when
+// reason is FailureNoCandidate (a normal, expected outcome — no Provider
+// had a good enough match), ERROR for the other three failure reasons
+// (all indicating something broke rather than simply not matching).
+func (p *Pipeline) logStatusChange(
+	ctx context.Context,
+	lib domain.Library,
+	videoPath string,
+	lang language.Tag,
+	from, to domain.SyncStatus,
+	reason domain.FailureReason,
+) {
+	args := []any{
+		"library", lib.Name,
+		"path", videoPath,
+		"language", lang.String(),
+		"from", string(from),
+		"to", string(to),
+	}
+
+	level := slog.LevelInfo
+	if to == domain.StatusFailed {
+		args = append(args, "reason", string(reason))
+		if reason == domain.FailureNoCandidate {
+			level = slog.LevelWarn
+		} else {
+			level = slog.LevelError
+		}
+	}
+
+	p.logger().Log(ctx, level, "status changed", args...)
+}
+
+// markFailed transitions fileID's (file, language) pair to StatusFailed
+// with reason in the store and, on success, emits the uniform "status
+// changed" log for the In Progress -> Failed transition. Every processFile
+// failure path funnels through here so a Failed landing always gets
+// exactly one log line.
+func (p *Pipeline) markFailed(
+	ctx context.Context,
+	lib domain.Library,
+	videoPath string,
+	lang language.Tag,
+	fileID int64,
+	reason domain.FailureReason,
+) error {
+	if err := p.Store.MarkFailed(ctx, fileID, lang, reason); err != nil {
+		return err
+	}
+	p.logStatusChange(ctx, lib, videoPath, lang, domain.StatusInProgress, domain.StatusFailed, reason)
+	return nil
+}
+
 // Stripper is the subset of strip.FFStripper the pipeline needs, extracted
 // as an interface so tests can inject a fake that doesn't shell out to
 // ffprobe/ffmpeg.
@@ -209,16 +265,12 @@ func (p *Pipeline) runFiles(
 				if o.err != nil {
 					result.Errors[fmt.Sprintf("%s:%s", o.videoPath, o.lang)] = o.err
 				}
-				p.logger().Error("subtitle sync failed",
-					"library", lib.Name, "path", o.videoPath, "language", o.lang.String(), "error", o.err)
 			case outcomeSkipped:
 				result.Skipped++
 			case outcomeSynced:
 				result.Synced++
 			case outcomeTerminal:
 				result.NoCandidate++
-				p.logger().Warn("no candidate cleared the scoring cutoff",
-					"library", lib.Name, "path", o.videoPath, "language", o.lang.String())
 			}
 		}
 		resultCh <- result
@@ -231,6 +283,7 @@ func (p *Pipeline) runFiles(
 		file, err := p.registerFile(ctx, lib, videoPath, cfg.force)
 		if err != nil {
 			registerErr := fmt.Errorf("registering file: %w", err)
+			p.logger().Error("registering file failed", "library", lib.Name, "path", videoPath, "error", err)
 			for _, lang := range lib.Languages {
 				wg.Add(1)
 				go func() {
@@ -249,6 +302,7 @@ func (p *Pipeline) runFiles(
 				select {
 				case sem <- struct{}{}:
 				case <-ctx.Done():
+					p.logger().Error("processing cancelled", "library", lib.Name, "path", videoPath, "language", lang.String(), "error", ctx.Err())
 					outcomes <- outcome{videoPath: videoPath, lang: lang, outcome: outcomeFailed, err: ctx.Err()}
 					return
 				}
@@ -256,6 +310,7 @@ func (p *Pipeline) runFiles(
 
 				select {
 				case <-ctx.Done():
+					p.logger().Error("processing cancelled", "library", lib.Name, "path", videoPath, "language", lang.String(), "error", ctx.Err())
 					outcomes <- outcome{videoPath: videoPath, lang: lang, outcome: outcomeFailed, err: ctx.Err()}
 					return
 				default:
@@ -393,15 +448,24 @@ func (p *Pipeline) processFile(
 	if !force {
 		needsFetch, err := strip.NeedsFetch(dir, stem, lang, hash)
 		if err != nil {
+			p.logger().Error("checking marker gate failed", "library", lib.Name, "path", videoPath, "language", lang.String(), "error", err)
 			return outcomeFailed, fmt.Errorf("checking marker gate: %w", err)
 		}
 		if !needsFetch {
 			if err := p.Store.MarkSynced(ctx, file.ID, lang); err != nil {
+				p.logger().Error("marking already-synced file failed", "library", lib.Name, "path", videoPath, "language", lang.String(), "error", err)
 				return outcomeFailed, fmt.Errorf("marking already-synced file: %w", err)
 			}
+			p.logStatusChange(ctx, lib, videoPath, lang, domain.StatusPending, domain.StatusSynced, domain.FailureNone)
 			return outcomeSkipped, nil
 		}
 	}
+
+	if err := p.Store.MarkInProgress(ctx, file.ID, lang); err != nil {
+		p.logger().Error("marking in progress failed", "library", lib.Name, "path", videoPath, "language", lang.String(), "error", err)
+		return outcomeFailed, fmt.Errorf("marking in progress: %w", err)
+	}
+	p.logStatusChange(ctx, lib, videoPath, lang, domain.StatusPending, domain.StatusInProgress, domain.FailureNone)
 
 	query, queryErr := queryFromPath(videoPath, lang)
 	if queryErr != nil {
@@ -411,7 +475,7 @@ func (p *Pipeline) processFile(
 
 	candidates, err := p.Provider.Search(ctx, query)
 	if err != nil {
-		if markErr := p.Store.MarkFailed(ctx, file.ID, lang, domain.FailureRetrievalFailed); markErr != nil {
+		if markErr := p.markFailed(ctx, lib, videoPath, lang, file.ID, domain.FailureRetrievalFailed); markErr != nil {
 			return outcomeFailed, errors.Join(err, markErr)
 		}
 		return outcomeFailed, fmt.Errorf("searching provider: %w", err)
@@ -419,7 +483,7 @@ func (p *Pipeline) processFile(
 
 	info, parseErr := scoring.Parse(filepath.Base(videoPath))
 	if parseErr != nil {
-		if markErr := p.Store.MarkFailed(ctx, file.ID, lang, domain.FailureInternalError); markErr != nil {
+		if markErr := p.markFailed(ctx, lib, videoPath, lang, file.ID, domain.FailureInternalError); markErr != nil {
 			return outcomeFailed, errors.Join(parseErr, markErr)
 		}
 		return outcomeFailed, fmt.Errorf("parsing video filename: %w", parseErr)
@@ -427,7 +491,7 @@ func (p *Pipeline) processFile(
 
 	best, ok := scoring.Select(info, candidates)
 	if !ok {
-		if markErr := p.Store.MarkFailed(ctx, file.ID, lang, domain.FailureNoCandidate); markErr != nil {
+		if markErr := p.markFailed(ctx, lib, videoPath, lang, file.ID, domain.FailureNoCandidate); markErr != nil {
 			return outcomeFailed, markErr
 		}
 		return outcomeTerminal, nil
@@ -435,7 +499,7 @@ func (p *Pipeline) processFile(
 
 	subtitleContent, err := p.Provider.Download(ctx, best)
 	if err != nil {
-		if markErr := p.Store.MarkFailed(ctx, file.ID, lang, domain.FailureRetrievalFailed); markErr != nil {
+		if markErr := p.markFailed(ctx, lib, videoPath, lang, file.ID, domain.FailureRetrievalFailed); markErr != nil {
 			return outcomeFailed, errors.Join(err, markErr)
 		}
 		return outcomeFailed, fmt.Errorf("downloading candidate: %w", err)
@@ -443,7 +507,7 @@ func (p *Pipeline) processFile(
 
 	syncedContent, err := p.syncSubtitle(ctx, videoPath, subtitleContent)
 	if err != nil {
-		if markErr := p.Store.MarkFailed(ctx, file.ID, lang, domain.FailureSyncFailed); markErr != nil {
+		if markErr := p.markFailed(ctx, lib, videoPath, lang, file.ID, domain.FailureSyncFailed); markErr != nil {
 			return outcomeFailed, errors.Join(err, markErr)
 		}
 		return outcomeFailed, fmt.Errorf("syncing subtitle: %w", err)
@@ -452,7 +516,7 @@ func (p *Pipeline) processFile(
 	sidecarExt := ".srt"
 	codec, ok := marker.CodecFor(sidecarExt)
 	if !ok {
-		if markErr := p.Store.MarkFailed(ctx, file.ID, lang, domain.FailureInternalError); markErr != nil {
+		if markErr := p.markFailed(ctx, lib, videoPath, lang, file.ID, domain.FailureInternalError); markErr != nil {
 			return outcomeFailed, markErr
 		}
 		return outcomeFailed, fmt.Errorf("no marker codec for %s", sidecarExt)
@@ -460,7 +524,7 @@ func (p *Pipeline) processFile(
 
 	removedStreams, err := p.Stripper.StripEmbedded(ctx, videoPath, lib.StripScope, lang)
 	if err != nil {
-		if markErr := p.Store.MarkFailed(ctx, file.ID, lang, domain.FailureInternalError); markErr != nil {
+		if markErr := p.markFailed(ctx, lib, videoPath, lang, file.ID, domain.FailureInternalError); markErr != nil {
 			return outcomeFailed, errors.Join(err, markErr)
 		}
 		return outcomeFailed, fmt.Errorf("stripping embedded streams: %w", err)
@@ -475,7 +539,7 @@ func (p *Pipeline) processFile(
 	if len(removedStreams) > 0 {
 		correctedHash, err := media.ComputeContentHash(videoPath)
 		if err != nil {
-			if markErr := p.Store.MarkFailed(ctx, file.ID, lang, domain.FailureInternalError); markErr != nil {
+			if markErr := p.markFailed(ctx, lib, videoPath, lang, file.ID, domain.FailureInternalError); markErr != nil {
 				return outcomeFailed, errors.Join(err, markErr)
 			}
 			return outcomeFailed, fmt.Errorf("recomputing content hash after strip: %w", err)
@@ -489,22 +553,24 @@ func (p *Pipeline) processFile(
 
 	markedContent, err := codec.Write(syncedContent, marker.Marker{ContentHash: hash})
 	if err != nil {
-		if markErr := p.Store.MarkFailed(ctx, file.ID, lang, domain.FailureInternalError); markErr != nil {
+		if markErr := p.markFailed(ctx, lib, videoPath, lang, file.ID, domain.FailureInternalError); markErr != nil {
 			return outcomeFailed, errors.Join(err, markErr)
 		}
 		return outcomeFailed, fmt.Errorf("embedding marker: %w", err)
 	}
 
 	if _, err := p.Stripper.Swap(ctx, videoPath, lang, lib.StripScope, hash, sidecarExt, markedContent); err != nil {
-		if markErr := p.Store.MarkFailed(ctx, file.ID, lang, domain.FailureInternalError); markErr != nil {
+		if markErr := p.markFailed(ctx, lib, videoPath, lang, file.ID, domain.FailureInternalError); markErr != nil {
 			return outcomeFailed, errors.Join(err, markErr)
 		}
 		return outcomeFailed, fmt.Errorf("swapping sidecar: %w", err)
 	}
 
 	if err := p.Store.MarkSynced(ctx, file.ID, lang); err != nil {
+		p.logger().Error("marking synced failed", "library", lib.Name, "path", videoPath, "language", lang.String(), "error", err)
 		return outcomeFailed, fmt.Errorf("marking synced: %w", err)
 	}
+	p.logStatusChange(ctx, lib, videoPath, lang, domain.StatusInProgress, domain.StatusSynced, domain.FailureNone)
 
 	return outcomeSynced, nil
 }
