@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"golang.org/x/text/language"
 
@@ -14,8 +15,13 @@ import (
 )
 
 // FakeStripper is a test double for Stripper that records calls and writes
-// sidecars without shelling out to ffprobe/ffmpeg.
+// sidecars without shelling out to ffprobe/ffmpeg. Safe for concurrent use
+// by multiple pipeline workers, since a Library run may process several
+// (file, language) pairs, including different languages of the same file,
+// in parallel.
 type FakeStripper struct {
+	mu sync.Mutex
+
 	// Calls records every Swap invocation.
 	Calls []FakeStripperCall
 
@@ -69,11 +75,13 @@ var _ Stripper = (*FakeStripper)(nil)
 // removed something: it mutates videoPath's bytes and reports the
 // configured indices.
 func (f *FakeStripper) StripEmbedded(_ context.Context, videoPath string, scope domain.StripScope, lang language.Tag) ([]int, error) {
+	f.mu.Lock()
 	f.StripEmbeddedCalls = append(f.StripEmbeddedCalls, FakeStripEmbeddedCall{
 		VideoPath: videoPath,
 		Scope:     scope,
 		Lang:      lang,
 	})
+	f.mu.Unlock()
 
 	if f.StripEmbeddedErr != nil {
 		return nil, f.StripEmbeddedErr
@@ -109,6 +117,7 @@ func (f *FakeStripper) Swap(
 	sidecarExt string,
 	sidecarContent []byte,
 ) (strip.SwapResult, error) {
+	f.mu.Lock()
 	f.Calls = append(f.Calls, FakeStripperCall{
 		VideoPath:      videoPath,
 		Lang:           lang,
@@ -117,6 +126,7 @@ func (f *FakeStripper) Swap(
 		SidecarExt:     sidecarExt,
 		SidecarContent: sidecarContent,
 	})
+	f.mu.Unlock()
 
 	if f.Err != nil {
 		return strip.SwapResult{}, f.Err

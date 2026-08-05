@@ -5,6 +5,17 @@
 // Marker-embedded sidecar, Strip old subtitles, and record the outcome in
 // the state store.
 //
+// # Discovery
+//
+// A Library scan streams discoveries as its directory walk progresses,
+// rather than walking the entire tree before anything is registered. Every
+// file is classified the instant it's seen as Found (never tracked before)
+// or Changed (already tracked, but its Content Hash differs or a manual
+// reprocess targets it) — see CONTEXT.md — which fans a Pending Sync
+// Status out for each of its Library's configured languages immediately,
+// ahead of worker pickup. RunFile applies the same classification for a
+// single file, used by fsnotify watch events and manual reprocessing.
+//
 // # Concurrency Model
 //
 // The pipeline processes files concurrently using a bounded worker pool.

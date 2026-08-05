@@ -139,56 +139,54 @@ type Result struct {
 }
 
 // Run processes every video file in lib, syncing subtitles for each of
-// lib.Languages. It returns after all files have been processed (or ctx is
-// cancelled).
+// lib.Languages. Files are streamed to workers as the Library's directory
+// walk discovers them — each is registered (Found or Changed — see
+// CONTEXT.md) and fanned out to Pending the instant it's seen, rather than
+// waiting for the whole tree to be walked first. It returns after all
+// files have been processed (or ctx is cancelled).
 func (p *Pipeline) Run(ctx context.Context, lib domain.Library, opts ...RunOption) (Result, error) {
-	videos, err := p.scanLibrary(lib.Path)
-	if err != nil {
-		return Result{}, fmt.Errorf("pipeline: scanning library %q: %w", lib.Name, err)
-	}
-	return p.runFiles(ctx, lib, videos, opts...)
+	paths, walkErrCh := p.scanLibraryStream(ctx, lib.Path)
+	return p.runFiles(ctx, lib, paths, walkErrCh, opts...)
 }
 
 // RunFile processes a single video file within lib for each of
 // lib.Languages, without scanning the rest of the Library. It's the
 // entrypoint triggers use for fsnotify watch events and single-file manual
-// reprocessing, where a full Library scan would be wasteful.
+// reprocessing, where a full Library scan would be wasteful. It applies the
+// same Found-vs-Changed classification as Run (see CONTEXT.md).
 func (p *Pipeline) RunFile(ctx context.Context, lib domain.Library, videoPath string, opts ...RunOption) (Result, error) {
-	return p.runFiles(ctx, lib, []string{videoPath}, opts...)
+	paths := make(chan string, 1)
+	paths <- videoPath
+	close(paths)
+	return p.runFiles(ctx, lib, paths, nil, opts...)
 }
 
-func (p *Pipeline) runFiles(ctx context.Context, lib domain.Library, videos []string, opts ...RunOption) (Result, error) {
+// runFiles registers each path read from videoPaths (Found or Changed — see
+// registerFile) and fans its languages out to a worker pool bounded by
+// p.WorkerCount, as paths stream in. Registration happens on this method's
+// own goroutine and is never blocked by worker availability: a per-file
+// registration (and its Pending rows) completes as soon as the file is
+// read from videoPaths, regardless of how backed up the workers are, so a
+// slow worker pool never delays a later file from being registered. Actual
+// per-language work is throttled to WorkerCount concurrent goroutines via
+// sem; walkErrCh, if non-nil, carries an error from the goroutine feeding
+// videoPaths (nil once it's exhausted successfully).
+func (p *Pipeline) runFiles(
+	ctx context.Context,
+	lib domain.Library,
+	videoPaths <-chan string,
+	walkErrCh <-chan error,
+	opts ...RunOption,
+) (Result, error) {
 	var cfg runConfig
 	for _, opt := range opts {
 		opt(&cfg)
-	}
-
-	result := Result{
-		FilesScanned: len(videos),
-		Errors:       make(map[string]error),
-	}
-
-	if len(videos) == 0 {
-		return result, nil
 	}
 
 	workerCount := p.WorkerCount
 	if workerCount <= 0 {
 		workerCount = runtime.NumCPU()
 	}
-
-	type job struct {
-		videoPath string
-		lang      language.Tag
-	}
-
-	jobs := make(chan job, len(videos)*len(lib.Languages))
-	for _, videoPath := range videos {
-		for _, lang := range lib.Languages {
-			jobs <- job{videoPath: videoPath, lang: lang}
-		}
-	}
-	close(jobs)
 
 	type outcome struct {
 		videoPath string
@@ -197,60 +195,90 @@ func (p *Pipeline) runFiles(ctx context.Context, lib domain.Library, videos []st
 		err       error
 	}
 
-	outcomes := make(chan outcome, cap(jobs))
-
+	outcomes := make(chan outcome)
+	sem := make(chan struct{}, workerCount)
 	var wg sync.WaitGroup
-	for range workerCount {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for j := range jobs {
+
+	resultCh := make(chan Result, 1)
+	go func() {
+		result := Result{Errors: make(map[string]error)}
+		for o := range outcomes {
+			switch o.outcome {
+			case outcomeFailed:
+				result.Failed++
+				if o.err != nil {
+					result.Errors[fmt.Sprintf("%s:%s", o.videoPath, o.lang)] = o.err
+				}
+				p.logger().Error("subtitle sync failed",
+					"library", lib.Name, "path", o.videoPath, "language", o.lang.String(), "error", o.err)
+			case outcomeSkipped:
+				result.Skipped++
+			case outcomeSynced:
+				result.Synced++
+			case outcomeTerminal:
+				result.NoCandidate++
+				p.logger().Warn("no candidate cleared the scoring cutoff",
+					"library", lib.Name, "path", o.videoPath, "language", o.lang.String())
+			}
+		}
+		resultCh <- result
+	}()
+
+	filesScanned := 0
+	for videoPath := range videoPaths {
+		filesScanned++
+
+		file, err := p.registerFile(ctx, lib, videoPath, cfg.force)
+		if err != nil {
+			registerErr := fmt.Errorf("registering file: %w", err)
+			for _, lang := range lib.Languages {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					outcomes <- outcome{videoPath: videoPath, lang: lang, outcome: outcomeFailed, err: registerErr}
+				}()
+			}
+			continue
+		}
+
+		for _, lang := range lib.Languages {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+
+				select {
+				case sem <- struct{}{}:
+				case <-ctx.Done():
+					outcomes <- outcome{videoPath: videoPath, lang: lang, outcome: outcomeFailed, err: ctx.Err()}
+					return
+				}
+				defer func() { <-sem }()
+
 				select {
 				case <-ctx.Done():
-					outcomes <- outcome{
-						videoPath: j.videoPath,
-						lang:      j.lang,
-						outcome:   outcomeFailed,
-						err:       ctx.Err(),
-					}
-					continue
+					outcomes <- outcome{videoPath: videoPath, lang: lang, outcome: outcomeFailed, err: ctx.Err()}
+					return
 				default:
 				}
 
-				res, syncErr := p.processFile(ctx, lib, j.videoPath, j.lang, cfg.force)
-				outcomes <- outcome{
-					videoPath: j.videoPath,
-					lang:      j.lang,
-					outcome:   res,
-					err:       syncErr,
-				}
-			}
-		}()
+				res, syncErr := p.processFile(ctx, lib, file, videoPath, lang, cfg.force)
+				outcomes <- outcome{videoPath: videoPath, lang: lang, outcome: res, err: syncErr}
+			}()
+		}
 	}
 
-	go func() {
-		wg.Wait()
-		close(outcomes)
-	}()
+	var walkErr error
+	if walkErrCh != nil {
+		walkErr = <-walkErrCh
+	}
 
-	for o := range outcomes {
-		switch o.outcome {
-		case outcomeFailed:
-			result.Failed++
-			if o.err != nil {
-				result.Errors[fmt.Sprintf("%s:%s", o.videoPath, o.lang)] = o.err
-			}
-			p.logger().Error("subtitle sync failed",
-				"library", lib.Name, "path", o.videoPath, "language", o.lang.String(), "error", o.err)
-		case outcomeSkipped:
-			result.Skipped++
-		case outcomeSynced:
-			result.Synced++
-		case outcomeTerminal:
-			result.NoCandidate++
-			p.logger().Warn("no candidate cleared the scoring cutoff",
-				"library", lib.Name, "path", o.videoPath, "language", o.lang.String())
-		}
+	wg.Wait()
+	close(outcomes)
+	result := <-resultCh
+	result.FilesScanned = filesScanned
+
+	if walkErr != nil {
+		return result, fmt.Errorf("pipeline: scanning library %q: %w", lib.Name, walkErr)
 	}
 
 	return result, nil
@@ -262,50 +290,102 @@ func IsVideoFile(path string) bool {
 	return videoExtensions[strings.ToLower(filepath.Ext(path))]
 }
 
-// scanLibrary walks lib.Path and returns the absolute paths of all video
-// files found.
-func (p *Pipeline) scanLibrary(root string) ([]string, error) {
-	var videos []string
-	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+// scanLibraryStream walks root on its own goroutine and streams the
+// absolute paths of every video file found on the returned channel as the
+// walk discovers them, closing it once the walk finishes. The returned
+// error channel receives at most one error (a walk failure, including ctx
+// cancellation) and is always closed; a nil-or-not-yet-received read after
+// the paths channel closes means the walk completed successfully.
+func (p *Pipeline) scanLibraryStream(ctx context.Context, root string) (<-chan string, <-chan error) {
+	paths := make(chan string)
+	errCh := make(chan error, 1)
+
+	go func() {
+		defer close(errCh)
+		defer close(paths)
+
+		err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if d.IsDir() || !IsVideoFile(path) {
+				return nil
+			}
+			select {
+			case paths <- path:
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		})
 		if err != nil {
-			return err
+			errCh <- err
 		}
-		if d.IsDir() {
-			return nil
-		}
-		if IsVideoFile(path) {
-			videos = append(videos, path)
-		}
-		return nil
-	})
-	if err != nil {
-		return nil, err
-	}
-	return videos, nil
+	}()
+
+	return paths, errCh
 }
 
-// processFile handles a single (video, language) pair: hash, gate check,
-// search, score, download, sync, write sidecar, strip, and record outcome.
+// registerFile classifies videoPath as Found or Changed (see CONTEXT.md)
+// the instant it's seen — whether by the bulk scan or a single-file
+// trigger — and logs exactly one "file found" or "file changed" line for
+// it, never one per language:
+//
+//   - Found: videoPath has never been tracked before. It's registered and
+//     a Pending row is fanned out for each of lib.Languages.
+//   - Changed: videoPath is already tracked and either its Content Hash
+//     differs from its last-recorded value, or force is set (a manual
+//     reprocess request). Its existing language states are reset to
+//     Pending in place.
+//   - Neither: videoPath is already tracked, its hash is unchanged, and
+//     force isn't set — nothing is logged. lib.Languages still get Pending
+//     rows fanned out for any newly configured language absent from the
+//     file's existing rows.
+func (p *Pipeline) registerFile(ctx context.Context, lib domain.Library, videoPath string, force bool) (domain.File, error) {
+	hash, err := media.ComputeContentHash(videoPath)
+	if err != nil {
+		return domain.File{}, fmt.Errorf("computing content hash: %w", err)
+	}
+
+	file, observation, err := p.Store.ObserveFileHash(ctx, lib.Name, videoPath, string(hash))
+	if err != nil {
+		return domain.File{}, fmt.Errorf("observing file hash: %w", err)
+	}
+
+	switch {
+	case observation == store.FileHashNew:
+		p.logger().Info("file found", "library", lib.Name, "path", videoPath)
+	case observation == store.FileHashChanged:
+		p.logger().Info("file changed", "library", lib.Name, "path", videoPath)
+	case force:
+		p.logger().Info("file changed", "library", lib.Name, "path", videoPath)
+		if err := p.Store.ResetToPending(ctx, file.ID); err != nil {
+			return domain.File{}, fmt.Errorf("resetting file to pending: %w", err)
+		}
+	}
+
+	for _, lang := range lib.Languages {
+		if err := p.Store.EnsureLanguage(ctx, file.ID, lang); err != nil {
+			return domain.File{}, fmt.Errorf("ensuring language state: %w", err)
+		}
+	}
+
+	return file, nil
+}
+
+// processFile handles a single (video, language) pair: gate check, search,
+// score, download, sync, write sidecar, strip, and record outcome. file
+// must already be registered (see registerFile) with a valid ID and
+// Content Hash for videoPath.
 func (p *Pipeline) processFile(
 	ctx context.Context,
 	lib domain.Library,
+	file domain.File,
 	videoPath string,
 	lang language.Tag,
 	force bool,
 ) (processOutcome, error) {
-	hash, err := media.ComputeContentHash(videoPath)
-	if err != nil {
-		return outcomeFailed, fmt.Errorf("computing content hash: %w", err)
-	}
-
-	file, err := p.Store.ObserveFileContentHash(ctx, lib.Name, videoPath, string(hash))
-	if err != nil {
-		return outcomeFailed, fmt.Errorf("upserting file in store: %w", err)
-	}
-
-	if err := p.Store.EnsureLanguage(ctx, file.ID, lang); err != nil {
-		return outcomeFailed, fmt.Errorf("ensuring language state: %w", err)
-	}
+	hash := media.ContentHash(file.ContentHash)
 
 	dir := filepath.Dir(videoPath)
 	stem := strings.TrimSuffix(filepath.Base(videoPath), filepath.Ext(videoPath))

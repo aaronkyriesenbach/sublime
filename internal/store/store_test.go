@@ -171,6 +171,108 @@ func TestObserveFileContentHash_HashChangeResetsLanguageStatesInPlace(t *testing
 	}
 }
 
+func TestObserveFileHash_ReportsFileHashNewOnFirstInsert(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+
+	file, obs, err := s.ObserveFileHash(ctx, "movies", "/media/movies/a.mkv", "hash-1")
+	if err != nil {
+		t.Fatalf("ObserveFileHash returned error: %v", err)
+	}
+
+	if obs != store.FileHashNew {
+		t.Errorf("observation = %v, want FileHashNew", obs)
+	}
+	if file.ID == 0 {
+		t.Errorf("expected a non-zero file ID, got %d", file.ID)
+	}
+}
+
+func TestObserveFileHash_ReportsFileHashUnchangedOnSameHash(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+
+	if _, _, err := s.ObserveFileHash(ctx, "movies", "/media/movies/a.mkv", "hash-1"); err != nil {
+		t.Fatalf("initial ObserveFileHash returned error: %v", err)
+	}
+
+	_, obs, err := s.ObserveFileHash(ctx, "movies", "/media/movies/a.mkv", "hash-1")
+	if err != nil {
+		t.Fatalf("repeat ObserveFileHash returned error: %v", err)
+	}
+
+	if obs != store.FileHashUnchanged {
+		t.Errorf("observation = %v, want FileHashUnchanged", obs)
+	}
+}
+
+func TestObserveFileHash_ReportsFileHashChangedOnDifferentHash(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+
+	if _, _, err := s.ObserveFileHash(ctx, "movies", "/media/movies/a.mkv", "hash-1"); err != nil {
+		t.Fatalf("initial ObserveFileHash returned error: %v", err)
+	}
+
+	_, obs, err := s.ObserveFileHash(ctx, "movies", "/media/movies/a.mkv", "hash-2")
+	if err != nil {
+		t.Fatalf("hash-change ObserveFileHash returned error: %v", err)
+	}
+
+	if obs != store.FileHashChanged {
+		t.Errorf("observation = %v, want FileHashChanged", obs)
+	}
+}
+
+func TestResetToPending_ResetsExistingLanguageStatesRegardlessOfContentHash(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	en := mustLang(t, "en")
+	pt := mustLang(t, "pt-BR")
+
+	file, err := s.ObserveFileContentHash(ctx, "movies", "/media/movies/a.mkv", "hash-1")
+	if err != nil {
+		t.Fatalf("ObserveFileContentHash returned error: %v", err)
+	}
+	if err := s.EnsureLanguage(ctx, file.ID, en); err != nil {
+		t.Fatalf("EnsureLanguage(en) returned error: %v", err)
+	}
+	if err := s.EnsureLanguage(ctx, file.ID, pt); err != nil {
+		t.Fatalf("EnsureLanguage(pt-BR) returned error: %v", err)
+	}
+	if err := s.MarkSynced(ctx, file.ID, en); err != nil {
+		t.Fatalf("MarkSynced returned error: %v", err)
+	}
+	if err := s.MarkFailed(ctx, file.ID, pt, domain.FailureNoCandidate); err != nil {
+		t.Fatalf("MarkFailed returned error: %v", err)
+	}
+
+	// A manual reprocess request resets an already-tracked file's language
+	// states to Pending even though its Content Hash hasn't changed.
+	if err := s.ResetToPending(ctx, file.ID); err != nil {
+		t.Fatalf("ResetToPending returned error: %v", err)
+	}
+
+	fetched, ok, err := s.GetFile(ctx, "movies", "/media/movies/a.mkv")
+	if err != nil {
+		t.Fatalf("GetFile returned error: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected GetFile to find the file")
+	}
+	if len(fetched.Languages) != 2 {
+		t.Fatalf("expected exactly 2 language rows after reset, got %d: %+v", len(fetched.Languages), fetched.Languages)
+	}
+	for _, ls := range fetched.Languages {
+		if ls.Status != domain.StatusPending {
+			t.Errorf("expected language %q to be reset to %q, got %q", ls.Language, domain.StatusPending, ls.Status)
+		}
+		if ls.FailureReason != domain.FailureNone {
+			t.Errorf("expected language %q to have no failure reason after reset, got %q", ls.Language, ls.FailureReason)
+		}
+	}
+}
+
 func TestGetFile_NotFound(t *testing.T) {
 	s := openTestStore(t)
 	ctx := context.Background()

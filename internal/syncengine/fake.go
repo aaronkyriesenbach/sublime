@@ -3,6 +3,7 @@ package syncengine
 import (
 	"fmt"
 	"os"
+	"sync"
 )
 
 // Call records a single Sync invocation on a FakeSyncEngine, so tests can
@@ -16,8 +17,11 @@ type Call struct {
 // FakeSyncEngine is a SyncEngine test double that never shells out to a
 // real alignment binary. By default it passes the candidate subtitle
 // through unchanged; set Err or OutputContent per test to exercise
-// failure or fixed-shift behavior instead.
+// failure or fixed-shift behavior instead. Safe for concurrent use by
+// multiple pipeline workers.
 type FakeSyncEngine struct {
+	mu sync.Mutex
+
 	// Err, if set, is returned by Sync instead of writing any output.
 	Err error
 
@@ -33,11 +37,13 @@ type FakeSyncEngine struct {
 
 // Sync implements SyncEngine.
 func (f *FakeSyncEngine) Sync(referenceVideoPath, candidateSubtitlePath, outputPath string) (string, error) {
+	f.mu.Lock()
 	f.Calls = append(f.Calls, Call{
 		ReferenceVideoPath:    referenceVideoPath,
 		CandidateSubtitlePath: candidateSubtitlePath,
 		OutputPath:            outputPath,
 	})
+	f.mu.Unlock()
 
 	if f.Err != nil {
 		return "", f.Err
