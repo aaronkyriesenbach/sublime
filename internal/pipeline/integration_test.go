@@ -177,6 +177,154 @@ func TestIntegration_RealPipeline_EndToEnd(t *testing.T) {
 	}
 }
 
+// TestIntegration_RealPipeline_RestartAfterStripSkipsResync is a regression
+// test for issue #48: Strip mutates the video in place (removing its
+// embedded subtitle track) and the pipeline recomputes the Content Hash
+// afterward so the Marker embeds the settled post-Strip hash rather than
+// the pre-Strip one. This proves that fix against real ffmpeg/ffprobe: it
+// runs the real pipeline once against a video with a real embedded
+// subtitle stream, then opens a brand-new, empty state store — simulating
+// genuine state loss (e.g. a daemon restart with a fresh database) —
+// unlike TestIntegration_RealPipeline_EndToEnd's second run, which reuses
+// the same store instance. The Marker embedded in the sidecar (not the
+// store) must be enough on its own to recognize the file as already
+// synced, so the second run should skip it rather than resync it and hit
+// the mocked Provider again.
+func TestIntegration_RealPipeline_RestartAfterStripSkipsResync(t *testing.T) {
+	requireRealBinaries(t)
+
+	libDir := t.TempDir()
+
+	videoName := "Test.Movie.2024.BluRay.x264-TESTGROUP.mp4"
+	videoPath := filepath.Join(libDir, videoName)
+	muxEmbeddedSubtitleFixture(t, videoPath)
+
+	subtitleContent, err := os.ReadFile(filepath.Join(integrationSubsDir, "sample.shifted.srt"))
+	if err != nil {
+		t.Fatalf("reading shifted subtitle: %v", err)
+	}
+
+	// Search runs before Strip mutates the video, so the moviehash the mock
+	// server is keyed on must match the file's pre-Strip (with-embedded-
+	// subtitle) bytes, not the post-Strip ones.
+	movieHash, err := opensubtitles.ComputeMovieHash(videoPath)
+	if err != nil {
+		t.Fatalf("computing moviehash: %v", err)
+	}
+
+	mock := newIntegrationMockServer(t, movieHash, subtitleContent)
+
+	provider, err := opensubtitles.New(opensubtitles.Config{
+		Secrets: config.OpenSubtitlesSecrets{
+			APIKey:   "test-api-key",
+			Username: "testuser",
+			Password: "testpass",
+		},
+		BaseURL: mock.URL(),
+	})
+	if err != nil {
+		t.Fatalf("creating provider: %v", err)
+	}
+
+	stripper := strip.NewFFStripper()
+
+	lib := domain.Library{
+		Name:       "test-library",
+		Path:       libDir,
+		Languages:  []language.Tag{language.English},
+		StripScope: domain.StripScopeAll,
+	}
+
+	newPipeline := func(st *store.Store) *pipeline.Pipeline {
+		return &pipeline.Pipeline{
+			Store:       st,
+			Provider:    provider,
+			SyncEngine:  alass.New(),
+			Stripper:    stripper,
+			WorkerCount: 1,
+		}
+	}
+
+	st1, err := store.Open(filepath.Join(t.TempDir(), "sublime.db"))
+	if err != nil {
+		t.Fatalf("opening first store: %v", err)
+	}
+	defer func() { _ = st1.Close() }()
+
+	ctx := context.Background()
+	result, err := newPipeline(st1).Run(ctx, lib)
+	if err != nil {
+		t.Fatalf("first pipeline.Run: %v", err)
+	}
+	if result.Synced != 1 {
+		t.Errorf("first run Synced = %d, want 1", result.Synced)
+	}
+	if result.Failed != 0 {
+		t.Errorf("first run Failed = %d, want 0; errors: %v", result.Failed, result.Errors)
+	}
+
+	streams, err := stripper.ProbeSubtitleStreams(ctx, videoPath)
+	if err != nil {
+		t.Fatalf("probing stripped video: %v", err)
+	}
+	if len(streams) != 0 {
+		t.Errorf("expected the embedded subtitle stream to be gone after Strip, still found %+v", streams)
+	}
+
+	requestsAfterFirstRun := mock.RequestCount()
+
+	// A brand-new, empty store — not the same instance the first run used —
+	// is the crux of this regression test: it proves the on-disk Marker
+	// alone (keyed on the post-Strip Content Hash) is what gates resyncing,
+	// not anything cached in the store from the first run.
+	st2, err := store.Open(filepath.Join(t.TempDir(), "sublime.db"))
+	if err != nil {
+		t.Fatalf("opening second store: %v", err)
+	}
+	defer func() { _ = st2.Close() }()
+
+	result2, err := newPipeline(st2).Run(ctx, lib)
+	if err != nil {
+		t.Fatalf("second pipeline.Run: %v", err)
+	}
+	if result2.Skipped != 1 {
+		t.Errorf("second run (fresh store) Skipped = %d, want 1", result2.Skipped)
+	}
+	if result2.Synced != 0 {
+		t.Errorf("second run (fresh store) Synced = %d, want 0", result2.Synced)
+	}
+
+	if got := mock.RequestCount(); got != requestsAfterFirstRun {
+		t.Errorf("second run (fresh store) hit the mock Provider server: request count went from %d to %d, want unchanged",
+			requestsAfterFirstRun, got)
+	}
+}
+
+// muxEmbeddedSubtitleFixture writes a copy of the shared integration
+// fixture video to dst with a real, ISO-639-2-tagged ("eng") subtitle
+// stream embedded, using real ffmpeg. This mirrors internal/strip's own
+// muxSubtitles test helper (see internal/strip/embedded_test.go); it's
+// duplicated here rather than imported because that helper is unexported
+// in the strip_test package.
+func muxEmbeddedSubtitleFixture(t *testing.T, dst string) {
+	t.Helper()
+
+	args := []string{
+		"-y", "-v", "error",
+		"-i", filepath.Join(integrationVideoDir, "sample.mp4"),
+		"-i", filepath.Join(integrationSubsDir, "sample.srt"),
+		"-map", "0", "-map", "1",
+		"-c", "copy", "-c:s", "mov_text",
+		"-metadata:s:s:0", "language=eng",
+		dst,
+	}
+	cmd := exec.CommandContext(context.Background(), "ffmpeg", args...)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("muxing fixture video with embedded subtitle: %v\n%s", err, output)
+	}
+}
+
 // TestIntegration_NewProduction validates that NewProduction constructs
 // a working pipeline with real implementations.
 func TestIntegration_NewProduction_Success(t *testing.T) {
@@ -265,6 +413,14 @@ func newIntegrationMockServer(t *testing.T, movieHash string, subtitleContent []
 }
 
 func (m *integrationMockServer) URL() string { return m.server.URL }
+
+// RequestCount returns the number of requests the mock server has handled
+// so far, of any method/path.
+func (m *integrationMockServer) RequestCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.requests)
+}
 
 func (m *integrationMockServer) handle(w http.ResponseWriter, r *http.Request) {
 	m.mu.Lock()
