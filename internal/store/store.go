@@ -49,7 +49,10 @@ CREATE TABLE IF NOT EXISTS file_language_states (
 	id INTEGER PRIMARY KEY,
 	file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
 	language TEXT NOT NULL,
-	status TEXT NOT NULL CHECK (status IN ('pending', 'synced', 'failed')),
+	-- See docs/adr/0002-no-migration-for-in-progress-status.md: widening
+	-- this CHECK to add 'in_progress' is an accepted breaking change for
+	-- existing databases, not migrated.
+	status TEXT NOT NULL CHECK (status IN ('pending', 'in_progress', 'synced', 'failed')),
 	failure_reason TEXT CHECK (
 		(status = 'failed' AND failure_reason IN ('no_candidate', 'retrieval_failed', 'sync_failed', 'internal_error'))
 		OR (status != 'failed' AND failure_reason IS NULL)

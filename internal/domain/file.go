@@ -12,6 +12,13 @@ const (
 	// Hash change reset it.
 	StatusPending SyncStatus = "pending"
 
+	// StatusInProgress means a pipeline worker currently has this
+	// (file, language) pair checked out, from its Marker gate check
+	// through a final StatusSynced/StatusFailed outcome. Deliberately not
+	// "syncing" — see CONTEXT.md's In Progress entry for why that name
+	// would collide with Sync's specific re-timing meaning.
+	StatusInProgress SyncStatus = "in_progress"
+
 	// StatusSynced means a subtitle was retrieved and Synced for the
 	// file's current Content Hash.
 	StatusSynced SyncStatus = "synced"

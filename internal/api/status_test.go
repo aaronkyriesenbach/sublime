@@ -2,8 +2,10 @@ package api_test
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"golang.org/x/text/language"
@@ -70,6 +72,52 @@ func TestStatus_UnscopedReturnsAllLibrarySummariesOnly(t *testing.T) {
 	}
 }
 
+func TestStatus_LibrarySummaryIncludesInProgressCount(t *testing.T) {
+	st := openTestStore(t)
+	ctx := t.Context()
+	en := mustLang(t, "en")
+
+	f, err := st.ObserveFileContentHash(ctx, "movies", "/media/movies/a.mkv", "hash-1")
+	if err != nil {
+		t.Fatalf("ObserveFileContentHash: %v", err)
+	}
+	if err := st.EnsureLanguage(ctx, f.ID, en); err != nil {
+		t.Fatalf("EnsureLanguage: %v", err)
+	}
+	if err := st.MarkInProgress(ctx, f.ID, en); err != nil {
+		t.Fatalf("MarkInProgress: %v", err)
+	}
+
+	srv := api.NewServer(api.Deps{Store: st, Libraries: testLibraries()})
+	defer srv.Close()
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/status")
+	if err != nil {
+		t.Fatalf("GET /status: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("reading response body: %v", err)
+	}
+	if !strings.Contains(string(raw), `"in_progress":1`) {
+		t.Errorf("expected response to contain \"in_progress\":1, got %s", raw)
+	}
+
+	var body statusResponse
+	if err := json.Unmarshal(raw, &body); err != nil {
+		t.Fatalf("decoding response: %v", err)
+	}
+	for _, lib := range body.Libraries {
+		if lib.Name == "movies" && lib.InProgress != 1 {
+			t.Errorf("movies in_progress = %d, want 1", lib.InProgress)
+		}
+	}
+}
+
 func TestStatus_ScopedByLibraryDefaultsToPendingAndFailed(t *testing.T) {
 	st := openTestStore(t)
 	ctx := t.Context()
@@ -97,6 +145,17 @@ func TestStatus_ScopedByLibraryDefaultsToPendingAndFailed(t *testing.T) {
 		t.Fatalf("MarkFailed: %v", err)
 	}
 
+	inProgress, err := st.ObserveFileContentHash(ctx, "movies", "/media/movies/inprogress.mkv", "hash-3")
+	if err != nil {
+		t.Fatalf("ObserveFileContentHash: %v", err)
+	}
+	if err := st.EnsureLanguage(ctx, inProgress.ID, en); err != nil {
+		t.Fatalf("EnsureLanguage: %v", err)
+	}
+	if err := st.MarkInProgress(ctx, inProgress.ID, en); err != nil {
+		t.Fatalf("MarkInProgress: %v", err)
+	}
+
 	srv := api.NewServer(api.Deps{Store: st, Libraries: testLibraries()})
 	defer srv.Close()
 	ts := httptest.NewServer(srv)
@@ -120,14 +179,41 @@ func TestStatus_ScopedByLibraryDefaultsToPendingAndFailed(t *testing.T) {
 	if len(body.Libraries) != 1 || body.Libraries[0].Name != "movies" {
 		t.Fatalf("libraries = %+v, want a single movies summary", body.Libraries)
 	}
-	if len(body.Files) != 1 || body.Files[0].Path != failed.Path {
-		t.Fatalf("files = %+v, want only the failed file (synced omitted by default)", body.Files)
+	if body.Libraries[0].InProgress != 1 {
+		t.Errorf("in_progress = %d, want 1", body.Libraries[0].InProgress)
 	}
-	if body.Files[0].Languages["en"].Status != "failed" || body.Files[0].Languages["en"].Reason != "sync_failed" {
-		t.Errorf("en language state = %+v", body.Files[0].Languages["en"])
+	if len(body.Files) != 2 {
+		t.Fatalf("files = %+v, want the failed and in-progress files (synced omitted by default)", body.Files)
 	}
-	if body.Total == nil || *body.Total != 1 {
-		t.Errorf("total = %v, want 1", body.Total)
+	var gotPaths []string
+	for _, f := range body.Files {
+		gotPaths = append(gotPaths, f.Path)
+	}
+	for _, want := range []string{failed.Path, inProgress.Path} {
+		found := false
+		for _, p := range gotPaths {
+			if p == want {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("expected %q in results, got %v", want, gotPaths)
+		}
+	}
+	for _, f := range body.Files {
+		if f.Path == failed.Path {
+			if f.Languages["en"].Status != "failed" || f.Languages["en"].Reason != "sync_failed" {
+				t.Errorf("en language state = %+v", f.Languages["en"])
+			}
+		}
+		if f.Path == inProgress.Path {
+			if f.Languages["en"].Status != "in_progress" {
+				t.Errorf("en language state = %+v, want status in_progress", f.Languages["en"])
+			}
+		}
+	}
+	if body.Total == nil || *body.Total != 2 {
+		t.Errorf("total = %v, want 2", body.Total)
 	}
 }
 
