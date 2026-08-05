@@ -27,6 +27,11 @@ import (
 // recording an outcome for a language.
 var ErrLanguageStateNotFound = errors.New("store: language state not found")
 
+// ErrFileNotFound is returned by UpdateContentHash when no file row exists
+// to update. Callers must have already recorded the file via
+// ObserveFileContentHash.
+var ErrFileNotFound = errors.New("store: file not found")
+
 // bootstrapSQL is Sublime's entire schema. There is no migration framework:
 // every statement uses IF NOT EXISTS so Open is safe to call against an
 // existing database file.

@@ -739,3 +739,136 @@ func TestPipeline_LogsNoCandidateOutcome(t *testing.T) {
 		t.Errorf("log output = %q, want it to contain path=%s", logOutput, videoPath)
 	}
 }
+
+// TestPipeline_ContentHashReflectsPostStripState guards the Content Hash /
+// Strip-ordering fix: when Strip's embedded-stream removal actually
+// mutates the video, the Marker and store must bind to the file's settled
+// post-Strip hash, not the pre-Strip hash captured at the top of the
+// per-file step. It uses FakeStripper (no real ffmpeg/ffprobe) configured
+// to simulate a removed stream by mutating the video's bytes.
+func TestPipeline_ContentHashReflectsPostStripState(t *testing.T) {
+	libDir := t.TempDir()
+
+	videoName := "Test.Movie.2024.HDTV.x264-FAKEGROUP.mp4"
+	videoPath := filepath.Join(libDir, videoName)
+	if err := os.WriteFile(videoPath, []byte("original video bytes"), 0o644); err != nil {
+		t.Fatalf("writing video to library: %v", err)
+	}
+
+	dbPath := filepath.Join(t.TempDir(), "sublime.db")
+	st, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("opening store: %v", err)
+	}
+	defer func() { _ = st.Close() }()
+
+	candidateContent := "1\n00:00:00,500 --> 00:00:01,900\nOne two three\n"
+	fakeProvider := &provider.Fake{
+		SearchFunc: func(ctx context.Context, q provider.Query) ([]domain.Candidate, error) {
+			return []domain.Candidate{{ID: "test-candidate", Title: "Test Movie", Year: 2024}}, nil
+		},
+		DownloadFunc: func(ctx context.Context, c domain.Candidate) ([]byte, error) {
+			return []byte(candidateContent), nil
+		},
+	}
+
+	lib := domain.Library{
+		Name:       "test-library",
+		Path:       libDir,
+		Languages:  []language.Tag{language.English},
+		StripScope: domain.StripScopeAll,
+	}
+
+	// Simulate a Strip pass that finds and removes an embedded stream,
+	// mutating the video's on-disk bytes the way a real ffmpeg remux would.
+	fakeStripper := &pipeline.FakeStripper{StripEmbeddedIndices: []int{2}}
+
+	p := &pipeline.Pipeline{
+		Store:       st,
+		Provider:    fakeProvider,
+		SyncEngine:  &syncengine.FakeSyncEngine{},
+		Stripper:    fakeStripper,
+		WorkerCount: 1,
+	}
+
+	ctx := context.Background()
+	result, err := p.Run(ctx, lib)
+	if err != nil {
+		t.Fatalf("first run: %v", err)
+	}
+	if result.Synced != 1 {
+		t.Fatalf("Synced = %d, want 1; errors: %v", result.Synced, result.Errors)
+	}
+	if len(fakeStripper.StripEmbeddedCalls) != 1 {
+		t.Fatalf("StripEmbeddedCalls = %d, want 1", len(fakeStripper.StripEmbeddedCalls))
+	}
+
+	// The video's Content Hash after the (simulated) Strip mutation.
+	postStripHash, err := media.ComputeContentHash(videoPath)
+	if err != nil {
+		t.Fatalf("computing post-strip video hash: %v", err)
+	}
+
+	sidecarPath := filepath.Join(libDir, "Test.Movie.2024.HDTV.x264-FAKEGROUP.en.srt")
+	sidecarContent, err := os.ReadFile(sidecarPath)
+	if err != nil {
+		t.Fatalf("reading sidecar: %v", err)
+	}
+	codec, _ := marker.CodecFor(".srt")
+	foundMarker, presence := codec.Read(sidecarContent)
+	if presence != marker.Present {
+		t.Fatalf("marker presence = %v, want Present", presence)
+	}
+	if foundMarker.ContentHash != postStripHash {
+		t.Errorf("marker hash = %q, want post-strip hash %q", foundMarker.ContentHash, postStripHash)
+	}
+
+	file, found, err := st.GetFile(ctx, lib.Name, videoPath)
+	if err != nil {
+		t.Fatalf("getting file from store: %v", err)
+	}
+	if !found {
+		t.Fatal("file not found in store")
+	}
+	if file.ContentHash != string(postStripHash) {
+		t.Errorf("store content hash = %q, want post-strip hash %q", file.ContentHash, postStripHash)
+	}
+	if len(file.Languages) != 1 || file.Languages[0].Status != domain.StatusSynced {
+		t.Fatalf("file.Languages = %+v, want 1 entry with status synced", file.Languages)
+	}
+
+	// Simulate total state loss: a brand-new, empty state store.
+	freshDBPath := filepath.Join(t.TempDir(), "fresh.db")
+	freshStore, err := store.Open(freshDBPath)
+	if err != nil {
+		t.Fatalf("opening fresh store: %v", err)
+	}
+	defer func() { _ = freshStore.Close() }()
+
+	fakeStripper.StripEmbeddedCalls = nil
+	fakeSyncEngine := &syncengine.FakeSyncEngine{}
+	p2 := &pipeline.Pipeline{
+		Store:       freshStore,
+		Provider:    fakeProvider,
+		SyncEngine:  fakeSyncEngine,
+		Stripper:    fakeStripper,
+		WorkerCount: 1,
+	}
+
+	result2, err := p2.Run(ctx, lib)
+	if err != nil {
+		t.Fatalf("run against fresh store: %v", err)
+	}
+	if result2.Skipped != 1 {
+		t.Errorf("Skipped = %d, want 1 (Marker recognized despite total state loss)", result2.Skipped)
+	}
+	if result2.Synced != 0 {
+		t.Errorf("Synced = %d, want 0 (should not reprocess)", result2.Synced)
+	}
+	if len(fakeSyncEngine.Calls) != 0 {
+		t.Errorf("SyncEngine.Calls = %d, want 0 (should not reprocess)", len(fakeSyncEngine.Calls))
+	}
+	if len(fakeStripper.StripEmbeddedCalls) != 0 {
+		t.Errorf("StripEmbeddedCalls = %d, want 0 (should not reprocess)", len(fakeStripper.StripEmbeddedCalls))
+	}
+}

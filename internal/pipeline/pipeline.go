@@ -65,6 +65,13 @@ func (p *Pipeline) logger() *slog.Logger {
 // as an interface so tests can inject a fake that doesn't shell out to
 // ffprobe/ffmpeg.
 type Stripper interface {
+	// StripEmbedded removes videoPath's embedded subtitle streams matching
+	// scope, mutating the video file in place when it removes anything. The
+	// pipeline calls this before computing the Content Hash used for the
+	// Marker and the store, so that hash reflects the file's settled
+	// post-Strip state — see CONTEXT.md's Content Hash entry.
+	StripEmbedded(ctx context.Context, videoPath string, scope domain.StripScope, lang language.Tag) ([]int, error)
+
 	Swap(
 		ctx context.Context,
 		videoPath string,
@@ -369,6 +376,35 @@ func (p *Pipeline) processFile(
 			return outcomeFailed, markErr
 		}
 		return outcomeFailed, fmt.Errorf("no marker codec for %s", sidecarExt)
+	}
+
+	removedStreams, err := p.Stripper.StripEmbedded(ctx, videoPath, lib.StripScope, lang)
+	if err != nil {
+		if markErr := p.Store.MarkFailed(ctx, file.ID, lang, domain.FailureInternalError); markErr != nil {
+			return outcomeFailed, errors.Join(err, markErr)
+		}
+		return outcomeFailed, fmt.Errorf("stripping embedded streams: %w", err)
+	}
+
+	// StripEmbedded's ffmpeg remux genuinely changes the video's bytes when
+	// it removes a stream, so the hash bound into the Marker and store must
+	// reflect the settled post-Strip file — the pre-Strip hash captured at
+	// the top of this step would otherwise misread Sublime's own edit as an
+	// external content change on the next scan (see CONTEXT.md's Content
+	// Hash entry).
+	if len(removedStreams) > 0 {
+		correctedHash, err := media.ComputeContentHash(videoPath)
+		if err != nil {
+			if markErr := p.Store.MarkFailed(ctx, file.ID, lang, domain.FailureInternalError); markErr != nil {
+				return outcomeFailed, errors.Join(err, markErr)
+			}
+			return outcomeFailed, fmt.Errorf("recomputing content hash after strip: %w", err)
+		}
+		hash = correctedHash
+
+		if err := p.Store.UpdateContentHash(ctx, file.ID, string(hash)); err != nil {
+			return outcomeFailed, fmt.Errorf("recording corrected content hash: %w", err)
+		}
 	}
 
 	markedContent, err := codec.Write(syncedContent, marker.Marker{ContentHash: hash})

@@ -88,6 +88,32 @@ func (s *Store) ObserveFileContentHash(ctx context.Context, libraryName, path, c
 	return file, nil
 }
 
+// UpdateContentHash records a corrected Content Hash for an already-known
+// fileID without resetting any of its language states, unlike
+// ObserveFileContentHash. Use this when Sublime's own Strip pass mutated
+// the video (changing its Content Hash) rather than an external content
+// change — the two intents are distinguished by which method is called,
+// not by inspecting the hash delta at each call site. Returns
+// ErrFileNotFound if fileID doesn't exist.
+func (s *Store) UpdateContentHash(ctx context.Context, fileID int64, contentHash string) error {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE files SET content_hash = ?, updated_at = ? WHERE id = ?`,
+		contentHash, nowString(), fileID,
+	)
+	if err != nil {
+		return fmt.Errorf("updating content hash: %w", err)
+	}
+
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("reading rows affected: %w", err)
+	}
+	if n == 0 {
+		return ErrFileNotFound
+	}
+	return nil
+}
+
 // EnsureLanguage guarantees fileID has a row for lang, inserting one as
 // StatusPending if it doesn't already exist. It never modifies an existing
 // row.
