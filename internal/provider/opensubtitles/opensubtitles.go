@@ -13,11 +13,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/text/language"
@@ -63,9 +65,15 @@ type Config struct {
 	// that records requested delays instead of sleeping.
 	Clock retry.Clock
 
-	// Now overrides the wall clock used for JWT-expiry bookkeeping and
-	// Retry-After date parsing; defaults to time.Now.
+	// Now overrides the wall clock used for JWT-expiry bookkeeping, Retry-
+	// After date parsing, and quota-suspension bookkeeping; defaults to
+	// time.Now.
 	Now func() time.Time
+
+	// Logger receives the Provider's own quota-suspension transition logs
+	// (entering and resuming) — see Provider.logger. Defaults to
+	// slog.Default() if nil, mirroring Pipeline.Logger's convention.
+	Logger *slog.Logger
 }
 
 // Provider is Sublime's real OpenSubtitles Provider.
@@ -73,6 +81,11 @@ type Provider struct {
 	client   *client
 	auth     *authenticator
 	executor *retry.Executor
+	now      func() time.Time
+	log      *slog.Logger
+
+	mu             sync.Mutex
+	suspendedUntil time.Time
 }
 
 var _ provider.Provider = (*Provider)(nil)
@@ -127,7 +140,69 @@ func New(cfg Config) (*Provider, error) {
 		client:   c,
 		executor: executor,
 		auth:     newAuthenticator(c, executor, cfg.Secrets.Username, cfg.Secrets.Password, now),
+		now:      now,
+		log:      cfg.Logger,
 	}, nil
+}
+
+// logger returns p.log, or slog.Default() if it isn't set.
+func (p *Provider) logger() *slog.Logger {
+	if p.log != nil {
+		return p.log
+	}
+	return slog.Default()
+}
+
+// suspendedError returns the quota-exhaustion signal to short-circuit the
+// caller with if p is still suspended as of now, or nil if p is free to
+// make a real request. Once the suspension's resume time has passed, it
+// clears the suspension and logs the resume transition before returning
+// nil — so the very next Search/Download call after that point issues a
+// real request again.
+func (p *Provider) suspendedError() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.suspendedUntil.IsZero() {
+		return nil
+	}
+	if p.now().Before(p.suspendedUntil) {
+		return &provider.QuotaExhaustedError{ResumeAt: p.suspendedUntil}
+	}
+
+	resumedAt := p.suspendedUntil
+	p.suspendedUntil = time.Time{}
+	p.logger().Info("opensubtitles: resuming after quota suspension", "resume_at", resumedAt)
+	return nil
+}
+
+// suspend enters the Suspended state until resumeAt and returns the
+// provider.QuotaExhaustedError callers should see, wrapping cause (the
+// OpenSubtitles-specific error that revealed the exhaustion) so it stays
+// inspectable via errors.As/Is.
+func (p *Provider) suspend(cause error, resumeAt time.Time) error {
+	p.mu.Lock()
+	p.suspendedUntil = resumeAt
+	p.mu.Unlock()
+
+	p.logger().Warn("opensubtitles: suspending due to quota exhaustion", "cause", cause, "resume_at", resumeAt)
+	return &provider.QuotaExhaustedError{ResumeAt: resumeAt, Cause: cause}
+}
+
+// quotaOrWrap inspects err for either quota-exhaustion response shape
+// (quotaExhaustion) and, if found, suspends p and returns the
+// provider.QuotaExhaustedError to surface; otherwise it returns ok=false so
+// the caller applies its own (non-quota) error handling.
+func (p *Provider) quotaOrWrap(err error) (wrapped error, ok bool) {
+	var apiErr *apiError
+	if !errors.As(err, &apiErr) {
+		return nil, false
+	}
+	resumeAt, exhausted := quotaExhaustion(apiErr)
+	if !exhausted {
+		return nil, false
+	}
+	return p.suspend(apiErr, resumeAt), true
 }
 
 // Search implements provider.Provider. It tries OpenSubtitles' own
@@ -137,6 +212,9 @@ func New(cfg Config) (*Provider, error) {
 // search finds nothing does it fall back to a fuzzy, metadata-based
 // search.
 func (p *Provider) Search(ctx context.Context, query provider.Query) ([]domain.Candidate, error) {
+	if err := p.suspendedError(); err != nil {
+		return nil, err
+	}
 	hashCandidates, err := p.searchByHash(ctx, query)
 	if err != nil {
 		return nil, err
@@ -195,7 +273,14 @@ func (p *Provider) searchRequest(ctx context.Context, params url.Values) (search
 	op := func(ctx context.Context, _ int) (searchResponseBody, error) {
 		return doJSON[noRequestBody, searchResponseBody](ctx, p.client, http.MethodGet, path, nil, "")
 	}
-	return retry.Do(ctx, p.executor, op)
+	resp, err := retry.Do(ctx, p.executor, op)
+	if err != nil {
+		if wrapped, ok := p.quotaOrWrap(err); ok {
+			return searchResponseBody{}, wrapped
+		}
+		return searchResponseBody{}, err
+	}
+	return resp, nil
 }
 
 // Download implements provider.Provider via OpenSubtitles' two-step
@@ -203,6 +288,10 @@ func (p *Provider) searchRequest(ctx context.Context, params url.Values) (search
 // short-lived link (consuming the daily download quota), then a plain GET
 // on that link fetches the subtitle bytes.
 func (p *Provider) Download(ctx context.Context, candidate domain.Candidate) ([]byte, error) {
+	if err := p.suspendedError(); err != nil {
+		return nil, err
+	}
+
 	fileID, err := strconv.Atoi(candidate.ID)
 	if err != nil {
 		return nil, fmt.Errorf("opensubtitles: candidate ID %q is not a valid file_id: %w", candidate.ID, err)
@@ -220,11 +309,11 @@ func (p *Provider) Download(ctx context.Context, candidate domain.Candidate) ([]
 
 	resp, err := retry.Do(ctx, p.executor, op)
 	if err != nil {
+		if wrapped, ok := p.quotaOrWrap(err); ok {
+			return nil, wrapped
+		}
 		var apiErr *apiError
 		if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusUnauthorized {
-			if apiErr.ResetTimeUTC != "" {
-				return nil, &QuotaExhaustedError{Message: apiErr.Message, ResetAtUTC: apiErr.ResetTimeUTC}
-			}
 			p.auth.invalidate()
 			return nil, &AuthenticationError{Message: apiErr.Message}
 		}
@@ -236,6 +325,9 @@ func (p *Provider) Download(ctx context.Context, candidate domain.Candidate) ([]
 	}
 	data, err := retry.Do(ctx, p.executor, getOp)
 	if err != nil {
+		if wrapped, ok := p.quotaOrWrap(err); ok {
+			return nil, wrapped
+		}
 		return nil, fmt.Errorf("opensubtitles: fetching subtitle content: %w", err)
 	}
 	return data, nil
