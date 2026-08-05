@@ -11,7 +11,7 @@ import (
 	"github.com/aaronkyriesenbach/sublime/internal/strip"
 )
 
-func TestSwap_WritesNewSidecarAndRemovesForeignEmbeddedAndSidecarSubtitles(t *testing.T) {
+func TestSwap_WritesNewSidecarAndRemovesForeignSidecar(t *testing.T) {
 	dir := t.TempDir()
 	hash := media.ContentHash("0123456789abcdef")
 	en := mustLang(t, "en")
@@ -36,9 +36,6 @@ func TestSwap_WritesNewSidecarAndRemovesForeignEmbeddedAndSidecarSubtitles(t *te
 		t.Errorf("expected sidecar content 'synced content', got %q", got)
 	}
 
-	if len(result.RemovedEmbeddedStreams) != 1 {
-		t.Errorf("expected 1 embedded stream removed, got %v", result.RemovedEmbeddedStreams)
-	}
 	if len(result.RemovedSidecars) != 1 || filepath.Base(result.RemovedSidecars[0]) != "muxed.en.ass" {
 		t.Errorf("expected the foreign sidecar removed, got %v", result.RemovedSidecars)
 	}
@@ -46,12 +43,15 @@ func TestSwap_WritesNewSidecarAndRemovesForeignEmbeddedAndSidecarSubtitles(t *te
 		t.Errorf("expected foreign sidecar to be deleted, stat error: %v", err)
 	}
 
+	// Swap no longer touches embedded subtitle streams; that's the caller's
+	// responsibility via Stripper.StripEmbedded, called separately before
+	// Swap.
 	streams, err := s.ProbeSubtitleStreams(context.Background(), video)
 	if err != nil {
 		t.Fatalf("re-probing swapped video: %v", err)
 	}
-	if len(streams) != 0 {
-		t.Errorf("expected 0 embedded subtitle streams after Swap, got %d", len(streams))
+	if len(streams) != 1 {
+		t.Errorf("expected the embedded subtitle stream to survive Swap, got %d streams", len(streams))
 	}
 }
 
@@ -87,7 +87,7 @@ func TestSwap_NoExistingSubtitlesAtAll(t *testing.T) {
 		t.Fatalf("Swap returned error: %v", err)
 	}
 
-	if len(result.RemovedSidecars) != 0 || len(result.RemovedEmbeddedStreams) != 0 {
+	if len(result.RemovedSidecars) != 0 {
 		t.Errorf("expected nothing removed, got %+v", result)
 	}
 	if _, err := os.Stat(result.SidecarPath); err != nil {

@@ -184,6 +184,54 @@ func TestGetFile_NotFound(t *testing.T) {
 	}
 }
 
+func TestUpdateContentHash_LeavesLanguageStatesUntouched(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	en := mustLang(t, "en")
+
+	file, err := s.ObserveFileContentHash(ctx, "movies", "/media/movies/a.mkv", "hash-1")
+	if err != nil {
+		t.Fatalf("ObserveFileContentHash returned error: %v", err)
+	}
+	if err := s.EnsureLanguage(ctx, file.ID, en); err != nil {
+		t.Fatalf("EnsureLanguage returned error: %v", err)
+	}
+	if err := s.MarkSynced(ctx, file.ID, en); err != nil {
+		t.Fatalf("MarkSynced returned error: %v", err)
+	}
+
+	if err := s.UpdateContentHash(ctx, file.ID, "hash-corrected"); err != nil {
+		t.Fatalf("UpdateContentHash returned error: %v", err)
+	}
+
+	updated, ok, err := s.GetFile(ctx, "movies", "/media/movies/a.mkv")
+	if err != nil {
+		t.Fatalf("GetFile returned error: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected GetFile to find the file")
+	}
+	if updated.ContentHash != "hash-corrected" {
+		t.Errorf("expected content hash %q, got %q", "hash-corrected", updated.ContentHash)
+	}
+	if len(updated.Languages) != 1 {
+		t.Fatalf("expected 1 language state, got %d: %+v", len(updated.Languages), updated.Languages)
+	}
+	if updated.Languages[0].Status != domain.StatusSynced {
+		t.Errorf("expected status to remain %q, got %q", domain.StatusSynced, updated.Languages[0].Status)
+	}
+}
+
+func TestUpdateContentHash_UnknownFile(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+
+	err := s.UpdateContentHash(ctx, 12345, "hash-1")
+	if !errors.Is(err, store.ErrFileNotFound) {
+		t.Errorf("expected ErrFileNotFound, got %v", err)
+	}
+}
+
 func TestEnsureLanguage_IsIdempotentAndDefaultsToPending(t *testing.T) {
 	s := openTestStore(t)
 	ctx := context.Background()
