@@ -100,7 +100,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	resp := StatusResponse{Libraries: libSummaries}
+	resp := StatusResponse{Libraries: libSummaries, Providers: s.providerEntries()}
 
 	if scoped {
 		files, total, err := s.store.ListFiles(r.Context(), store.FileFilter{
@@ -122,6 +122,24 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// providerEntries builds GET /status' providers array from s.providers,
+// calling each Status func live so a currently-Suspended Provider's
+// resumeAt reflects its actual current state.
+func (s *Server) providerEntries() []ProviderEntry {
+	entries := make([]ProviderEntry, 0, len(s.providers))
+	for _, p := range s.providers {
+		entry := ProviderEntry{Name: p.Name}
+		if p.Status != nil {
+			if resumeAt, suspended := p.Status(); suspended {
+				entry.Suspended = true
+				entry.ResumeAt = &resumeAt
+			}
+		}
+		entries = append(entries, entry)
+	}
+	return entries
 }
 
 func toFileEntries(files []domain.File) []FileEntry {

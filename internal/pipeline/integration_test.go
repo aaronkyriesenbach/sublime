@@ -337,7 +337,7 @@ func TestIntegration_NewProduction_Success(t *testing.T) {
 	}
 	defer func() { _ = st.Close() }()
 
-	p, err := pipeline.NewProduction(pipeline.ProductionConfig{
+	p, providerStatuses, err := pipeline.NewProduction(pipeline.ProductionConfig{
 		Store: st,
 		Secrets: config.OpenSubtitlesSecrets{
 			APIKey:   "test-api-key",
@@ -362,6 +362,12 @@ func TestIntegration_NewProduction_Success(t *testing.T) {
 	if p.Stripper == nil {
 		t.Error("pipeline.Stripper is nil")
 	}
+	if len(providerStatuses) != 1 || providerStatuses[0].Name != "opensubtitles" {
+		t.Errorf("providerStatuses = %+v, want a single opensubtitles entry", providerStatuses)
+	}
+	if providerStatuses[0].Suspension == nil {
+		t.Error("providerStatuses[0].Suspension is nil, want the opensubtitles Provider's suspension reporter")
+	}
 }
 
 func TestIntegration_NewProduction_MissingSecrets(t *testing.T) {
@@ -372,7 +378,7 @@ func TestIntegration_NewProduction_MissingSecrets(t *testing.T) {
 	}
 	defer func() { _ = st.Close() }()
 
-	_, err = pipeline.NewProduction(pipeline.ProductionConfig{
+	_, _, err = pipeline.NewProduction(pipeline.ProductionConfig{
 		Store:   st,
 		Secrets: config.OpenSubtitlesSecrets{},
 	})

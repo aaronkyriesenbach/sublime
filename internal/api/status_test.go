@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"golang.org/x/text/language"
 
@@ -343,6 +344,107 @@ func TestStatus_PaginatesWithLimitAndOffset(t *testing.T) {
 
 func fileNameForIndex(i int) string {
 	return "/media/movies/file" + string(rune('a'+i)) + ".mkv"
+}
+
+func TestStatus_ProvidersReflectsSuspendedStateAndResumeAt(t *testing.T) {
+	st := openTestStore(t)
+	resumeAt := time.Date(2026, 1, 1, 1, 0, 0, 0, time.UTC)
+
+	srv := api.NewServer(api.Deps{
+		Store:     st,
+		Libraries: testLibraries(),
+		Providers: []api.ProviderStatusFunc{
+			{
+				Name:   "opensubtitles",
+				Status: func() (time.Time, bool) { return resumeAt, true },
+			},
+		},
+	})
+	defer srv.Close()
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/status")
+	if err != nil {
+		t.Fatalf("GET /status: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	var body statusResponse
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decoding response: %v", err)
+	}
+
+	if len(body.Providers) != 1 {
+		t.Fatalf("providers = %+v, want 1 entry", body.Providers)
+	}
+	p := body.Providers[0]
+	if p.Name != "opensubtitles" || !p.Suspended {
+		t.Errorf("providers[0] = %+v, want name=opensubtitles suspended=true", p)
+	}
+	if p.ResumeAt == nil || !p.ResumeAt.Equal(resumeAt) {
+		t.Errorf("providers[0].ResumeAt = %v, want %v", p.ResumeAt, resumeAt)
+	}
+}
+
+func TestStatus_ProvidersReflectsNotSuspendedAndMissingCapability(t *testing.T) {
+	st := openTestStore(t)
+
+	srv := api.NewServer(api.Deps{
+		Store:     st,
+		Libraries: testLibraries(),
+		Providers: []api.ProviderStatusFunc{
+			{Name: "not-suspended", Status: func() (time.Time, bool) { return time.Time{}, false }},
+			{Name: "no-capability"},
+		},
+	})
+	defer srv.Close()
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/status")
+	if err != nil {
+		t.Fatalf("GET /status: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	var body statusResponse
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decoding response: %v", err)
+	}
+
+	if len(body.Providers) != 2 {
+		t.Fatalf("providers = %+v, want 2 entries", body.Providers)
+	}
+	for _, p := range body.Providers {
+		if p.Suspended {
+			t.Errorf("providers = %+v, want none suspended", body.Providers)
+		}
+		if p.ResumeAt != nil {
+			t.Errorf("provider %q ResumeAt = %v, want nil", p.Name, p.ResumeAt)
+		}
+	}
+}
+
+func TestStatus_ProvidersEmptyWhenNoneConfigured(t *testing.T) {
+	srv := api.NewServer(api.Deps{Store: openTestStore(t), Libraries: testLibraries()})
+	defer srv.Close()
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/status")
+	if err != nil {
+		t.Fatalf("GET /status: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("reading response body: %v", err)
+	}
+	if !strings.Contains(string(raw), `"providers":[]`) {
+		t.Errorf("expected response to contain an empty providers array, got %s", raw)
+	}
 }
 
 func TestStatus_UnknownLibraryReturns404WithErrorEnvelope(t *testing.T) {
