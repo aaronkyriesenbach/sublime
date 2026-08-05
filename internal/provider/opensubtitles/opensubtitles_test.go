@@ -1,13 +1,16 @@
 package opensubtitles_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -403,7 +406,12 @@ func TestDownload_ReLoginsAfterTokenExpires(t *testing.T) {
 	}
 }
 
-func TestDownload_QuotaExhausted(t *testing.T) {
+// TestDownload_QuotaExhausted_401ResetTimeUTC is regression coverage for
+// the original 401+reset_time_utc quota-exhaustion shape (issue #13): it
+// must still classify correctly now that quota exhaustion is detected via
+// the Provider-agnostic provider.QuotaExhaustedError (issue #56) instead of
+// an OpenSubtitles-specific type.
+func TestDownload_QuotaExhausted_401ResetTimeUTC(t *testing.T) {
 	mock := newMockServer(t)
 	mock.on(http.MethodPost, "/login", jsonHandler(http.StatusOK, map[string]any{"token": "jwt-token"}))
 	mock.on(http.MethodPost, "/download", jsonHandler(http.StatusUnauthorized, map[string]any{
@@ -416,17 +424,183 @@ func TestDownload_QuotaExhausted(t *testing.T) {
 
 	_, err := p.Download(context.Background(), domain.Candidate{ID: "1"})
 
-	var quotaErr *opensubtitles.QuotaExhaustedError
+	var quotaErr *provider.QuotaExhaustedError
 	if !errors.As(err, &quotaErr) {
-		t.Fatalf("Download() error = %v, want a *QuotaExhaustedError", err)
+		t.Fatalf("Download() error = %v, want a *provider.QuotaExhaustedError", err)
 	}
-	if quotaErr.ResetAtUTC != "2026-01-02T00:00:00Z" {
-		t.Errorf("ResetAtUTC = %q, want %q", quotaErr.ResetAtUTC, "2026-01-02T00:00:00Z")
+	if want := time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC); !quotaErr.ResumeAt.Equal(want) {
+		t.Errorf("ResumeAt = %v, want %v", quotaErr.ResumeAt, want)
 	}
 
 	// A quota-exhausted 401 is terminal: no retry attempts.
 	if reqs := mock.requestsFor(http.MethodPost, "/download"); len(reqs) != 1 {
 		t.Errorf("got %d /download requests, want 1 (no retry on quota exhaustion)", len(reqs))
+	}
+}
+
+// TestDownload_QuotaExhausted_406EmbeddedResetTime covers the real-world
+// quota-exhaustion shape (issue #56): a 406 whose reset time is only
+// embedded in the message's free text, not a structured field.
+func TestDownload_QuotaExhausted_406EmbeddedResetTime(t *testing.T) {
+	mock := newMockServer(t)
+	mock.on(http.MethodPost, "/login", jsonHandler(http.StatusOK, map[string]any{"token": "jwt-token"}))
+	mock.on(http.MethodPost, "/download", jsonHandler(http.StatusNotAcceptable, map[string]any{
+		"message": "Not acceptable. Your quota will be renewed in 00 hours and 57 minutes (2026-01-02 00:57:00 UTC)",
+	}))
+
+	clock := &fakeClock{}
+	p := newTestProvider(t, mock, clock)
+
+	_, err := p.Download(context.Background(), domain.Candidate{ID: "1"})
+
+	var quotaErr *provider.QuotaExhaustedError
+	if !errors.As(err, &quotaErr) {
+		t.Fatalf("Download() error = %v, want a *provider.QuotaExhaustedError", err)
+	}
+	if want := time.Date(2026, 1, 2, 0, 57, 0, 0, time.UTC); !quotaErr.ResumeAt.Equal(want) {
+		t.Errorf("ResumeAt = %v, want %v", quotaErr.ResumeAt, want)
+	}
+
+	if reqs := mock.requestsFor(http.MethodPost, "/download"); len(reqs) != 1 {
+		t.Errorf("got %d /download requests, want 1 (no retry on quota exhaustion)", len(reqs))
+	}
+}
+
+// TestDownload_QuotaExhausted_NoParseableResetTime_FallsBackToOneHourCooldown
+// covers a quota-exhaustion response OpenSubtitles sends with no resume
+// time Sublime can parse at all: the Provider must still suspend, using a
+// fixed 1h cooldown from the observed response time (issue #56).
+func TestDownload_QuotaExhausted_NoParseableResetTime_FallsBackToOneHourCooldown(t *testing.T) {
+	mock := newMockServer(t)
+	mock.on(http.MethodPost, "/login", jsonHandler(http.StatusOK, map[string]any{"token": "jwt-token"}))
+	mock.on(http.MethodPost, "/download", jsonHandler(http.StatusNotAcceptable, map[string]any{
+		"message": "Quota exceeded, try again later.",
+	}))
+
+	clock := &fakeClock{}
+	observedAt := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC) // matches newTestProvider's fixed Now
+	p := newTestProvider(t, mock, clock)
+
+	_, err := p.Download(context.Background(), domain.Candidate{ID: "1"})
+
+	var quotaErr *provider.QuotaExhaustedError
+	if !errors.As(err, &quotaErr) {
+		t.Fatalf("Download() error = %v, want a *provider.QuotaExhaustedError", err)
+	}
+	if want := observedAt.Add(time.Hour); !quotaErr.ResumeAt.Equal(want) {
+		t.Errorf("ResumeAt = %v, want %v (1h fallback)", quotaErr.ResumeAt, want)
+	}
+}
+
+// TestQuotaSuspension_ShortCircuitsUntilResumeTimeThenResumes drives the
+// Provider's full Suspended lifecycle (issue #56): a quota-exhaustion
+// response suspends it; a subsequent Download before the resume time makes
+// no HTTP request at all and returns the same signal; once the resume time
+// passes, a further Download issues a real request again.
+func TestQuotaSuspension_ShortCircuitsUntilResumeTimeThenResumes(t *testing.T) {
+	mock := newMockServer(t)
+	mock.on(http.MethodPost, "/login", jsonHandler(http.StatusOK, map[string]any{"token": "jwt-token"}))
+	mock.on(http.MethodPost, "/download", jsonHandler(http.StatusUnauthorized, map[string]any{
+		"message":        "quota exceeded",
+		"reset_time_utc": "2026-01-01T01:00:00Z",
+	}))
+
+	clock := &fakeClock{}
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	p, err := opensubtitles.New(opensubtitles.Config{
+		Secrets: testSecrets(),
+		BaseURL: mock.URL(),
+		Clock:   clock,
+		Now:     func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	_, err = p.Download(context.Background(), domain.Candidate{ID: "1"})
+	var quotaErr *provider.QuotaExhaustedError
+	if !errors.As(err, &quotaErr) {
+		t.Fatalf("first Download() error = %v, want a *provider.QuotaExhaustedError", err)
+	}
+	resumeAt := quotaErr.ResumeAt
+
+	// Still before resumeAt: no handlers queued for /login or /download, so
+	// any real request would fail the mock server outright.
+	now = now.Add(30 * time.Minute)
+	_, err = p.Download(context.Background(), domain.Candidate{ID: "2"})
+	var secondQuotaErr *provider.QuotaExhaustedError
+	if !errors.As(err, &secondQuotaErr) {
+		t.Fatalf("second Download() error = %v, want a *provider.QuotaExhaustedError", err)
+	}
+	if !secondQuotaErr.ResumeAt.Equal(resumeAt) {
+		t.Errorf("second ResumeAt = %v, want %v (unchanged while still suspended)", secondQuotaErr.ResumeAt, resumeAt)
+	}
+	if reqs := mock.requestsFor(http.MethodPost, "/download"); len(reqs) != 1 {
+		t.Errorf("got %d /download requests, want 1 (suspended call must not hit the network)", len(reqs))
+	}
+
+	// Past resumeAt: a real request should go out again.
+	now = resumeAt.Add(time.Minute)
+	mock.on(http.MethodPost, "/download", jsonHandler(http.StatusOK, map[string]any{
+		"link": mockServerLink(mock, "/signed/sub.srt"),
+	}))
+	mock.on(http.MethodGet, "/signed/sub.srt", rawHandler(http.StatusOK, "content"))
+
+	data, err := p.Download(context.Background(), domain.Candidate{ID: "3"})
+	if err != nil {
+		t.Fatalf("third Download() error = %v, want success after resume time", err)
+	}
+	if string(data) != "content" {
+		t.Errorf("Download() = %q, want %q", data, "content")
+	}
+	if reqs := mock.requestsFor(http.MethodPost, "/download"); len(reqs) != 2 {
+		t.Errorf("got %d /download requests, want 2 (a real request after resuming)", len(reqs))
+	}
+}
+
+// TestQuotaSuspension_LogsEnterAndResume guards the ticket's observability
+// requirement: one log line entering Suspended (with cause and resume
+// time) and one resuming.
+func TestQuotaSuspension_LogsEnterAndResume(t *testing.T) {
+	mock := newMockServer(t)
+	mock.on(http.MethodPost, "/login", jsonHandler(http.StatusOK, map[string]any{"token": "jwt-token"}))
+	mock.on(http.MethodPost, "/download", jsonHandler(http.StatusUnauthorized, map[string]any{
+		"message":        "quota exceeded",
+		"reset_time_utc": "2026-01-01T01:00:00Z",
+	}))
+	mock.on(http.MethodPost, "/download", jsonHandler(http.StatusOK, map[string]any{
+		"link": mockServerLink(mock, "/signed/sub.srt"),
+	}))
+	mock.on(http.MethodGet, "/signed/sub.srt", rawHandler(http.StatusOK, "content"))
+
+	clock := &fakeClock{}
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	var logBuf bytes.Buffer
+	p, err := opensubtitles.New(opensubtitles.Config{
+		Secrets: testSecrets(),
+		BaseURL: mock.URL(),
+		Clock:   clock,
+		Now:     func() time.Time { return now },
+		Logger:  slog.New(slog.NewTextHandler(&logBuf, nil)),
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	if _, err := p.Download(context.Background(), domain.Candidate{ID: "1"}); err == nil {
+		t.Fatal("expected the first Download() to fail with quota exhaustion")
+	}
+
+	now = now.Add(2 * time.Hour) // past the 01:00:00 resume time
+	if _, err := p.Download(context.Background(), domain.Candidate{ID: "2"}); err != nil {
+		t.Fatalf("second Download() error = %v, want success after resume time", err)
+	}
+
+	logOutput := logBuf.String()
+	for _, want := range []string{"suspending", "resuming", "2026-01-01T01:00:00"} {
+		if !strings.Contains(logOutput, want) {
+			t.Errorf("log output = %q, want it to contain %q", logOutput, want)
+		}
 	}
 }
 
