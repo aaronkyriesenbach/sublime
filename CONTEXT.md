@@ -28,6 +28,14 @@ _Avoid_: Result, match (as a noun — Match is reserved for a scored attribute)
 An external subtitle source Sublime can query for Candidates (e.g., OpenSubtitles). Each Provider owns its own rate limit and derives whatever hash or query key it needs from the video internally; Sublime supports one Provider in v1 but is built to support several.
 _Avoid_: Source, backend
 
+**Suspended**:
+A time-bounded state of a single Provider — not a Sync Status of any (file, language) pair — entered when the Provider reports its request quota is exhausted, and lasting until the Provider-reported (or, failing that, a conservative default) resume time. While Suspended, no further Search or Download calls are made against that Provider; every (file, language) pair that would otherwise be attempted is left Pending rather than marked Failed, since the Provider's unavailability says nothing about whether any individual file can be synced. Scoped to the one Provider that reported exhaustion — other Providers are unaffected. Distinct from Failed: Suspended is an environmental, self-clearing condition owned by the Provider, not a per-file outcome owned by the state store.
+_Avoid_: Paused (used informally above, but Suspended is the canonical term), rate-limited, blocked
+
+**Quota Exhausted**:
+The cause recorded for a Provider entering Suspended: it has used its full allotment of a rate-limited operation (e.g. OpenSubtitles' 24h download quota) and been told to wait until a reset time. Distinct from ordinary throttling (a 429/5xx response, handled by adaptive backoff on individual requests) — Quota Exhausted is a hard stop with a known-ish resume time, not a rate to slow down.
+_Avoid_: Rate limited, throttled
+
 **Sync Engine**:
 The tool Sublime uses to perform Sync (e.g., alass). Swappable independently of the Provider used to retrieve the Candidate.
 _Avoid_: Aligner, sync tool
