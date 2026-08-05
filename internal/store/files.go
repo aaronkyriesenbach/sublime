@@ -12,6 +12,29 @@ import (
 	"github.com/aaronkyriesenbach/sublime/internal/domain"
 )
 
+// FileHashObservation classifies what ObserveFileHash found when recording
+// a file's Content Hash, distinguishing a brand-new path (Found) from an
+// already-tracked one whose hash did or didn't change — see CONTEXT.md's
+// Found and Changed entries. The pipeline combines this with its own
+// force-reprocess flag to decide the Found-vs-Changed classification it
+// logs; the store only knows about the hash itself.
+type FileHashObservation int
+
+const (
+	// FileHashNew means path had never been recorded before this call; the
+	// file row was just inserted, with no language rows yet.
+	FileHashNew FileHashObservation = iota
+
+	// FileHashChanged means path was already tracked but contentHash
+	// differs from its last-recorded value; its existing language rows
+	// were reset to StatusPending in place.
+	FileHashChanged
+
+	// FileHashUnchanged means path was already tracked and contentHash
+	// matches its last-recorded value; nothing was changed.
+	FileHashUnchanged
+)
+
 // ObserveFileContentHash records path's current Content Hash within
 // libraryName, inserting a new file row if none exists yet.
 //
@@ -22,10 +45,20 @@ import (
 // recorded. This reset-on-mismatch behavior represents a fresh scan
 // observing a hash change and implying the file's content has changed;
 // when Sublime needs to update its own content hash record without
-// resetting language states, use UpdateContentHash instead (once available).
+// resetting language states, use UpdateContentHash instead.
 func (s *Store) ObserveFileContentHash(ctx context.Context, libraryName, path, contentHash string) (domain.File, error) {
+	file, _, err := s.ObserveFileHash(ctx, libraryName, path, contentHash)
+	return file, err
+}
+
+// ObserveFileHash is ObserveFileContentHash plus a FileHashObservation
+// reporting whether path was newly inserted, changed, or unchanged, so
+// callers (the pipeline) can classify a file as Found or Changed without
+// re-deriving that from the hash themselves.
+func (s *Store) ObserveFileHash(ctx context.Context, libraryName, path, contentHash string) (domain.File, FileHashObservation, error) {
 	now := nowString()
 	var file domain.File
+	observation := FileHashUnchanged
 
 	err := s.withTx(ctx, func(tx *sql.Tx) error {
 		var id int64
@@ -48,11 +81,13 @@ func (s *Store) ObserveFileContentHash(ctx context.Context, libraryName, path, c
 			if err != nil {
 				return fmt.Errorf("reading inserted file id: %w", err)
 			}
+			observation = FileHashNew
 
 		case err != nil:
 			return fmt.Errorf("looking up file: %w", err)
 
 		case existingHash != contentHash:
+			observation = FileHashChanged
 			if _, err := tx.ExecContext(ctx,
 				`UPDATE files SET content_hash = ?, updated_at = ? WHERE id = ?`,
 				contentHash, now, id,
@@ -82,10 +117,27 @@ func (s *Store) ObserveFileContentHash(ctx context.Context, libraryName, path, c
 		return nil
 	})
 	if err != nil {
-		return domain.File{}, err
+		return domain.File{}, FileHashUnchanged, err
 	}
 
-	return file, nil
+	return file, observation, nil
+}
+
+// ResetToPending resets fileID's existing language rows to StatusPending in
+// place (FailureReason cleared, updated_at bumped), without touching its
+// Content Hash or inserting any new rows. Unlike ObserveFileHash's
+// reset-on-hash-change, this is for a manual reprocess request against an
+// already-tracked file whose Content Hash hasn't necessarily changed — a
+// Changed event per CONTEXT.md even though the hash itself may be identical.
+func (s *Store) ResetToPending(ctx context.Context, fileID int64) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE file_language_states SET status = ?, failure_reason = NULL, updated_at = ? WHERE file_id = ?`,
+		domain.StatusPending, nowString(), fileID,
+	)
+	if err != nil {
+		return fmt.Errorf("resetting language states to pending: %w", err)
+	}
+	return nil
 }
 
 // UpdateContentHash records a corrected Content Hash for an already-known
