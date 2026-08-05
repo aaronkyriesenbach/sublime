@@ -273,6 +273,80 @@ func TestResetToPending_ResetsExistingLanguageStatesRegardlessOfContentHash(t *t
 	}
 }
 
+func TestResetLanguageToPending_ResetsOnlyTheGivenLanguage(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	en := mustLang(t, "en")
+	pt := mustLang(t, "pt-BR")
+
+	file, err := s.ObserveFileContentHash(ctx, "movies", "/media/movies/a.mkv", "hash-1")
+	if err != nil {
+		t.Fatalf("ObserveFileContentHash returned error: %v", err)
+	}
+	if err := s.EnsureLanguage(ctx, file.ID, en); err != nil {
+		t.Fatalf("EnsureLanguage(en) returned error: %v", err)
+	}
+	if err := s.EnsureLanguage(ctx, file.ID, pt); err != nil {
+		t.Fatalf("EnsureLanguage(pt-BR) returned error: %v", err)
+	}
+	if err := s.MarkFailed(ctx, file.ID, en, domain.FailureRetrievalFailed); err != nil {
+		t.Fatalf("MarkFailed(en) returned error: %v", err)
+	}
+	if err := s.MarkSynced(ctx, file.ID, pt); err != nil {
+		t.Fatalf("MarkSynced(pt-BR) returned error: %v", err)
+	}
+
+	// A quota-exhausted attempt on one language shouldn't touch the state
+	// of the file's other, unrelated languages.
+	if err := s.ResetLanguageToPending(ctx, file.ID, en); err != nil {
+		t.Fatalf("ResetLanguageToPending returned error: %v", err)
+	}
+
+	fetched, ok, err := s.GetFile(ctx, "movies", "/media/movies/a.mkv")
+	if err != nil {
+		t.Fatalf("GetFile returned error: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected GetFile to find the file")
+	}
+	if len(fetched.Languages) != 2 {
+		t.Fatalf("expected exactly 2 language rows, got %d: %+v", len(fetched.Languages), fetched.Languages)
+	}
+	for _, ls := range fetched.Languages {
+		switch ls.Language {
+		case en:
+			if ls.Status != domain.StatusPending {
+				t.Errorf("expected en to be reset to %q, got %q", domain.StatusPending, ls.Status)
+			}
+			if ls.FailureReason != domain.FailureNone {
+				t.Errorf("expected en to have no failure reason after reset, got %q", ls.FailureReason)
+			}
+		case pt:
+			if ls.Status != domain.StatusSynced {
+				t.Errorf("expected pt-BR to remain untouched at %q, got %q", domain.StatusSynced, ls.Status)
+			}
+		default:
+			t.Errorf("unexpected language state: %+v", ls)
+		}
+	}
+}
+
+func TestResetLanguageToPending_UnknownLanguageState(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	en := mustLang(t, "en")
+
+	file, err := s.ObserveFileContentHash(ctx, "movies", "/media/movies/a.mkv", "hash-1")
+	if err != nil {
+		t.Fatalf("ObserveFileContentHash returned error: %v", err)
+	}
+
+	err = s.ResetLanguageToPending(ctx, file.ID, en)
+	if !errors.Is(err, store.ErrLanguageStateNotFound) {
+		t.Fatalf("expected ErrLanguageStateNotFound, got %v", err)
+	}
+}
+
 func TestGetFile_NotFound(t *testing.T) {
 	s := openTestStore(t)
 	ctx := context.Background()

@@ -140,6 +140,25 @@ func (s *Store) ResetToPending(ctx context.Context, fileID int64) error {
 	return nil
 }
 
+// ResetLanguageToPending resets fileID's single (file, language) row to
+// StatusPending in place (FailureReason cleared, updated_at bumped),
+// without touching any of the file's other language rows or its Content
+// Hash. Unlike ResetToPending, which resets every language row for a file,
+// this is scoped to one language — a quota-exhausted attempt on one
+// language shouldn't reset the state of a file's other, unrelated
+// languages. It returns ErrLanguageStateNotFound if no such row exists;
+// callers must EnsureLanguage first.
+func (s *Store) ResetLanguageToPending(ctx context.Context, fileID int64, lang language.Tag) error {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE file_language_states SET status = ?, failure_reason = NULL, updated_at = ? WHERE file_id = ? AND language = ?`,
+		domain.StatusPending, nowString(), fileID, lang.String(),
+	)
+	if err != nil {
+		return fmt.Errorf("resetting language state to pending: %w", err)
+	}
+	return checkUpdated(res)
+}
+
 // UpdateContentHash records a corrected Content Hash for an already-known
 // fileID without resetting any of its language states, unlike
 // ObserveFileContentHash. Use this when Sublime's own Strip pass mutated
