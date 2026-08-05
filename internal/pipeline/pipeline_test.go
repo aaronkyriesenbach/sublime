@@ -684,6 +684,259 @@ func TestPipeline_LogsStatusChangeForRetrievalFailure(t *testing.T) {
 	}
 }
 
+// TestPipeline_QuotaExhaustedOnSearchResetsToPending guards that a
+// provider.QuotaExhaustedError from Search leaves the (file, language) pair
+// Pending rather than routing it through markFailed: the log line must
+// land at INFO with to=pending and no reason, not an ERROR Failed landing.
+func TestPipeline_QuotaExhaustedOnSearchResetsToPending(t *testing.T) {
+	libDir := t.TempDir()
+
+	videoName := "Test.Movie.2024.HDTV.x264-FAKEGROUP.mp4"
+	videoPath := filepath.Join(libDir, videoName)
+
+	srcVideo := filepath.Join("..", "..", "testdata", "integration", "video", "sample.mp4")
+	videoContent, err := os.ReadFile(srcVideo)
+	if err != nil {
+		t.Fatalf("reading source video: %v", err)
+	}
+	if err := os.WriteFile(videoPath, videoContent, 0o644); err != nil {
+		t.Fatalf("writing video to library: %v", err)
+	}
+
+	dbPath := filepath.Join(t.TempDir(), "sublime.db")
+	st, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("opening store: %v", err)
+	}
+	defer func() { _ = st.Close() }()
+
+	quotaErr := &provider.QuotaExhaustedError{ResumeAt: time.Now().Add(24 * time.Hour)}
+	fakeProvider := &provider.Fake{
+		SearchFunc: func(ctx context.Context, q provider.Query) ([]domain.Candidate, error) {
+			return nil, quotaErr
+		},
+	}
+
+	lib := domain.Library{
+		Name:       "test-library",
+		Path:       libDir,
+		Languages:  []language.Tag{language.English},
+		StripScope: domain.StripScopeAll,
+	}
+
+	var logBuf bytes.Buffer
+	p := &pipeline.Pipeline{
+		Store:       st,
+		Provider:    fakeProvider,
+		SyncEngine:  &syncengine.FakeSyncEngine{},
+		Stripper:    &pipeline.FakeStripper{},
+		WorkerCount: 1,
+		Logger:      slog.New(slog.NewTextHandler(&logBuf, nil)),
+	}
+
+	ctx := context.Background()
+	result, err := p.Run(ctx, lib)
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if result.Failed != 0 {
+		t.Fatalf("Failed = %d, want 0; errors: %v", result.Failed, result.Errors)
+	}
+
+	file, ok, err := st.GetFile(ctx, "test-library", videoPath)
+	if err != nil {
+		t.Fatalf("GetFile returned error: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected GetFile to find the file")
+	}
+	if len(file.Languages) != 1 {
+		t.Fatalf("expected exactly 1 language row, got %d: %+v", len(file.Languages), file.Languages)
+	}
+	if file.Languages[0].Status != domain.StatusPending {
+		t.Errorf("expected language status %q, got %q", domain.StatusPending, file.Languages[0].Status)
+	}
+	if file.Languages[0].FailureReason != domain.FailureNone {
+		t.Errorf("expected no failure reason, got %q", file.Languages[0].FailureReason)
+	}
+
+	logOutput := logBuf.String()
+	for _, want := range []string{
+		"level=INFO", `msg="status changed"`, "library=test-library", "path=" + videoPath,
+		"language=en", "from=in_progress", "to=pending",
+	} {
+		if !strings.Contains(logOutput, want) {
+			t.Errorf("log output = %q, want it to contain %q", logOutput, want)
+		}
+	}
+	if strings.Contains(logOutput, "to=failed") {
+		t.Errorf("log output unexpectedly contains a Failed landing:%s", logOutput)
+	}
+	if strings.Contains(logOutput, "reason=") {
+		t.Errorf("log output unexpectedly contains a failure reason:%s", logOutput)
+	}
+}
+
+// TestPipeline_QuotaExhaustedOnDownloadResetsToPending guards the same
+// behavior when the QuotaExhaustedError surfaces from Download instead of
+// Search.
+func TestPipeline_QuotaExhaustedOnDownloadResetsToPending(t *testing.T) {
+	libDir := t.TempDir()
+
+	videoName := "Test.Movie.2024.HDTV.x264-FAKEGROUP.mp4"
+	videoPath := filepath.Join(libDir, videoName)
+
+	srcVideo := filepath.Join("..", "..", "testdata", "integration", "video", "sample.mp4")
+	videoContent, err := os.ReadFile(srcVideo)
+	if err != nil {
+		t.Fatalf("reading source video: %v", err)
+	}
+	if err := os.WriteFile(videoPath, videoContent, 0o644); err != nil {
+		t.Fatalf("writing video to library: %v", err)
+	}
+
+	dbPath := filepath.Join(t.TempDir(), "sublime.db")
+	st, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("opening store: %v", err)
+	}
+	defer func() { _ = st.Close() }()
+
+	quotaErr := &provider.QuotaExhaustedError{ResumeAt: time.Now().Add(24 * time.Hour)}
+	fakeProvider := &provider.Fake{
+		SearchFunc: func(ctx context.Context, q provider.Query) ([]domain.Candidate, error) {
+			return []domain.Candidate{{ID: "candidate", Title: "Test Movie", Year: 2024}}, nil
+		},
+		DownloadFunc: func(ctx context.Context, c domain.Candidate) ([]byte, error) {
+			return nil, quotaErr
+		},
+	}
+
+	lib := domain.Library{
+		Name:       "test-library",
+		Path:       libDir,
+		Languages:  []language.Tag{language.English},
+		StripScope: domain.StripScopeAll,
+	}
+
+	var logBuf bytes.Buffer
+	p := &pipeline.Pipeline{
+		Store:       st,
+		Provider:    fakeProvider,
+		SyncEngine:  &syncengine.FakeSyncEngine{},
+		Stripper:    &pipeline.FakeStripper{},
+		WorkerCount: 1,
+		Logger:      slog.New(slog.NewTextHandler(&logBuf, nil)),
+	}
+
+	ctx := context.Background()
+	result, err := p.Run(ctx, lib)
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if result.Failed != 0 {
+		t.Fatalf("Failed = %d, want 0; errors: %v", result.Failed, result.Errors)
+	}
+
+	file, ok, err := st.GetFile(ctx, "test-library", videoPath)
+	if err != nil {
+		t.Fatalf("GetFile returned error: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected GetFile to find the file")
+	}
+	if len(file.Languages) != 1 {
+		t.Fatalf("expected exactly 1 language row, got %d: %+v", len(file.Languages), file.Languages)
+	}
+	if file.Languages[0].Status != domain.StatusPending {
+		t.Errorf("expected language status %q, got %q", domain.StatusPending, file.Languages[0].Status)
+	}
+	if file.Languages[0].FailureReason != domain.FailureNone {
+		t.Errorf("expected no failure reason, got %q", file.Languages[0].FailureReason)
+	}
+
+	logOutput := logBuf.String()
+	if strings.Contains(logOutput, "to=failed") {
+		t.Errorf("log output unexpectedly contains a Failed landing:%s", logOutput)
+	}
+}
+
+// TestPipeline_QuotaExhaustedAcrossMultipleFilesAllStayPending guards that
+// several (file, language) pairs processed while the Provider keeps
+// returning QuotaExhaustedError all land Pending, not Failed — the
+// per-pair reset must not leak state across files.
+func TestPipeline_QuotaExhaustedAcrossMultipleFilesAllStayPending(t *testing.T) {
+	libDir := t.TempDir()
+
+	srcVideo := filepath.Join("..", "..", "testdata", "integration", "video", "sample.mp4")
+	videoContent, err := os.ReadFile(srcVideo)
+	if err != nil {
+		t.Fatalf("reading source video: %v", err)
+	}
+
+	videoNames := []string{
+		"Movie.One.2024.HDTV.x264-FAKEGROUP.mp4",
+		"Movie.Two.2024.HDTV.x264-FAKEGROUP.mp4",
+		"Movie.Three.2024.HDTV.x264-FAKEGROUP.mp4",
+	}
+	for _, name := range videoNames {
+		if err := os.WriteFile(filepath.Join(libDir, name), videoContent, 0o644); err != nil {
+			t.Fatalf("writing video %q to library: %v", name, err)
+		}
+	}
+
+	dbPath := filepath.Join(t.TempDir(), "sublime.db")
+	st, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("opening store: %v", err)
+	}
+	defer func() { _ = st.Close() }()
+
+	quotaErr := &provider.QuotaExhaustedError{ResumeAt: time.Now().Add(24 * time.Hour)}
+	fakeProvider := &provider.Fake{
+		SearchFunc: func(ctx context.Context, q provider.Query) ([]domain.Candidate, error) {
+			return nil, quotaErr
+		},
+	}
+
+	lib := domain.Library{
+		Name:       "test-library",
+		Path:       libDir,
+		Languages:  []language.Tag{language.English},
+		StripScope: domain.StripScopeAll,
+	}
+
+	p := &pipeline.Pipeline{
+		Store:       st,
+		Provider:    fakeProvider,
+		SyncEngine:  &syncengine.FakeSyncEngine{},
+		Stripper:    &pipeline.FakeStripper{},
+		WorkerCount: 1,
+	}
+
+	ctx := context.Background()
+	result, err := p.Run(ctx, lib)
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if result.Failed != 0 {
+		t.Fatalf("Failed = %d, want 0; errors: %v", result.Failed, result.Errors)
+	}
+
+	for _, name := range videoNames {
+		file, ok, err := st.GetFile(ctx, "test-library", filepath.Join(libDir, name))
+		if err != nil {
+			t.Fatalf("GetFile(%q) returned error: %v", name, err)
+		}
+		if !ok {
+			t.Fatalf("expected GetFile(%q) to find the file", name)
+		}
+		if len(file.Languages) != 1 || file.Languages[0].Status != domain.StatusPending {
+			t.Errorf("%q: expected single Pending language row, got %+v", name, file.Languages)
+		}
+	}
+}
+
 // TestPipeline_LogsStatusChangeForNoCandidate guards the uniform "status
 // changed" log line for a Failed landing whose reason is no_candidate: it
 // must log at WARN (not ERROR) with from=in_progress, to=failed, and
