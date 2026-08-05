@@ -1,0 +1,56 @@
+name: Release and Build Docker Image
+
+on:
+  push:
+    branches:
+      - "**"
+
+jobs:
+  checks:
+    name: Build, vet, test, and lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test ./...
+
+      - name: Lint
+        uses: golangci/golangci-lint-action@v8
+        with:
+          version: latest
+
+  release-please:
+    needs: checks
+    if: >
+      github.ref_name == 'master' &&
+      needs.checks.result == 'success'
+    uses: >-
+      aaronkyriesenbach/workflows/.github/workflows/release-please.yaml@master
+    permissions:
+      contents: write
+      pull-requests: write
+
+  docker:
+    needs: [checks, release-please]
+    if: >
+      always() && needs.checks.result == 'success' &&
+      (github.ref_name != 'master' ||
+        needs.release-please.outputs.release_created == 'true')
+    uses: >-
+      aaronkyriesenbach/workflows/.github/workflows/docker-build-push.yaml@master
+    with:
+      version: ${{ needs.release-please.outputs.version }}
+    permissions:
+      contents: read
+      packages: write
