@@ -122,6 +122,28 @@ func (p *Pipeline) markFailed(
 	return nil
 }
 
+// markPending resets fileID's (file, language) pair back to StatusPending
+// via the store's single-language reset and, on success, emits the
+// uniform "status changed" log for the In Progress -> Pending transition.
+// Used when a Provider reports QuotaExhaustedError: the attempt didn't
+// fail in any way that reflects on the file itself, so it's requeued
+// rather than landing on Failed, and logged as an ordinary Info-level
+// landing with no FailureReason — the "something's off" signal already
+// lives in the Provider's own Suspended log line.
+func (p *Pipeline) markPending(
+	ctx context.Context,
+	lib domain.Library,
+	videoPath string,
+	lang language.Tag,
+	fileID int64,
+) error {
+	if err := p.Store.ResetLanguageToPending(ctx, fileID, lang); err != nil {
+		return err
+	}
+	p.logStatusChange(ctx, lib, videoPath, lang, domain.StatusInProgress, domain.StatusPending, domain.FailureNone, nil)
+	return nil
+}
+
 // Stripper is the subset of strip.FFStripper the pipeline needs, extracted
 // as an interface so tests can inject a fake that doesn't shell out to
 // ffprobe/ffmpeg.
@@ -155,6 +177,10 @@ const (
 	// outcomeTerminal means a non-error terminal state was recorded (e.g.
 	// no_candidate) — the file won't be retried until content changes.
 	outcomeTerminal
+	// outcomePending means the pair was reset to StatusPending after a
+	// provider.QuotaExhaustedError — it will be retried on a future run,
+	// unlike outcomeTerminal.
+	outcomePending
 	// outcomeFailed means an error occurred.
 	outcomeFailed
 )
@@ -190,6 +216,10 @@ type Result struct {
 	// NoCandidate counts (file, language) pairs where no Candidate cleared
 	// the scoring cutoff.
 	NoCandidate int
+
+	// Requeued counts (file, language) pairs reset to Pending after a
+	// provider.QuotaExhaustedError — they'll be retried on a future run.
+	Requeued int
 
 	// Failed counts (file, language) pairs that failed with an error.
 	Failed int
@@ -276,6 +306,8 @@ func (p *Pipeline) runFiles(
 				result.Synced++
 			case outcomeTerminal:
 				result.NoCandidate++
+			case outcomePending:
+				result.Requeued++
 			}
 		}
 		resultCh <- result
@@ -480,6 +512,13 @@ func (p *Pipeline) processFile(
 
 	candidates, err := p.Provider.Search(ctx, query)
 	if err != nil {
+		var quotaErr *provider.QuotaExhaustedError
+		if errors.As(err, &quotaErr) {
+			if pendingErr := p.markPending(ctx, lib, videoPath, lang, file.ID); pendingErr != nil {
+				return outcomeFailed, errors.Join(err, pendingErr)
+			}
+			return outcomePending, nil
+		}
 		if markErr := p.markFailed(ctx, lib, videoPath, lang, file.ID, domain.FailureRetrievalFailed, err); markErr != nil {
 			return outcomeFailed, errors.Join(err, markErr)
 		}
@@ -504,6 +543,13 @@ func (p *Pipeline) processFile(
 
 	subtitleContent, err := p.Provider.Download(ctx, best)
 	if err != nil {
+		var quotaErr *provider.QuotaExhaustedError
+		if errors.As(err, &quotaErr) {
+			if pendingErr := p.markPending(ctx, lib, videoPath, lang, file.ID); pendingErr != nil {
+				return outcomeFailed, errors.Join(err, pendingErr)
+			}
+			return outcomePending, nil
+		}
 		if markErr := p.markFailed(ctx, lib, videoPath, lang, file.ID, domain.FailureRetrievalFailed, err); markErr != nil {
 			return outcomeFailed, errors.Join(err, markErr)
 		}
