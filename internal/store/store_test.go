@@ -403,6 +403,78 @@ func TestMarkFailed_RejectsInvalidReason(t *testing.T) {
 	}
 }
 
+func TestMarkInProgress_TransitionsFromPendingAndBackToSyncedOrFailed(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	en := mustLang(t, "en")
+
+	file, err := s.ObserveFileContentHash(ctx, "movies", "/media/movies/a.mkv", "hash-1")
+	if err != nil {
+		t.Fatalf("ObserveFileContentHash returned error: %v", err)
+	}
+	if err := s.EnsureLanguage(ctx, file.ID, en); err != nil {
+		t.Fatalf("EnsureLanguage returned error: %v", err)
+	}
+
+	if err := s.MarkInProgress(ctx, file.ID, en); err != nil {
+		t.Fatalf("MarkInProgress returned error: %v", err)
+	}
+
+	got, _, err := s.GetFile(ctx, "movies", "/media/movies/a.mkv")
+	if err != nil {
+		t.Fatalf("GetFile returned error: %v", err)
+	}
+	if got.Languages[0].Status != domain.StatusInProgress {
+		t.Errorf("expected status %q, got %q", domain.StatusInProgress, got.Languages[0].Status)
+	}
+	if got.Languages[0].FailureReason != domain.FailureNone {
+		t.Errorf("expected no failure reason while in progress, got %q", got.Languages[0].FailureReason)
+	}
+
+	// in_progress -> synced
+	if err := s.MarkSynced(ctx, file.ID, en); err != nil {
+		t.Fatalf("MarkSynced returned error: %v", err)
+	}
+	got, _, err = s.GetFile(ctx, "movies", "/media/movies/a.mkv")
+	if err != nil {
+		t.Fatalf("GetFile returned error: %v", err)
+	}
+	if got.Languages[0].Status != domain.StatusSynced {
+		t.Errorf("expected status %q, got %q", domain.StatusSynced, got.Languages[0].Status)
+	}
+
+	// back to in_progress, then to failed
+	if err := s.MarkInProgress(ctx, file.ID, en); err != nil {
+		t.Fatalf("second MarkInProgress returned error: %v", err)
+	}
+	if err := s.MarkFailed(ctx, file.ID, en, domain.FailureRetrievalFailed); err != nil {
+		t.Fatalf("MarkFailed returned error: %v", err)
+	}
+	got, _, err = s.GetFile(ctx, "movies", "/media/movies/a.mkv")
+	if err != nil {
+		t.Fatalf("GetFile returned error: %v", err)
+	}
+	if got.Languages[0].Status != domain.StatusFailed || got.Languages[0].FailureReason != domain.FailureRetrievalFailed {
+		t.Errorf("expected failed/retrieval_failed, got %q/%q", got.Languages[0].Status, got.Languages[0].FailureReason)
+	}
+}
+
+func TestMarkInProgress_UnknownLanguageState(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	en := mustLang(t, "en")
+
+	file, err := s.ObserveFileContentHash(ctx, "movies", "/media/movies/a.mkv", "hash-1")
+	if err != nil {
+		t.Fatalf("ObserveFileContentHash returned error: %v", err)
+	}
+
+	err = s.MarkInProgress(ctx, file.ID, en)
+	if !errors.Is(err, store.ErrLanguageStateNotFound) {
+		t.Fatalf("expected ErrLanguageStateNotFound, got %v", err)
+	}
+}
+
 func TestLibrarySummaries_CountsStatusesPerLibrary(t *testing.T) {
 	s := openTestStore(t)
 	ctx := context.Background()
@@ -431,6 +503,17 @@ func TestLibrarySummaries_CountsStatusesPerLibrary(t *testing.T) {
 		t.Fatalf("MarkFailed: %v", err)
 	}
 
+	movieC, err := s.ObserveFileContentHash(ctx, "movies", "/media/movies/c.mkv", "hash-4")
+	if err != nil {
+		t.Fatalf("ObserveFileContentHash: %v", err)
+	}
+	if err := s.EnsureLanguage(ctx, movieC.ID, en); err != nil {
+		t.Fatalf("EnsureLanguage: %v", err)
+	}
+	if err := s.MarkInProgress(ctx, movieC.ID, en); err != nil {
+		t.Fatalf("MarkInProgress: %v", err)
+	}
+
 	tvA, err := s.ObserveFileContentHash(ctx, "tv", "/media/tv/a.mkv", "hash-3")
 	if err != nil {
 		t.Fatalf("ObserveFileContentHash: %v", err)
@@ -454,8 +537,8 @@ func TestLibrarySummaries_CountsStatusesPerLibrary(t *testing.T) {
 	if !ok {
 		t.Fatal("expected a summary for \"movies\"")
 	}
-	if movies.Synced != 1 || movies.Failed != 1 || movies.Pending != 0 {
-		t.Errorf("movies summary = %+v, want Synced=1 Failed=1 Pending=0", movies)
+	if movies.Synced != 1 || movies.Failed != 1 || movies.Pending != 0 || movies.InProgress != 1 {
+		t.Errorf("movies summary = %+v, want Synced=1 Failed=1 Pending=0 InProgress=1", movies)
 	}
 
 	tv, ok := byName["tv"]
@@ -515,25 +598,36 @@ func TestListFiles_DefaultFilterOmitsFullySyncedFiles(t *testing.T) {
 		t.Fatalf("EnsureLanguage: %v", err)
 	}
 
+	inProgress, err := s.ObserveFileContentHash(ctx, "movies", "/media/movies/inprogress.mkv", "hash-4")
+	if err != nil {
+		t.Fatalf("ObserveFileContentHash: %v", err)
+	}
+	if err := s.EnsureLanguage(ctx, inProgress.ID, en); err != nil {
+		t.Fatalf("EnsureLanguage: %v", err)
+	}
+	if err := s.MarkInProgress(ctx, inProgress.ID, en); err != nil {
+		t.Fatalf("MarkInProgress: %v", err)
+	}
+
 	files, total, err := s.ListFiles(ctx, store.FileFilter{
-		LibraryName:         "movies",
-		PendingOrFailedOnly: true,
-		Limit:               100,
+		LibraryName:    "movies",
+		IncompleteOnly: true,
+		Limit:          100,
 	})
 	if err != nil {
 		t.Fatalf("ListFiles: %v", err)
 	}
-	if total != 2 {
-		t.Errorf("total = %d, want 2 (synced file excluded by default)", total)
+	if total != 3 {
+		t.Errorf("total = %d, want 3 (synced file excluded by default)", total)
 	}
 	var gotPaths []string
 	for _, f := range files {
 		gotPaths = append(gotPaths, f.Path)
 	}
-	if len(files) != 2 {
-		t.Fatalf("files = %d, want 2: %v", len(files), gotPaths)
+	if len(files) != 3 {
+		t.Fatalf("files = %d, want 3: %v", len(files), gotPaths)
 	}
-	for _, want := range []string{failed.Path, pending.Path} {
+	for _, want := range []string{failed.Path, pending.Path, inProgress.Path} {
 		found := false
 		for _, p := range gotPaths {
 			if p == want {

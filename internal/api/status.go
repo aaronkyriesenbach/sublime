@@ -92,10 +92,11 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	for _, lib := range summaryScope {
 		sum := summaryFor(allSummaries, lib.Name)
 		libSummaries = append(libSummaries, LibrarySummaryEntry{
-			Name:    lib.Name,
-			Pending: sum.Pending,
-			Synced:  sum.Synced,
-			Failed:  sum.Failed,
+			Name:       lib.Name,
+			Pending:    sum.Pending,
+			InProgress: sum.InProgress,
+			Synced:     sum.Synced,
+			Failed:     sum.Failed,
 		})
 	}
 
@@ -103,11 +104,11 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 
 	if scoped {
 		files, total, err := s.store.ListFiles(r.Context(), store.FileFilter{
-			LibraryName:         scopeLib.Name,
-			PathPrefix:          pathParam,
-			PendingOrFailedOnly: stateParam != "all",
-			Limit:               limit,
-			Offset:              offset,
+			LibraryName:    scopeLib.Name,
+			PathPrefix:     pathParam,
+			IncompleteOnly: stateParam != "all",
+			Limit:          limit,
+			Offset:         offset,
 		})
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, codeInternalError, "failed to load files")

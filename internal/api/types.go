@@ -21,12 +21,13 @@ const (
 // LibraryEntry is one Library's full listing shape for GET /libraries: its
 // config identity plus aggregate sync counts.
 type LibraryEntry struct {
-	Name      string   `json:"name"`
-	Path      string   `json:"path"`
-	Languages []string `json:"languages"`
-	Pending   int      `json:"pending"`
-	Synced    int      `json:"synced"`
-	Failed    int      `json:"failed"`
+	Name       string   `json:"name"`
+	Path       string   `json:"path"`
+	Languages  []string `json:"languages"`
+	Pending    int      `json:"pending"`
+	InProgress int      `json:"in_progress"`
+	Synced     int      `json:"synced"`
+	Failed     int      `json:"failed"`
 }
 
 // LibrariesResponse is GET /libraries' response shape.
@@ -37,10 +38,11 @@ type LibrariesResponse struct {
 // LibrarySummaryEntry is the lighter-weight library shape /status embeds:
 // aggregate counts only, without LibraryEntry's path/languages detail.
 type LibrarySummaryEntry struct {
-	Name    string `json:"name"`
-	Pending int    `json:"pending"`
-	Synced  int    `json:"synced"`
-	Failed  int    `json:"failed"`
+	Name       string `json:"name"`
+	Pending    int    `json:"pending"`
+	InProgress int    `json:"in_progress"`
+	Synced     int    `json:"synced"`
+	Failed     int    `json:"failed"`
 }
 
 // LanguageStateEntry is one language's sync state within a FileEntry.

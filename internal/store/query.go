@@ -17,6 +17,7 @@ import (
 type LibrarySummary struct {
 	LibraryName string
 	Pending     int
+	InProgress  int
 	Synced      int
 	Failed      int
 }
@@ -58,6 +59,8 @@ func (s *Store) LibrarySummaries(ctx context.Context) ([]LibrarySummary, error) 
 		switch domain.SyncStatus(status) {
 		case domain.StatusPending:
 			sum.Pending = count
+		case domain.StatusInProgress:
+			sum.InProgress = count
 		case domain.StatusSynced:
 			sum.Synced = count
 		case domain.StatusFailed:
@@ -84,11 +87,12 @@ type FileFilter struct {
 	// or any file under it as a directory prefix.
 	PathPrefix string
 
-	// PendingOrFailedOnly, if true, restricts results to files with at
-	// least one language state in StatusPending or StatusFailed — a file
-	// whose every language is StatusSynced is excluded. This is the
-	// default status filter the HTTP API applies to /status.
-	PendingOrFailedOnly bool
+	// IncompleteOnly, if true, restricts results to files with at least
+	// one language state that is not StatusSynced (StatusPending,
+	// StatusInProgress, or StatusFailed) — a file whose every language is
+	// StatusSynced is excluded. This is the default status filter the
+	// HTTP API applies to /status.
+	IncompleteOnly bool
 
 	// Limit is the maximum number of files to return. Zero returns none;
 	// callers must supply a positive value to get results.
@@ -113,11 +117,11 @@ func (s *Store) ListFiles(ctx context.Context, filter FileFilter) ([]domain.File
 		where = append(where, "(path = ? OR path LIKE ? ESCAPE '\\')")
 		args = append(args, filter.PathPrefix, escapeLike(filter.PathPrefix)+string(filepath.Separator)+"%")
 	}
-	if filter.PendingOrFailedOnly {
+	if filter.IncompleteOnly {
 		where = append(where, `id IN (
-			SELECT file_id FROM file_language_states WHERE status IN (?, ?)
+			SELECT file_id FROM file_language_states WHERE status IN (?, ?, ?)
 		)`)
-		args = append(args, string(domain.StatusPending), string(domain.StatusFailed))
+		args = append(args, string(domain.StatusPending), string(domain.StatusInProgress), string(domain.StatusFailed))
 	}
 
 	whereClause := strings.Join(where, " AND ")

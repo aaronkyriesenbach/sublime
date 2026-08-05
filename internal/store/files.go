@@ -174,6 +174,20 @@ func (s *Store) MarkSynced(ctx context.Context, fileID int64, lang language.Tag)
 	return checkUpdated(res)
 }
 
+// MarkInProgress sets fileID's language state to StatusInProgress, clearing
+// any FailureReason. It returns ErrLanguageStateNotFound if no such row
+// exists; callers must EnsureLanguage first.
+func (s *Store) MarkInProgress(ctx context.Context, fileID int64, lang language.Tag) error {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE file_language_states SET status = ?, failure_reason = NULL, updated_at = ? WHERE file_id = ? AND language = ?`,
+		domain.StatusInProgress, nowString(), fileID, lang.String(),
+	)
+	if err != nil {
+		return fmt.Errorf("marking language state in progress: %w", err)
+	}
+	return checkUpdated(res)
+}
+
 // MarkFailed sets fileID's language state to StatusFailed with reason. It
 // returns ErrLanguageStateNotFound if no such row exists; callers must
 // EnsureLanguage first.

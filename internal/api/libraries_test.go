@@ -73,7 +73,7 @@ func TestLibraries_ListsConfiguredLibrariesWithZeroCountsWhenUntouched(t *testin
 	if len(movies.Languages) != 2 || movies.Languages[0] != "en" || movies.Languages[1] != "pt-BR" {
 		t.Errorf("movies languages = %+v, want [en pt-BR]", movies.Languages)
 	}
-	if movies.Pending != 0 || movies.Synced != 0 || movies.Failed != 0 {
+	if movies.Pending != 0 || movies.InProgress != 0 || movies.Synced != 0 || movies.Failed != 0 {
 		t.Errorf("movies counts = %+v, want all zero for an untouched library", movies)
 	}
 }
@@ -112,6 +112,43 @@ func TestLibraries_ReflectsStoreCounts(t *testing.T) {
 	}
 	if len(body.Libraries) != 1 || body.Libraries[0].Synced != 1 {
 		t.Fatalf("libraries = %+v, want a single movies entry with Synced=1", body.Libraries)
+	}
+}
+
+func TestLibraries_ReflectsInProgressCount(t *testing.T) {
+	st := openTestStore(t)
+	ctx := t.Context()
+	en := mustLang(t, "en")
+
+	f, err := st.ObserveFileContentHash(ctx, "movies", "/media/movies/a.mkv", "hash-1")
+	if err != nil {
+		t.Fatalf("ObserveFileContentHash: %v", err)
+	}
+	if err := st.EnsureLanguage(ctx, f.ID, en); err != nil {
+		t.Fatalf("EnsureLanguage: %v", err)
+	}
+	if err := st.MarkInProgress(ctx, f.ID, en); err != nil {
+		t.Fatalf("MarkInProgress: %v", err)
+	}
+
+	libs := []domain.Library{{Name: "movies", Path: "/media/movies", Languages: []language.Tag{en}}}
+	srv := api.NewServer(api.Deps{Store: st, Libraries: libs})
+	defer srv.Close()
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/libraries")
+	if err != nil {
+		t.Fatalf("GET /libraries: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	var body librariesResponse
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decoding response: %v", err)
+	}
+	if len(body.Libraries) != 1 || body.Libraries[0].InProgress != 1 {
+		t.Fatalf("libraries = %+v, want a single movies entry with InProgress=1", body.Libraries)
 	}
 }
 
