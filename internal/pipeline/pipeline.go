@@ -75,6 +75,7 @@ func (p *Pipeline) logStatusChange(
 	lang language.Tag,
 	from, to domain.SyncStatus,
 	reason domain.FailureReason,
+	cause error,
 ) {
 	args := []any{
 		"library", lib.Name,
@@ -87,6 +88,9 @@ func (p *Pipeline) logStatusChange(
 	level := slog.LevelInfo
 	if to == domain.StatusFailed {
 		args = append(args, "reason", string(reason))
+		if cause != nil {
+			args = append(args, "error", cause)
+		}
 		if reason == domain.FailureNoCandidate {
 			level = slog.LevelWarn
 		} else {
@@ -109,11 +113,12 @@ func (p *Pipeline) markFailed(
 	lang language.Tag,
 	fileID int64,
 	reason domain.FailureReason,
+	cause error,
 ) error {
 	if err := p.Store.MarkFailed(ctx, fileID, lang, reason); err != nil {
 		return err
 	}
-	p.logStatusChange(ctx, lib, videoPath, lang, domain.StatusInProgress, domain.StatusFailed, reason)
+	p.logStatusChange(ctx, lib, videoPath, lang, domain.StatusInProgress, domain.StatusFailed, reason, cause)
 	return nil
 }
 
@@ -456,7 +461,7 @@ func (p *Pipeline) processFile(
 				p.logger().Error("marking already-synced file failed", "library", lib.Name, "path", videoPath, "language", lang.String(), "error", err)
 				return outcomeFailed, fmt.Errorf("marking already-synced file: %w", err)
 			}
-			p.logStatusChange(ctx, lib, videoPath, lang, domain.StatusPending, domain.StatusSynced, domain.FailureNone)
+			p.logStatusChange(ctx, lib, videoPath, lang, domain.StatusPending, domain.StatusSynced, domain.FailureNone, nil)
 			return outcomeSkipped, nil
 		}
 	}
@@ -465,7 +470,7 @@ func (p *Pipeline) processFile(
 		p.logger().Error("marking in progress failed", "library", lib.Name, "path", videoPath, "language", lang.String(), "error", err)
 		return outcomeFailed, fmt.Errorf("marking in progress: %w", err)
 	}
-	p.logStatusChange(ctx, lib, videoPath, lang, domain.StatusPending, domain.StatusInProgress, domain.FailureNone)
+	p.logStatusChange(ctx, lib, videoPath, lang, domain.StatusPending, domain.StatusInProgress, domain.FailureNone, nil)
 
 	query, queryErr := queryFromPath(videoPath, lang)
 	if queryErr != nil {
@@ -475,7 +480,7 @@ func (p *Pipeline) processFile(
 
 	candidates, err := p.Provider.Search(ctx, query)
 	if err != nil {
-		if markErr := p.markFailed(ctx, lib, videoPath, lang, file.ID, domain.FailureRetrievalFailed); markErr != nil {
+		if markErr := p.markFailed(ctx, lib, videoPath, lang, file.ID, domain.FailureRetrievalFailed, err); markErr != nil {
 			return outcomeFailed, errors.Join(err, markErr)
 		}
 		return outcomeFailed, fmt.Errorf("searching provider: %w", err)
@@ -483,7 +488,7 @@ func (p *Pipeline) processFile(
 
 	info, parseErr := scoring.Parse(filepath.Base(videoPath))
 	if parseErr != nil {
-		if markErr := p.markFailed(ctx, lib, videoPath, lang, file.ID, domain.FailureInternalError); markErr != nil {
+		if markErr := p.markFailed(ctx, lib, videoPath, lang, file.ID, domain.FailureInternalError, parseErr); markErr != nil {
 			return outcomeFailed, errors.Join(parseErr, markErr)
 		}
 		return outcomeFailed, fmt.Errorf("parsing video filename: %w", parseErr)
@@ -491,7 +496,7 @@ func (p *Pipeline) processFile(
 
 	best, ok := scoring.Select(info, candidates)
 	if !ok {
-		if markErr := p.markFailed(ctx, lib, videoPath, lang, file.ID, domain.FailureNoCandidate); markErr != nil {
+		if markErr := p.markFailed(ctx, lib, videoPath, lang, file.ID, domain.FailureNoCandidate, nil); markErr != nil {
 			return outcomeFailed, markErr
 		}
 		return outcomeTerminal, nil
@@ -499,7 +504,7 @@ func (p *Pipeline) processFile(
 
 	subtitleContent, err := p.Provider.Download(ctx, best)
 	if err != nil {
-		if markErr := p.markFailed(ctx, lib, videoPath, lang, file.ID, domain.FailureRetrievalFailed); markErr != nil {
+		if markErr := p.markFailed(ctx, lib, videoPath, lang, file.ID, domain.FailureRetrievalFailed, err); markErr != nil {
 			return outcomeFailed, errors.Join(err, markErr)
 		}
 		return outcomeFailed, fmt.Errorf("downloading candidate: %w", err)
@@ -507,7 +512,7 @@ func (p *Pipeline) processFile(
 
 	syncedContent, err := p.syncSubtitle(ctx, videoPath, subtitleContent)
 	if err != nil {
-		if markErr := p.markFailed(ctx, lib, videoPath, lang, file.ID, domain.FailureSyncFailed); markErr != nil {
+		if markErr := p.markFailed(ctx, lib, videoPath, lang, file.ID, domain.FailureSyncFailed, err); markErr != nil {
 			return outcomeFailed, errors.Join(err, markErr)
 		}
 		return outcomeFailed, fmt.Errorf("syncing subtitle: %w", err)
@@ -516,15 +521,16 @@ func (p *Pipeline) processFile(
 	sidecarExt := ".srt"
 	codec, ok := marker.CodecFor(sidecarExt)
 	if !ok {
-		if markErr := p.markFailed(ctx, lib, videoPath, lang, file.ID, domain.FailureInternalError); markErr != nil {
+		noCodecErr := fmt.Errorf("no marker codec for %s", sidecarExt)
+		if markErr := p.markFailed(ctx, lib, videoPath, lang, file.ID, domain.FailureInternalError, noCodecErr); markErr != nil {
 			return outcomeFailed, markErr
 		}
-		return outcomeFailed, fmt.Errorf("no marker codec for %s", sidecarExt)
+		return outcomeFailed, noCodecErr
 	}
 
 	removedStreams, err := p.Stripper.StripEmbedded(ctx, videoPath, lib.StripScope, lang)
 	if err != nil {
-		if markErr := p.markFailed(ctx, lib, videoPath, lang, file.ID, domain.FailureInternalError); markErr != nil {
+		if markErr := p.markFailed(ctx, lib, videoPath, lang, file.ID, domain.FailureInternalError, err); markErr != nil {
 			return outcomeFailed, errors.Join(err, markErr)
 		}
 		return outcomeFailed, fmt.Errorf("stripping embedded streams: %w", err)
@@ -539,7 +545,7 @@ func (p *Pipeline) processFile(
 	if len(removedStreams) > 0 {
 		correctedHash, err := media.ComputeContentHash(videoPath)
 		if err != nil {
-			if markErr := p.markFailed(ctx, lib, videoPath, lang, file.ID, domain.FailureInternalError); markErr != nil {
+			if markErr := p.markFailed(ctx, lib, videoPath, lang, file.ID, domain.FailureInternalError, err); markErr != nil {
 				return outcomeFailed, errors.Join(err, markErr)
 			}
 			return outcomeFailed, fmt.Errorf("recomputing content hash after strip: %w", err)
@@ -553,14 +559,14 @@ func (p *Pipeline) processFile(
 
 	markedContent, err := codec.Write(syncedContent, marker.Marker{ContentHash: hash})
 	if err != nil {
-		if markErr := p.markFailed(ctx, lib, videoPath, lang, file.ID, domain.FailureInternalError); markErr != nil {
+		if markErr := p.markFailed(ctx, lib, videoPath, lang, file.ID, domain.FailureInternalError, err); markErr != nil {
 			return outcomeFailed, errors.Join(err, markErr)
 		}
 		return outcomeFailed, fmt.Errorf("embedding marker: %w", err)
 	}
 
 	if _, err := p.Stripper.Swap(ctx, videoPath, lang, lib.StripScope, hash, sidecarExt, markedContent); err != nil {
-		if markErr := p.markFailed(ctx, lib, videoPath, lang, file.ID, domain.FailureInternalError); markErr != nil {
+		if markErr := p.markFailed(ctx, lib, videoPath, lang, file.ID, domain.FailureInternalError, err); markErr != nil {
 			return outcomeFailed, errors.Join(err, markErr)
 		}
 		return outcomeFailed, fmt.Errorf("swapping sidecar: %w", err)
@@ -570,7 +576,7 @@ func (p *Pipeline) processFile(
 		p.logger().Error("marking synced failed", "library", lib.Name, "path", videoPath, "language", lang.String(), "error", err)
 		return outcomeFailed, fmt.Errorf("marking synced: %w", err)
 	}
-	p.logStatusChange(ctx, lib, videoPath, lang, domain.StatusInProgress, domain.StatusSynced, domain.FailureNone)
+	p.logStatusChange(ctx, lib, videoPath, lang, domain.StatusInProgress, domain.StatusSynced, domain.FailureNone, nil)
 
 	return outcomeSynced, nil
 }

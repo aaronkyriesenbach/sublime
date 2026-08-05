@@ -71,11 +71,11 @@ func newStatusCommand(apiAddr *string) *cobra.Command {
 
 func printStatus(w io.Writer, resp api.StatusResponse) error {
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
-	if _, err := fmt.Fprintln(tw, "LIBRARY\tPENDING\tSYNCED\tFAILED"); err != nil {
+	if _, err := fmt.Fprintln(tw, "LIBRARY\tPENDING\tIN PROGRESS\tSYNCED\tFAILED"); err != nil {
 		return fmt.Errorf("writing library summary header: %w", err)
 	}
 	for _, lib := range resp.Libraries {
-		if _, err := fmt.Fprintf(tw, "%s\t%d\t%d\t%d\n", lib.Name, lib.Pending, lib.Synced, lib.Failed); err != nil {
+		if _, err := fmt.Fprintf(tw, "%s\t%d\t%d\t%d\t%d\n", lib.Name, lib.Pending, lib.InProgress, lib.Synced, lib.Failed); err != nil {
 			return fmt.Errorf("writing library summary: %w", err)
 		}
 	}

@@ -40,13 +40,13 @@ func newLibrariesCommand(apiAddr *string) *cobra.Command {
 
 func printLibraries(w io.Writer, libraries []api.LibraryEntry) error {
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
-	if _, err := fmt.Fprintln(tw, "NAME\tPATH\tLANGUAGES\tPENDING\tSYNCED\tFAILED"); err != nil {
+	if _, err := fmt.Fprintln(tw, "NAME\tPATH\tLANGUAGES\tPENDING\tIN PROGRESS\tSYNCED\tFAILED"); err != nil {
 		return fmt.Errorf("writing library header: %w", err)
 	}
 	for _, lib := range libraries {
-		if _, err := fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n",
+		if _, err := fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
 			lib.Name, lib.Path, strings.Join(lib.Languages, ", "),
-			strconv.Itoa(lib.Pending), strconv.Itoa(lib.Synced), strconv.Itoa(lib.Failed),
+			strconv.Itoa(lib.Pending), strconv.Itoa(lib.InProgress), strconv.Itoa(lib.Synced), strconv.Itoa(lib.Failed),
 		); err != nil {
 			return fmt.Errorf("writing library output: %w", err)
 		}
