@@ -83,9 +83,9 @@ func TestLibraries_ReflectsStoreCounts(t *testing.T) {
 	ctx := t.Context()
 	en := mustLang(t, "en")
 
-	f, err := st.UpsertFile(ctx, "movies", "/media/movies/a.mkv", "hash-1")
+	f, err := st.ObserveFileContentHash(ctx, "movies", "/media/movies/a.mkv", "hash-1")
 	if err != nil {
-		t.Fatalf("UpsertFile: %v", err)
+		t.Fatalf("ObserveFileContentHash: %v", err)
 	}
 	if err := st.EnsureLanguage(ctx, f.ID, en); err != nil {
 		t.Fatalf("EnsureLanguage: %v", err)

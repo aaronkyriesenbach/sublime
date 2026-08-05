@@ -12,16 +12,18 @@ import (
 	"github.com/aaronkyriesenbach/sublime/internal/domain"
 )
 
-// UpsertFile records path's current Content Hash within libraryName,
-// inserting a new file row if none exists yet.
+// ObserveFileContentHash records path's current Content Hash within
+// libraryName, inserting a new file row if none exists yet.
 //
 // If a file row already exists and contentHash matches its stored value,
 // its language states are left untouched. If contentHash differs, every one
 // of the file's existing language rows is reset to StatusPending in place
 // (FailureReason cleared, no new rows created) before the new hash is
-// recorded — that reset is the state store's contract for "the file
-// changed, whatever was Synced against the old content no longer counts."
-func (s *Store) UpsertFile(ctx context.Context, libraryName, path, contentHash string) (domain.File, error) {
+// recorded. This reset-on-mismatch behavior represents a fresh scan
+// observing a hash change and implying the file's content has changed;
+// when Sublime needs to update its own content hash record without
+// resetting language states, use UpdateContentHash instead (once available).
+func (s *Store) ObserveFileContentHash(ctx context.Context, libraryName, path, contentHash string) (domain.File, error) {
 	now := nowString()
 	var file domain.File
 
