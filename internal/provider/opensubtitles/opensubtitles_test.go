@@ -558,6 +558,53 @@ func TestQuotaSuspension_ShortCircuitsUntilResumeTimeThenResumes(t *testing.T) {
 	}
 }
 
+// TestSuspension_ReportsSuspendedAndResumeTime covers issue #58's
+// dependency on the Provider's Suspended state: not-yet-suspended reports
+// suspended=false, and a live suspension reports suspended=true with the
+// resume time.
+func TestSuspension_ReportsSuspendedAndResumeTime(t *testing.T) {
+	mock := newMockServer(t)
+	mock.on(http.MethodPost, "/login", jsonHandler(http.StatusOK, map[string]any{"token": "jwt-token"}))
+	mock.on(http.MethodPost, "/download", jsonHandler(http.StatusUnauthorized, map[string]any{
+		"message":        "quota exceeded",
+		"reset_time_utc": "2026-01-01T01:00:00Z",
+	}))
+
+	clock := &fakeClock{}
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	p, err := opensubtitles.New(opensubtitles.Config{
+		Secrets: testSecrets(),
+		BaseURL: mock.URL(),
+		Clock:   clock,
+		Now:     func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	if resumeAt, suspended := p.Suspension(); suspended {
+		t.Errorf("Suspension() before any exhaustion = (%v, %v), want suspended=false", resumeAt, suspended)
+	}
+
+	if _, err := p.Download(context.Background(), domain.Candidate{ID: "1"}); err == nil {
+		t.Fatal("expected Download() to fail with quota exhaustion")
+	}
+
+	wantResumeAt := time.Date(2026, 1, 1, 1, 0, 0, 0, time.UTC)
+	resumeAt, suspended := p.Suspension()
+	if !suspended {
+		t.Fatal("Suspension() after exhaustion = suspended=false, want true")
+	}
+	if !resumeAt.Equal(wantResumeAt) {
+		t.Errorf("Suspension() resumeAt = %v, want %v", resumeAt, wantResumeAt)
+	}
+
+	now = wantResumeAt.Add(time.Minute)
+	if _, suspended := p.Suspension(); suspended {
+		t.Error("Suspension() past resume time = suspended=true, want false")
+	}
+}
+
 // TestQuotaSuspension_LogsEnterAndResume guards the ticket's observability
 // requirement: one log line entering Suspended (with cause and resume
 // time) and one resuming.

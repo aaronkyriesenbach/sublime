@@ -109,7 +109,7 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 	defer func() { _ = st.Close() }()
 
 	secrets := config.LoadProviderSecrets()
-	p, err := pipeline.NewProduction(pipeline.ProductionConfig{
+	p, providerStatuses, err := pipeline.NewProduction(pipeline.ProductionConfig{
 		Store:   st,
 		Secrets: secrets.OpenSubtitles,
 		Logger:  logger,
@@ -118,13 +118,19 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 		return fmt.Errorf("constructing pipeline: %w", err)
 	}
 
+	apiProviders := make([]api.ProviderStatusFunc, 0, len(providerStatuses))
+	for _, ps := range providerStatuses {
+		apiProviders = append(apiProviders, api.ProviderStatusFunc{Name: ps.Name, Status: ps.Suspension})
+	}
+
 	apiServer := api.NewServer(api.Deps{
 		Store:     st,
 		Libraries: cfg.Libraries,
 		Reprocess: func(ctx context.Context, lib domain.Library, target string) (pipeline.Result, error) {
 			return trigger.Reprocess(ctx, p, lib, target)
 		},
-		Logger: logger,
+		Providers: apiProviders,
+		Logger:    logger,
 	})
 	defer apiServer.Close()
 

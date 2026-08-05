@@ -4,6 +4,8 @@
 // contract (see internal/cli).
 package api
 
+import "time"
+
 // ErrorEnvelope is the uniform JSON shape for every non-2xx response.
 type ErrorEnvelope struct {
 	Error   string `json:"error"`
@@ -61,12 +63,22 @@ type FileEntry struct {
 	Languages   map[string]LanguageStateEntry `json:"languages"`
 }
 
+// ProviderEntry is one configured Provider's shape within GET /status'
+// providers array: identity plus current Suspended state. ResumeAt is
+// only populated when Suspended is true.
+type ProviderEntry struct {
+	Name      string     `json:"name"`
+	Suspended bool       `json:"suspended"`
+	ResumeAt  *time.Time `json:"resumeAt,omitempty"`
+}
+
 // StatusResponse is GET /status' response shape. Files/Total/Limit/Offset
 // are only populated for a scoped request (?library= or ?path= given);
 // pointers so an unscoped response omits them entirely via omitempty
 // instead of emitting misleading zero values.
 type StatusResponse struct {
 	Libraries []LibrarySummaryEntry `json:"libraries"`
+	Providers []ProviderEntry       `json:"providers"`
 	Files     []FileEntry           `json:"files,omitempty"`
 	Total     *int                  `json:"total,omitempty"`
 	Limit     *int                  `json:"limit,omitempty"`

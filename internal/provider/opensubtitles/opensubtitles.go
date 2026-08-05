@@ -176,6 +176,26 @@ func (p *Provider) suspendedError() error {
 	return nil
 }
 
+// Suspension reports p's current quota-suspension state: resumeAt is when
+// p will resume issuing real requests, and suspended is whether p is
+// currently in that state as of now. It implements the optional
+// suspension-reporting capability internal/pipeline's production wiring
+// type-asserts for (see pipeline.NewProduction), letting GET /status
+// surface a Provider's Suspended state (issue #58) without the api
+// package needing to know about this concrete type. A resumeAt that has
+// already passed is reported as not suspended, even though
+// suspendedError hasn't cleared p.suspendedUntil yet — that happens
+// lazily on the next real Search/Download call.
+func (p *Provider) Suspension() (resumeAt time.Time, suspended bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.suspendedUntil.IsZero() || !p.now().Before(p.suspendedUntil) {
+		return time.Time{}, false
+	}
+	return p.suspendedUntil, true
+}
+
 // suspend enters the Suspended state until resumeAt and returns the
 // provider.QuotaExhaustedError callers should see, wrapping cause (the
 // OpenSubtitles-specific error that revealed the exhaustion) so it stays
