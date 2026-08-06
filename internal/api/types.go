@@ -48,10 +48,15 @@ type LibrarySummaryEntry struct {
 }
 
 // LanguageStateEntry is one language's sync state within a FileEntry.
-// Reason is only populated when Status is "failed".
+// Reason is only populated when Status is "failed". Attempted lists
+// Provider names already tried-and-missed this cycle (see
+// store.RecordProviderMiss), letting a caller tell a pair that's never
+// been attempted apart from one that's already been missed by every
+// Provider but one.
 type LanguageStateEntry struct {
-	Status string `json:"status"`
-	Reason string `json:"reason,omitempty"`
+	Status    string   `json:"status"`
+	Reason    string   `json:"reason,omitempty"`
+	Attempted []string `json:"attempted,omitempty"`
 }
 
 // FileEntry is one tracked file's shape within GET /status' scoped "files"

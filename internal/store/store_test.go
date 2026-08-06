@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"slices"
 	"testing"
 
 	"golang.org/x/text/language"
@@ -1072,6 +1073,75 @@ func TestRecordProviderMiss_AppendsNameAndResetsToPendingNoFailureReason(t *test
 	}
 	if len(attempted) != 1 || attempted[0] != "opensubtitles" {
 		t.Errorf("attempted = %v, want [opensubtitles]", attempted)
+	}
+}
+
+func TestGetFile_SurfacesAttemptedProvidersOnLanguageState(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	en := mustLang(t, "en")
+
+	file, err := s.ObserveFileContentHash(ctx, "movies", "/media/movies/a.mkv", "hash-1")
+	if err != nil {
+		t.Fatalf("ObserveFileContentHash returned error: %v", err)
+	}
+	if err := s.EnsureLanguage(ctx, file.ID, en); err != nil {
+		t.Fatalf("EnsureLanguage returned error: %v", err)
+	}
+
+	// Before any Provider has missed, GetFile must report no attempted
+	// Providers rather than omitting the field silently.
+	fresh, _, err := s.GetFile(ctx, "movies", "/media/movies/a.mkv")
+	if err != nil {
+		t.Fatalf("GetFile returned error: %v", err)
+	}
+	if len(fresh.Languages[0].Attempted) != 0 {
+		t.Errorf("Attempted = %v, want empty before any RecordProviderMiss", fresh.Languages[0].Attempted)
+	}
+
+	if err := s.RecordProviderMiss(ctx, file.ID, en, "opensubtitles"); err != nil {
+		t.Fatalf("first RecordProviderMiss returned error: %v", err)
+	}
+	if err := s.RecordProviderMiss(ctx, file.ID, en, "subdl"); err != nil {
+		t.Fatalf("second RecordProviderMiss returned error: %v", err)
+	}
+
+	got, _, err := s.GetFile(ctx, "movies", "/media/movies/a.mkv")
+	if err != nil {
+		t.Fatalf("GetFile returned error: %v", err)
+	}
+	want := []string{"opensubtitles", "subdl"}
+	if !slices.Equal(got.Languages[0].Attempted, want) {
+		t.Errorf("Languages[0].Attempted = %v, want %v", got.Languages[0].Attempted, want)
+	}
+}
+
+func TestListFiles_SurfacesAttemptedProvidersOnLanguageState(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	en := mustLang(t, "en")
+
+	file, err := s.ObserveFileContentHash(ctx, "movies", "/media/movies/a.mkv", "hash-1")
+	if err != nil {
+		t.Fatalf("ObserveFileContentHash returned error: %v", err)
+	}
+	if err := s.EnsureLanguage(ctx, file.ID, en); err != nil {
+		t.Fatalf("EnsureLanguage returned error: %v", err)
+	}
+	if err := s.RecordProviderMiss(ctx, file.ID, en, "opensubtitles"); err != nil {
+		t.Fatalf("RecordProviderMiss returned error: %v", err)
+	}
+
+	files, _, err := s.ListFiles(ctx, store.FileFilter{LibraryName: "movies", Limit: 10})
+	if err != nil {
+		t.Fatalf("ListFiles returned error: %v", err)
+	}
+	if len(files) != 1 {
+		t.Fatalf("len(files) = %d, want 1", len(files))
+	}
+	want := []string{"opensubtitles"}
+	if !slices.Equal(files[0].Languages[0].Attempted, want) {
+		t.Errorf("Languages[0].Attempted = %v, want %v", files[0].Languages[0].Attempted, want)
 	}
 }
 

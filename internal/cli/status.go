@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"slices"
 	"strconv"
+	"strings"
 	"text/tabwriter"
 
 	"github.com/spf13/cobra"
@@ -92,7 +93,7 @@ func printStatus(w io.Writer, resp api.StatusResponse) error {
 	}
 
 	ftw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
-	if _, err := fmt.Fprintln(ftw, "PATH\tLANGUAGE\tSTATUS\tREASON"); err != nil {
+	if _, err := fmt.Fprintln(ftw, "PATH\tLANGUAGE\tSTATUS\tREASON\tATTEMPTED"); err != nil {
 		return fmt.Errorf("writing file header: %w", err)
 	}
 	for _, f := range resp.Files {
@@ -104,7 +105,7 @@ func printStatus(w io.Writer, resp api.StatusResponse) error {
 
 		for _, lang := range langs {
 			ls := f.Languages[lang]
-			if _, err := fmt.Fprintf(ftw, "%s\t%s\t%s\t%s\n", f.Path, lang, ls.Status, ls.Reason); err != nil {
+			if _, err := fmt.Fprintf(ftw, "%s\t%s\t%s\t%s\t%s\n", f.Path, lang, ls.Status, ls.Reason, strings.Join(ls.Attempted, ",")); err != nil {
 				return fmt.Errorf("writing file state: %w", err)
 			}
 		}

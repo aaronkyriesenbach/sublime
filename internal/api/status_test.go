@@ -218,6 +218,46 @@ func TestStatus_ScopedByLibraryDefaultsToPendingAndFailed(t *testing.T) {
 	}
 }
 
+func TestStatus_LanguageStateSurfacesAttemptedProviders(t *testing.T) {
+	st := openTestStore(t)
+	ctx := t.Context()
+	en := mustLang(t, "en")
+
+	file, err := st.ObserveFileContentHash(ctx, "movies", "/media/movies/pending.mkv", "hash-1")
+	if err != nil {
+		t.Fatalf("ObserveFileContentHash: %v", err)
+	}
+	if err := st.EnsureLanguage(ctx, file.ID, en); err != nil {
+		t.Fatalf("EnsureLanguage: %v", err)
+	}
+	if err := st.RecordProviderMiss(ctx, file.ID, en, "opensubtitles"); err != nil {
+		t.Fatalf("RecordProviderMiss: %v", err)
+	}
+
+	srv := api.NewServer(api.Deps{Store: st, Libraries: testLibraries()})
+	defer srv.Close()
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/status?library=movies")
+	if err != nil {
+		t.Fatalf("GET /status: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	var body statusResponse
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decoding response: %v", err)
+	}
+
+	if len(body.Files) != 1 {
+		t.Fatalf("files = %+v, want 1", body.Files)
+	}
+	if got := body.Files[0].Languages["en"].Attempted; len(got) != 1 || got[0] != "opensubtitles" {
+		t.Errorf("attempted = %v, want [opensubtitles]", got)
+	}
+}
+
 func TestStatus_StateAllIncludesSyncedFiles(t *testing.T) {
 	st := openTestStore(t)
 	ctx := t.Context()
