@@ -34,8 +34,13 @@ type ProductionConfig struct {
 	// ProviderChain is the priority-ordered list of Providers to
 	// construct, from config.Config.ProviderChain. A nil or empty chain
 	// defaults to a single opensubtitles entry, matching config.Load's own
-	// default.
+	// default. Deprecated: use ProviderTiers instead.
 	ProviderChain []config.ProviderConfig
+
+	// ProviderTiers is the Tier-grouped Provider list from
+	// config.Config.ProviderTiers. When non-empty, ProviderChain is ignored
+	// and Tiers are preserved in the returned ProviderTierStatuses.
+	ProviderTiers []config.ProviderTier
 
 	// WorkerCount is the fallback number of concurrent workers for a chain
 	// entry that doesn't set its own worker_count. Zero means
@@ -68,6 +73,13 @@ type ProviderStatus struct {
 	// Suspension reports the Provider's current suspension state; nil if
 	// the Provider doesn't implement suspensionReporter.
 	Suspension func() (resumeAt time.Time, suspended bool)
+}
+
+// ProviderTierStatus holds a Tier's worth of ProviderStatus entries,
+// preserving the Tier grouping from config.Config.ProviderTiers for
+// dispatcher.ProviderTiers wiring.
+type ProviderTierStatus struct {
+	Providers []ProviderStatus
 }
 
 // suspensionReporter is the optional capability interface a Provider may
@@ -108,8 +120,8 @@ var providerConstructors = map[string]providerConstructor{
 	},
 }
 
-// NewProduction constructs one real Provider per entry in cfg.ProviderChain
-// (opensubtitles and/or subdl, in chain order), each wrapped in its own
+// NewProduction constructs one real Provider per entry in cfg.ProviderTiers
+// (or cfg.ProviderChain for legacy callers), each wrapped in its own
 // Pipeline sharing the same alass Sync Engine and FFStripper. The first
 // entry's Pipeline is returned as the primary Pipeline for Trigger's
 // registration calls (Run/RunFile/Reprocess never touch Provider — see
@@ -117,25 +129,35 @@ var providerConstructors = map[string]providerConstructor{
 // works equally well there). The second return value reports every
 // configured Provider's identity, own Pipeline, worker count, and live
 // suspension status, for wiring into both dispatcher.Providers (chain
-// mode) and api.Deps.Providers.
-func NewProduction(cfg ProductionConfig) (*Pipeline, []ProviderStatus, error) {
+// mode) and api.Deps.Providers. The third return value is the same data
+// grouped by Tier, for dispatcher.ProviderTiers wiring.
+func NewProduction(cfg ProductionConfig) (*Pipeline, []ProviderStatus, []ProviderTierStatus, error) {
+	// Use ProviderTiers if provided, otherwise fall back to ProviderChain
+	if len(cfg.ProviderTiers) > 0 {
+		return newProductionFromTiers(cfg)
+	}
+	return newProductionFromChain(cfg)
+}
+
+func newProductionFromChain(cfg ProductionConfig) (*Pipeline, []ProviderStatus, []ProviderTierStatus, error) {
 	chain := cfg.ProviderChain
 	if len(chain) == 0 {
 		chain = []config.ProviderConfig{{Name: "opensubtitles"}}
 	}
 
 	statuses := make([]ProviderStatus, 0, len(chain))
+	tierStatuses := make([]ProviderTierStatus, 0, len(chain))
 	var primary *Pipeline
 
 	for _, entry := range chain {
 		ctor, ok := providerConstructors[entry.Name]
 		if !ok {
-			return nil, nil, fmt.Errorf("providers.chain: unknown provider %q", entry.Name)
+			return nil, nil, nil, fmt.Errorf("providers.chain: unknown provider %q", entry.Name)
 		}
 
 		p, err := ctor(cfg.Secrets, entry)
 		if err != nil {
-			return nil, nil, fmt.Errorf("creating %s provider: %w", entry.Name, err)
+			return nil, nil, nil, fmt.Errorf("creating %s provider: %w", entry.Name, err)
 		}
 
 		workerCount := entry.WorkerCount
@@ -159,7 +181,55 @@ func NewProduction(cfg ProductionConfig) (*Pipeline, []ProviderStatus, error) {
 		status.Pipeline = pipe
 		status.WorkerCount = workerCount
 		statuses = append(statuses, status)
+		tierStatuses = append(tierStatuses, ProviderTierStatus{Providers: []ProviderStatus{status}})
 	}
 
-	return primary, statuses, nil
+	return primary, statuses, tierStatuses, nil
+}
+
+func newProductionFromTiers(cfg ProductionConfig) (*Pipeline, []ProviderStatus, []ProviderTierStatus, error) {
+	statuses := make([]ProviderStatus, 0)
+	tierStatuses := make([]ProviderTierStatus, 0, len(cfg.ProviderTiers))
+	var primary *Pipeline
+
+	for _, tier := range cfg.ProviderTiers {
+		tierProviders := make([]ProviderStatus, 0, len(tier.Providers))
+		for _, entry := range tier.Providers {
+			ctor, ok := providerConstructors[entry.Name]
+			if !ok {
+				return nil, nil, nil, fmt.Errorf("providers.chain: unknown provider %q", entry.Name)
+			}
+
+			p, err := ctor(cfg.Secrets, entry)
+			if err != nil {
+				return nil, nil, nil, fmt.Errorf("creating %s provider: %w", entry.Name, err)
+			}
+
+			workerCount := entry.WorkerCount
+			if workerCount <= 0 {
+				workerCount = cfg.WorkerCount
+			}
+
+			pipe := &Pipeline{
+				Store:       cfg.Store,
+				Provider:    p,
+				SyncEngine:  alass.New(),
+				Stripper:    strip.NewFFStripper(),
+				WorkerCount: workerCount,
+				Logger:      cfg.Logger,
+			}
+			if primary == nil {
+				primary = pipe
+			}
+
+			status := providerStatusFor(entry.Name, p)
+			status.Pipeline = pipe
+			status.WorkerCount = workerCount
+			statuses = append(statuses, status)
+			tierProviders = append(tierProviders, status)
+		}
+		tierStatuses = append(tierStatuses, ProviderTierStatus{Providers: tierProviders})
+	}
+
+	return primary, statuses, tierStatuses, nil
 }
