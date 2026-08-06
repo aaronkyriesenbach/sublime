@@ -1682,6 +1682,105 @@ func TestPipeline_ForceReprocessLogsFileChangedNotFileFound(t *testing.T) {
 // permanently stuck on its first Provider.Search call, every file in the
 // Library must still be registered (Found, logged, and given a Pending row
 // per language) well before that first job unblocks and completes.
+// TestPipeline_ClaimLostSkipsWithoutError guards processFile's handling of
+// store.ErrClaimLost from MarkInProgress: when another caller has already
+// claimed the (file, language) pair, processFile must treat it like an
+// already-synced skip (outcomeSkipped, no error, no ERROR log), not a
+// processing failure.
+func TestPipeline_ClaimLostSkipsWithoutError(t *testing.T) {
+	libDir := t.TempDir()
+
+	srcVideo := filepath.Join("..", "..", "testdata", "integration", "video", "sample.mp4")
+	videoContent, err := os.ReadFile(srcVideo)
+	if err != nil {
+		t.Fatalf("reading source video: %v", err)
+	}
+
+	videoPath := filepath.Join(libDir, "Movie.One.2020.HDTV.x264-GRP.mp4")
+	if err := os.WriteFile(videoPath, videoContent, 0o644); err != nil {
+		t.Fatalf("writing video: %v", err)
+	}
+
+	dbPath := filepath.Join(t.TempDir(), "sublime.db")
+	st, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("opening store: %v", err)
+	}
+	defer func() { _ = st.Close() }()
+
+	ctx := context.Background()
+	en := language.English
+
+	hash, err := media.ComputeContentHash(videoPath)
+	if err != nil {
+		t.Fatalf("computing content hash: %v", err)
+	}
+	file, _, err := st.ObserveFileHash(ctx, "test-library", videoPath, string(hash))
+	if err != nil {
+		t.Fatalf("ObserveFileHash: %v", err)
+	}
+	if err := st.EnsureLanguage(ctx, file.ID, en); err != nil {
+		t.Fatalf("EnsureLanguage: %v", err)
+	}
+	// Simulate a concurrent caller having already claimed this pair before
+	// this pipeline run reaches it.
+	if err := st.MarkInProgress(ctx, file.ID, en); err != nil {
+		t.Fatalf("pre-claiming MarkInProgress: %v", err)
+	}
+
+	fakeProvider := &provider.Fake{
+		SearchFunc: func(ctx context.Context, q provider.Query) ([]domain.Candidate, error) {
+			t.Fatal("Search should not be called for a pair that lost its claim")
+			return nil, nil
+		},
+	}
+
+	lib := domain.Library{
+		Name:       "test-library",
+		Path:       libDir,
+		Languages:  []language.Tag{en},
+		StripScope: domain.StripScopeAll,
+	}
+
+	var logBuf bytes.Buffer
+	var logMu sync.Mutex
+	p := &pipeline.Pipeline{
+		Store:       st,
+		Provider:    fakeProvider,
+		SyncEngine:  &syncengine.FakeSyncEngine{},
+		Stripper:    &pipeline.FakeStripper{},
+		WorkerCount: 1,
+		Logger:      slog.New(slog.NewTextHandler(&syncedWriter{mu: &logMu, buf: &logBuf}, nil)),
+	}
+
+	result, err := p.RunFile(ctx, lib, videoPath)
+	if err != nil {
+		t.Fatalf("RunFile: %v", err)
+	}
+
+	if result.Failed != 0 {
+		t.Errorf("Failed = %d, want 0", result.Failed)
+	}
+	if result.Skipped != 1 {
+		t.Errorf("Skipped = %d, want 1", result.Skipped)
+	}
+
+	logMu.Lock()
+	logOutput := logBuf.String()
+	logMu.Unlock()
+	if strings.Contains(logOutput, "level=ERROR") {
+		t.Errorf("expected no ERROR log for a lost claim, got: %s", logOutput)
+	}
+
+	got, _, err := st.GetFile(ctx, "test-library", videoPath)
+	if err != nil {
+		t.Fatalf("GetFile: %v", err)
+	}
+	if got.Languages[0].Status != domain.StatusInProgress {
+		t.Errorf("expected the other claimant's status %q to survive untouched, got %q", domain.StatusInProgress, got.Languages[0].Status)
+	}
+}
+
 func TestPipeline_StreamingDiscoveryRegistersPendingAheadOfWorkerPickup(t *testing.T) {
 	libDir := t.TempDir()
 

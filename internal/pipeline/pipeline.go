@@ -499,6 +499,9 @@ func (p *Pipeline) processFile(
 	}
 
 	if err := p.Store.MarkInProgress(ctx, file.ID, lang); err != nil {
+		if errors.Is(err, store.ErrClaimLost) {
+			return outcomeSkipped, nil
+		}
 		p.logger().Error("marking in progress failed", "library", lib.Name, "path", videoPath, "language", lang.String(), "error", err)
 		return outcomeFailed, fmt.Errorf("marking in progress: %w", err)
 	}

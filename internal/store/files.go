@@ -256,17 +256,27 @@ func (s *Store) MarkSynced(ctx context.Context, fileID int64, lang language.Tag)
 }
 
 // MarkInProgress sets fileID's language state to StatusInProgress, clearing
-// any FailureReason. It returns ErrLanguageStateNotFound if no such row
-// exists; callers must EnsureLanguage first.
+// any FailureReason, but only if the row is currently StatusPending. It
+// returns ErrClaimLost if the row exists but isn't StatusPending anymore —
+// whether because another caller already claimed it or for any other
+// reason; see ErrClaimLost's doc comment for why that's not distinguished
+// from a genuinely missing row. Callers must EnsureLanguage first.
 func (s *Store) MarkInProgress(ctx context.Context, fileID int64, lang language.Tag) error {
 	res, err := s.db.ExecContext(ctx,
-		`UPDATE file_language_states SET status = ?, failure_reason = NULL, updated_at = ? WHERE file_id = ? AND language = ?`,
-		domain.StatusInProgress, nowString(), fileID, lang.String(),
+		`UPDATE file_language_states SET status = ?, failure_reason = NULL, updated_at = ? WHERE file_id = ? AND language = ? AND status = ?`,
+		domain.StatusInProgress, nowString(), fileID, lang.String(), domain.StatusPending,
 	)
 	if err != nil {
 		return fmt.Errorf("marking language state in progress: %w", err)
 	}
-	return checkUpdated(res)
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("reading rows affected: %w", err)
+	}
+	if n == 0 {
+		return ErrClaimLost
+	}
+	return nil
 }
 
 // MarkFailed sets fileID's language state to StatusFailed with reason. It
