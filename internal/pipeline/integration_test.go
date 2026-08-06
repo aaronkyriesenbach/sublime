@@ -119,12 +119,11 @@ func TestIntegration_RealPipeline_EndToEnd(t *testing.T) {
 	if result.FilesScanned != 1 {
 		t.Errorf("FilesScanned = %d, want 1", result.FilesScanned)
 	}
-	if result.Synced != 1 {
-		t.Errorf("Synced = %d, want 1", result.Synced)
+	if result.Found != 1 {
+		t.Errorf("Found = %d, want 1", result.Found)
 	}
-	if result.Failed != 0 {
-		t.Errorf("Failed = %d, want 0; errors: %v", result.Failed, result.Errors)
-	}
+
+	dispatchPending(t, ctx, p, st, lib)
 
 	sidecarPath := filepath.Join(libDir, "Test.Movie.2024.BluRay.x264-TESTGROUP.en.srt")
 	sidecarContent, err := os.ReadFile(sidecarPath)
@@ -169,11 +168,15 @@ func TestIntegration_RealPipeline_EndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("second pipeline.Run: %v", err)
 	}
-	if result2.Skipped != 1 {
-		t.Errorf("second run Skipped = %d, want 1 (marker recognized)", result2.Skipped)
+	if result2.Found != 0 || result2.Changed != 0 {
+		t.Errorf("second run Found=%d Changed=%d, want 0,0 (unchanged file)", result2.Found, result2.Changed)
 	}
-	if result2.Synced != 0 {
-		t.Errorf("second run Synced = %d, want 0", result2.Synced)
+
+	requestsBeforeSecondDispatch := mock.RequestCount()
+	dispatchPending(t, ctx, p, st, lib)
+	if got := mock.RequestCount(); got != requestsBeforeSecondDispatch {
+		t.Errorf("second dispatch hit the mock Provider server: request count went from %d to %d, want unchanged (marker recognized)",
+			requestsBeforeSecondDispatch, got)
 	}
 }
 
@@ -252,15 +255,22 @@ func TestIntegration_RealPipeline_RestartAfterStripSkipsResync(t *testing.T) {
 	defer func() { _ = st1.Close() }()
 
 	ctx := context.Background()
-	result, err := newPipeline(st1).Run(ctx, lib)
+	p1 := newPipeline(st1)
+	result, err := p1.Run(ctx, lib)
 	if err != nil {
 		t.Fatalf("first pipeline.Run: %v", err)
 	}
-	if result.Synced != 1 {
-		t.Errorf("first run Synced = %d, want 1", result.Synced)
+	if result.Found != 1 {
+		t.Errorf("first run Found = %d, want 1", result.Found)
 	}
-	if result.Failed != 0 {
-		t.Errorf("first run Failed = %d, want 0; errors: %v", result.Failed, result.Errors)
+	dispatchPending(t, ctx, p1, st1, lib)
+
+	file1, found1, err := st1.GetFile(ctx, lib.Name, videoPath)
+	if err != nil {
+		t.Fatalf("GetFile after first dispatch: %v", err)
+	}
+	if !found1 || file1.Languages[0].Status != domain.StatusSynced {
+		t.Fatalf("expected Synced after first dispatch, got %+v", file1)
 	}
 
 	streams, err := stripper.ProbeSubtitleStreams(ctx, videoPath)
@@ -287,11 +297,18 @@ func TestIntegration_RealPipeline_RestartAfterStripSkipsResync(t *testing.T) {
 	if err != nil {
 		t.Fatalf("second pipeline.Run: %v", err)
 	}
-	if result2.Skipped != 1 {
-		t.Errorf("second run (fresh store) Skipped = %d, want 1", result2.Skipped)
+	if result2.Found != 0 || result2.Changed != 0 {
+		t.Errorf("second run (fresh store) Found=%d Changed=%d, want 0,0", result2.Found, result2.Changed)
 	}
-	if result2.Synced != 0 {
-		t.Errorf("second run (fresh store) Synced = %d, want 0", result2.Synced)
+
+	dispatchPending(t, ctx, newPipeline(st2), st2, lib)
+
+	file2, found2, err := st2.GetFile(ctx, lib.Name, videoPath)
+	if err != nil {
+		t.Fatalf("GetFile after second dispatch: %v", err)
+	}
+	if !found2 || file2.Languages[0].Status != domain.StatusSynced {
+		t.Fatalf("expected Marker-gate hit to leave file Synced, got %+v", file2)
 	}
 
 	if got := mock.RequestCount(); got != requestsAfterFirstRun {

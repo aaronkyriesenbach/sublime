@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -24,220 +23,82 @@ import (
 	"github.com/aaronkyriesenbach/sublime/internal/syncengine"
 )
 
-func TestPipeline_EndToEnd(t *testing.T) {
-	// Create a temp directory as the "library"
-	libDir := t.TempDir()
+// syncedWriter serializes concurrent writes to buf behind mu, letting a
+// slog.TextHandler be shared safely across goroutines in tests.
+type syncedWriter struct {
+	mu  *sync.Mutex
+	buf *bytes.Buffer
+}
 
-	// Copy the sample video with a parseable filename
-	// Format: "Title 2024 HDTV x264-GROUP.mp4" for scoring.Parse to extract
-	videoName := "Test.Movie.2024.HDTV.x264-FAKEGROUP.mp4"
-	videoPath := filepath.Join(libDir, videoName)
+func (w *syncedWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.buf.Write(p)
+}
 
+func writeVideoFixture(t *testing.T, dst string) {
+	t.Helper()
 	srcVideo := filepath.Join("..", "..", "testdata", "integration", "video", "sample.mp4")
 	videoContent, err := os.ReadFile(srcVideo)
 	if err != nil {
 		t.Fatalf("reading source video: %v", err)
 	}
-	if err := os.WriteFile(videoPath, videoContent, 0o644); err != nil {
+	if err := os.WriteFile(dst, videoContent, 0o644); err != nil {
 		t.Fatalf("writing video to library: %v", err)
-	}
-
-	// Create a foreign sidecar (no Marker) that should be stripped
-	foreignSidecarPath := filepath.Join(libDir, "Test.Movie.2024.HDTV.x264-FAKEGROUP.en.srt")
-	foreignContent := "1\n00:00:01,000 --> 00:00:02,000\nForeign subtitle\n"
-	if err := os.WriteFile(foreignSidecarPath, []byte(foreignContent), 0o644); err != nil {
-		t.Fatalf("writing foreign sidecar: %v", err)
-	}
-
-	// Set up the store
-	dbPath := filepath.Join(t.TempDir(), "sublime.db")
-	st, err := store.Open(dbPath)
-	if err != nil {
-		t.Fatalf("opening store: %v", err)
-	}
-	defer func() { _ = st.Close() }()
-
-	// Set up fakes
-	candidateContent := "1\n00:00:00,500 --> 00:00:01,900\nOne two three\n\n2\n00:00:03,500 --> 00:00:05,100\nFour five six\n"
-	fakeProvider := &provider.Fake{
-		SearchFunc: func(ctx context.Context, q provider.Query) ([]domain.Candidate, error) {
-			return []domain.Candidate{{
-				ID:           "test-candidate-1",
-				Title:        "Test Movie",
-				Year:         2024,
-				Source:       "HDTV",
-				ReleaseGroup: "FAKEGROUP",
-				HashMatch:    false,
-			}}, nil
-		},
-		DownloadFunc: func(ctx context.Context, c domain.Candidate) ([]byte, error) {
-			return []byte(candidateContent), nil
-		},
-	}
-
-	fakeSyncEngine := &syncengine.FakeSyncEngine{}
-	fakeStripper := &pipeline.FakeStripper{}
-
-	lib := domain.Library{
-		Name:       "test-library",
-		Path:       libDir,
-		Languages:  []language.Tag{language.English},
-		StripScope: domain.StripScopeAll,
-	}
-
-	p := &pipeline.Pipeline{
-		Store:       st,
-		Provider:    fakeProvider,
-		SyncEngine:  fakeSyncEngine,
-		Stripper:    fakeStripper,
-		WorkerCount: 1, // Deterministic single-threaded for testing
-	}
-
-	// First run: should sync the file
-	ctx := context.Background()
-	result, err := p.Run(ctx, lib)
-	if err != nil {
-		t.Fatalf("first run: %v", err)
-	}
-
-	if result.FilesScanned != 1 {
-		t.Errorf("FilesScanned = %d, want 1", result.FilesScanned)
-	}
-	if result.Synced != 1 {
-		t.Errorf("Synced = %d, want 1", result.Synced)
-	}
-	if result.Skipped != 0 {
-		t.Errorf("Skipped = %d, want 0", result.Skipped)
-	}
-	if result.Failed != 0 {
-		t.Errorf("Failed = %d, want 0; errors: %v", result.Failed, result.Errors)
-	}
-
-	// Verify the sync engine was called
-	if len(fakeSyncEngine.Calls) != 1 {
-		t.Errorf("SyncEngine.Calls = %d, want 1", len(fakeSyncEngine.Calls))
-	}
-
-	// Verify the stripper was called
-	if len(fakeStripper.Calls) != 1 {
-		t.Errorf("Stripper.Calls = %d, want 1", len(fakeStripper.Calls))
-	}
-
-	// Verify a Marker-embedded sidecar was written
-	sidecarPath := filepath.Join(libDir, "Test.Movie.2024.HDTV.x264-FAKEGROUP.en.srt")
-	sidecarContent, err := os.ReadFile(sidecarPath)
-	if err != nil {
-		t.Fatalf("reading sidecar: %v", err)
-	}
-
-	codec, _ := marker.CodecFor(".srt")
-	foundMarker, presence := codec.Read(sidecarContent)
-	if presence != marker.Present {
-		t.Errorf("marker presence = %v, want Present; content:\n%s", presence, sidecarContent)
-	}
-
-	// Verify the marker matches the video's content hash
-	videoHash, err := media.ComputeContentHash(videoPath)
-	if err != nil {
-		t.Fatalf("computing video hash: %v", err)
-	}
-	if foundMarker.ContentHash != videoHash {
-		t.Errorf("marker hash = %q, want %q", foundMarker.ContentHash, videoHash)
-	}
-
-	// Verify the state store shows "synced"
-	file, found, err := st.GetFile(ctx, lib.Name, videoPath)
-	if err != nil {
-		t.Fatalf("getting file from store: %v", err)
-	}
-	if !found {
-		t.Fatal("file not found in store")
-	}
-	if len(file.Languages) != 1 {
-		t.Fatalf("file.Languages = %d, want 1", len(file.Languages))
-	}
-	if file.Languages[0].Status != domain.StatusSynced {
-		t.Errorf("file status = %q, want %q", file.Languages[0].Status, domain.StatusSynced)
-	}
-
-	// Second run: should skip (Marker recognized)
-	fakeStripper.Calls = nil
-	fakeSyncEngine.Calls = nil
-
-	result2, err := p.Run(ctx, lib)
-	if err != nil {
-		t.Fatalf("second run: %v", err)
-	}
-
-	if result2.FilesScanned != 1 {
-		t.Errorf("second run FilesScanned = %d, want 1", result2.FilesScanned)
-	}
-	if result2.Synced != 0 {
-		t.Errorf("second run Synced = %d, want 0", result2.Synced)
-	}
-	if result2.Skipped != 1 {
-		t.Errorf("second run Skipped = %d, want 1", result2.Skipped)
-	}
-	if result2.Failed != 0 {
-		t.Errorf("second run Failed = %d, want 0", result2.Failed)
-	}
-
-	// Verify no sync engine or stripper calls on re-run
-	if len(fakeSyncEngine.Calls) != 0 {
-		t.Errorf("second run SyncEngine.Calls = %d, want 0", len(fakeSyncEngine.Calls))
-	}
-	if len(fakeStripper.Calls) != 0 {
-		t.Errorf("second run Stripper.Calls = %d, want 0", len(fakeStripper.Calls))
 	}
 }
 
-func TestPipeline_NoCandidate(t *testing.T) {
-	libDir := t.TempDir()
-
-	videoName := "Test.Movie.2024.HDTV.x264-FAKEGROUP.mp4"
-	videoPath := filepath.Join(libDir, videoName)
-
-	srcVideo := filepath.Join("..", "..", "testdata", "integration", "video", "sample.mp4")
-	videoContent, err := os.ReadFile(srcVideo)
-	if err != nil {
-		t.Fatalf("reading source video: %v", err)
-	}
-	if err := os.WriteFile(videoPath, videoContent, 0o644); err != nil {
-		t.Fatalf("writing video to library: %v", err)
-	}
-
+func openTestStore(t *testing.T) *store.Store {
+	t.Helper()
 	dbPath := filepath.Join(t.TempDir(), "sublime.db")
 	st, err := store.Open(dbPath)
 	if err != nil {
 		t.Fatalf("opening store: %v", err)
 	}
-	defer func() { _ = st.Close() }()
+	t.Cleanup(func() { _ = st.Close() })
+	return st
+}
 
-	// Provider returns candidates that don't match (wrong title/year)
-	fakeProvider := &provider.Fake{
-		SearchFunc: func(ctx context.Context, q provider.Query) ([]domain.Candidate, error) {
-			return []domain.Candidate{{
-				ID:    "wrong-candidate",
-				Title: "Wrong Title",
-				Year:  1999,
-			}}, nil
-		},
+// dispatchPending processes every currently Pending (file, language) pair
+// for lib by calling pipeline.Pipeline.ProcessPending directly \u2014 the same
+// seam a Dispatcher (internal/dispatcher) calls after claiming a pair from
+// store.Store.PendingPairs. This is pipeline_test's stand-in for a real
+// Dispatcher: it lets these tests observe the per-pair dispatch work
+// (gate/claim/Search/Score/Download/Sync/Strip/outcome) that Run/RunFile no
+// longer perform themselves \u2014 see
+// docs/adr/0004-decouple-trigger-and-dispatcher.md.
+func dispatchPending(t *testing.T, ctx context.Context, p *pipeline.Pipeline, st *store.Store, lib domain.Library) {
+	t.Helper()
+	pairs, err := st.PendingPairs(ctx)
+	if err != nil {
+		t.Fatalf("PendingPairs: %v", err)
 	}
+	for _, pair := range pairs {
+		if pair.LibraryName != lib.Name {
+			continue
+		}
+		// ProcessPending's error return also carries expected, already-
+		// recorded outcomes (e.g. a Provider error landing the pair on
+		// StatusFailed) — callers assert against the resulting Store state,
+		// not this error, so it's deliberately not t.Fatal'd here.
+		_ = p.ProcessPending(ctx, lib, pair.FileID, pair.ContentHash, pair.Path, pair.Language, pair.Force)
+	}
+}
 
+func TestPipeline_RunRegistersFoundFileAndFansOutPending(t *testing.T) {
+	libDir := t.TempDir()
+	videoName := "Test.Movie.2024.HDTV.x264-FAKEGROUP.mp4"
+	videoPath := filepath.Join(libDir, videoName)
+	writeVideoFixture(t, videoPath)
+
+	st := openTestStore(t)
 	lib := domain.Library{
 		Name:       "test-library",
 		Path:       libDir,
 		Languages:  []language.Tag{language.English},
 		StripScope: domain.StripScopeAll,
 	}
-
-	p := &pipeline.Pipeline{
-		Store:       st,
-		Provider:    fakeProvider,
-		SyncEngine:  &syncengine.FakeSyncEngine{},
-		Stripper:    &pipeline.FakeStripper{},
-		WorkerCount: 1,
-	}
+	p := &pipeline.Pipeline{Store: st}
 
 	ctx := context.Background()
 	result, err := p.Run(ctx, lib)
@@ -245,188 +106,87 @@ func TestPipeline_NoCandidate(t *testing.T) {
 		t.Fatalf("run: %v", err)
 	}
 
-	// Should be counted as NoCandidate, not Synced or Failed with an error
-	if result.NoCandidate != 1 {
-		t.Errorf("NoCandidate = %d, want 1", result.NoCandidate)
+	if result.FilesScanned != 1 {
+		t.Errorf("FilesScanned = %d, want 1", result.FilesScanned)
 	}
-	if result.Failed != 0 {
-		t.Errorf("Failed = %d, want 0", result.Failed)
+	if result.Found != 1 {
+		t.Errorf("Found = %d, want 1", result.Found)
 	}
-	if result.Synced != 0 {
-		t.Errorf("Synced = %d, want 0", result.Synced)
+	if result.Changed != 0 {
+		t.Errorf("Changed = %d, want 0", result.Changed)
 	}
 
-	// Verify the store shows "failed" with no_candidate reason
 	file, found, err := st.GetFile(ctx, lib.Name, videoPath)
 	if err != nil {
-		t.Fatalf("getting file from store: %v", err)
+		t.Fatalf("GetFile: %v", err)
 	}
 	if !found {
 		t.Fatal("file not found in store")
 	}
-	if len(file.Languages) != 1 {
-		t.Fatalf("file.Languages = %d, want 1", len(file.Languages))
-	}
-	if file.Languages[0].Status != domain.StatusFailed {
-		t.Errorf("file status = %q, want %q", file.Languages[0].Status, domain.StatusFailed)
-	}
-	if file.Languages[0].FailureReason != domain.FailureNoCandidate {
-		t.Errorf("failure reason = %q, want %q", file.Languages[0].FailureReason, domain.FailureNoCandidate)
+	if len(file.Languages) != 1 || file.Languages[0].Status != domain.StatusPending {
+		t.Fatalf("file.Languages = %+v, want 1 Pending entry", file.Languages)
 	}
 }
 
-func TestPipeline_MultipleLanguages(t *testing.T) {
+func TestPipeline_MultipleLanguagesFanOutOnePendingRowEach(t *testing.T) {
 	libDir := t.TempDir()
-
 	videoName := "Test.Movie.2024.HDTV.x264-FAKEGROUP.mp4"
 	videoPath := filepath.Join(libDir, videoName)
+	writeVideoFixture(t, videoPath)
 
-	srcVideo := filepath.Join("..", "..", "testdata", "integration", "video", "sample.mp4")
-	videoContent, err := os.ReadFile(srcVideo)
-	if err != nil {
-		t.Fatalf("reading source video: %v", err)
-	}
-	if err := os.WriteFile(videoPath, videoContent, 0o644); err != nil {
-		t.Fatalf("writing video to library: %v", err)
-	}
-
-	dbPath := filepath.Join(t.TempDir(), "sublime.db")
-	st, err := store.Open(dbPath)
-	if err != nil {
-		t.Fatalf("opening store: %v", err)
-	}
-	defer func() { _ = st.Close() }()
-
-	candidateContent := "1\n00:00:00,500 --> 00:00:01,900\nOne two three\n"
-	fakeProvider := &provider.Fake{
-		SearchFunc: func(ctx context.Context, q provider.Query) ([]domain.Candidate, error) {
-			return []domain.Candidate{{
-				ID:        "test-candidate",
-				Title:     "Test Movie",
-				Year:      2024,
-				HashMatch: false,
-			}}, nil
-		},
-		DownloadFunc: func(ctx context.Context, c domain.Candidate) ([]byte, error) {
-			return []byte(candidateContent), nil
-		},
-	}
-
+	st := openTestStore(t)
 	lib := domain.Library{
 		Name:       "test-library",
 		Path:       libDir,
 		Languages:  []language.Tag{language.English, language.Spanish},
 		StripScope: domain.StripScopeAll,
 	}
-
-	p := &pipeline.Pipeline{
-		Store:       st,
-		Provider:    fakeProvider,
-		SyncEngine:  &syncengine.FakeSyncEngine{},
-		Stripper:    &pipeline.FakeStripper{},
-		WorkerCount: 1,
-	}
+	p := &pipeline.Pipeline{Store: st}
 
 	ctx := context.Background()
-	result, err := p.Run(ctx, lib)
-	if err != nil {
+	if _, err := p.Run(ctx, lib); err != nil {
 		t.Fatalf("run: %v", err)
 	}
 
-	if result.FilesScanned != 1 {
-		t.Errorf("FilesScanned = %d, want 1", result.FilesScanned)
+	file, found, err := st.GetFile(ctx, lib.Name, videoPath)
+	if err != nil {
+		t.Fatalf("GetFile: %v", err)
 	}
-	if result.Synced != 2 {
-		t.Errorf("Synced = %d, want 2 (one per language)", result.Synced)
+	if !found || len(file.Languages) != 2 {
+		t.Fatalf("file.Languages = %+v, want 2 entries", file.Languages)
 	}
-
-	// Verify both sidecars exist
-	enSidecar := filepath.Join(libDir, "Test.Movie.2024.HDTV.x264-FAKEGROUP.en.srt")
-	esSidecar := filepath.Join(libDir, "Test.Movie.2024.HDTV.x264-FAKEGROUP.es.srt")
-
-	if _, err := os.Stat(enSidecar); os.IsNotExist(err) {
-		t.Error("English sidecar not found")
-	}
-	if _, err := os.Stat(esSidecar); os.IsNotExist(err) {
-		t.Error("Spanish sidecar not found")
+	for _, ls := range file.Languages {
+		if ls.Status != domain.StatusPending {
+			t.Errorf("language %q status = %q, want %q", ls.Language, ls.Status, domain.StatusPending)
+		}
 	}
 }
 
-func TestPipeline_ScanFindsVideoFiles(t *testing.T) {
+func TestPipeline_ScanFindsVideoFilesAcrossSubdirectories(t *testing.T) {
 	libDir := t.TempDir()
-
-	// Create subdirectory structure
 	subDir := filepath.Join(libDir, "subdir")
 	if err := os.MkdirAll(subDir, 0o755); err != nil {
 		t.Fatalf("creating subdir: %v", err)
 	}
 
-	// Copy video to both root and subdir
-	srcVideo := filepath.Join("..", "..", "testdata", "integration", "video", "sample.mp4")
-	videoContent, err := os.ReadFile(srcVideo)
-	if err != nil {
-		t.Fatalf("reading source video: %v", err)
-	}
-
 	video1 := filepath.Join(libDir, "Movie.One.2020.HDTV.x264-GRP.mp4")
 	video2 := filepath.Join(subDir, "Movie.Two.2021.HDTV.x264-GRP.mkv")
+	writeVideoFixture(t, video1)
+	writeVideoFixture(t, video2)
 
-	if err := os.WriteFile(video1, videoContent, 0o644); err != nil {
-		t.Fatalf("writing video1: %v", err)
-	}
-	if err := os.WriteFile(video2, videoContent, 0o644); err != nil {
-		t.Fatalf("writing video2: %v", err)
-	}
-
-	// Also create a non-video file that should be ignored
 	txtFile := filepath.Join(libDir, "readme.txt")
 	if err := os.WriteFile(txtFile, []byte("not a video"), 0o644); err != nil {
 		t.Fatalf("writing txt file: %v", err)
 	}
 
-	dbPath := filepath.Join(t.TempDir(), "sublime.db")
-	st, err := store.Open(dbPath)
-	if err != nil {
-		t.Fatalf("opening store: %v", err)
-	}
-	defer func() { _ = st.Close() }()
-
-	candidateContent := "1\n00:00:00,500 --> 00:00:01,900\nOne two three\n"
-	searchCount := 0
-	fakeProvider := &provider.Fake{
-		SearchFunc: func(ctx context.Context, q provider.Query) ([]domain.Candidate, error) {
-			searchCount++
-			title := "Movie One"
-			year := 2020
-			if strings.Contains(q.Path, "Two") {
-				title = "Movie Two"
-				year = 2021
-			}
-			return []domain.Candidate{{
-				ID:    "candidate",
-				Title: title,
-				Year:  year,
-			}}, nil
-		},
-		DownloadFunc: func(ctx context.Context, c domain.Candidate) ([]byte, error) {
-			return []byte(candidateContent), nil
-		},
-	}
-
+	st := openTestStore(t)
 	lib := domain.Library{
 		Name:       "test-library",
 		Path:       libDir,
 		Languages:  []language.Tag{language.English},
 		StripScope: domain.StripScopeAll,
 	}
-
-	p := &pipeline.Pipeline{
-		Store:       st,
-		Provider:    fakeProvider,
-		SyncEngine:  &syncengine.FakeSyncEngine{},
-		Stripper:    &pipeline.FakeStripper{},
-		WorkerCount: 1,
-	}
+	p := &pipeline.Pipeline{Store: st}
 
 	ctx := context.Background()
 	result, err := p.Run(ctx, lib)
@@ -437,33 +197,390 @@ func TestPipeline_ScanFindsVideoFiles(t *testing.T) {
 	if result.FilesScanned != 2 {
 		t.Errorf("FilesScanned = %d, want 2", result.FilesScanned)
 	}
-	if result.Synced != 2 {
-		t.Errorf("Synced = %d, want 2", result.Synced)
+	if result.Found != 2 {
+		t.Errorf("Found = %d, want 2", result.Found)
 	}
 }
 
-func TestPipeline_RunWithForceReprocessesSyncedFile(t *testing.T) {
+func TestPipeline_RunFileRegistersOnlyTheGivenFile(t *testing.T) {
 	libDir := t.TempDir()
+	video1 := filepath.Join(libDir, "Movie.One.2020.HDTV.x264-GRP.mp4")
+	video2 := filepath.Join(libDir, "Movie.Two.2021.HDTV.x264-GRP.mp4")
+	writeVideoFixture(t, video1)
+	writeVideoFixture(t, video2)
 
+	st := openTestStore(t)
+	lib := domain.Library{
+		Name:       "test-library",
+		Path:       libDir,
+		Languages:  []language.Tag{language.English},
+		StripScope: domain.StripScopeAll,
+	}
+	p := &pipeline.Pipeline{Store: st}
+
+	ctx := context.Background()
+	result, err := p.RunFile(ctx, lib, video1)
+	if err != nil {
+		t.Fatalf("RunFile: %v", err)
+	}
+
+	if result.FilesScanned != 1 {
+		t.Errorf("FilesScanned = %d, want 1", result.FilesScanned)
+	}
+	if result.Found != 1 {
+		t.Errorf("Found = %d, want 1", result.Found)
+	}
+
+	if _, found, err := st.GetFile(ctx, lib.Name, video1); err != nil || !found {
+		t.Errorf("video1 not registered: found=%v err=%v", found, err)
+	}
+	if _, found, err := st.GetFile(ctx, lib.Name, video2); err != nil || found {
+		t.Errorf("video2 unexpectedly registered: found=%v err=%v", found, err)
+	}
+}
+
+// TestPipeline_ChangedFileLogsFileChangedAndResetsToPending guards the
+// Changed half of the classification for the bulk-scan entrypoint: an
+// already-tracked file whose Content Hash differs from its last-recorded
+// value must log "file changed" (not another "file found") and reset its
+// language state back to Pending in place.
+func TestPipeline_ChangedFileLogsFileChangedAndResetsToPending(t *testing.T) {
+	libDir := t.TempDir()
 	videoName := "Test.Movie.2024.HDTV.x264-FAKEGROUP.mp4"
 	videoPath := filepath.Join(libDir, videoName)
+	writeVideoFixture(t, videoPath)
 
-	srcVideo := filepath.Join("..", "..", "testdata", "integration", "video", "sample.mp4")
-	videoContent, err := os.ReadFile(srcVideo)
-	if err != nil {
-		t.Fatalf("reading source video: %v", err)
+	st := openTestStore(t)
+	lib := domain.Library{
+		Name:       "test-library",
+		Path:       libDir,
+		Languages:  []language.Tag{language.English},
+		StripScope: domain.StripScopeAll,
 	}
-	if err := os.WriteFile(videoPath, videoContent, 0o644); err != nil {
+
+	var logBuf bytes.Buffer
+	p := &pipeline.Pipeline{Store: st, Logger: slog.New(slog.NewTextHandler(&logBuf, nil))}
+
+	ctx := context.Background()
+	if _, err := p.Run(ctx, lib); err != nil {
+		t.Fatalf("first run: %v", err)
+	}
+
+	videoContent, err := os.ReadFile(videoPath)
+	if err != nil {
+		t.Fatalf("reading video: %v", err)
+	}
+	if err := os.WriteFile(videoPath, append(videoContent, []byte("mutated")...), 0o644); err != nil {
+		t.Fatalf("mutating video: %v", err)
+	}
+
+	logBuf.Reset()
+	result2, err := p.Run(ctx, lib)
+	if err != nil {
+		t.Fatalf("second run: %v", err)
+	}
+
+	logOutput := logBuf.String()
+	if !strings.Contains(logOutput, "file changed") {
+		t.Errorf(`log output missing "file changed":%s`, logOutput)
+	}
+	if strings.Contains(logOutput, "file found") {
+		t.Errorf(`log output unexpectedly contains "file found" for an already-tracked file:%s`, logOutput)
+	}
+	if result2.Changed != 1 {
+		t.Errorf("second run Changed = %d, want 1", result2.Changed)
+	}
+	if result2.Found != 0 {
+		t.Errorf("second run Found = %d, want 0", result2.Found)
+	}
+
+	file, found, err := st.GetFile(ctx, lib.Name, videoPath)
+	if err != nil {
+		t.Fatalf("getting file from store: %v", err)
+	}
+	if !found {
+		t.Fatal("file not found in store")
+	}
+	if len(file.Languages) != 1 || file.Languages[0].Status != domain.StatusPending {
+		t.Fatalf("file.Languages = %+v, want 1 entry with status pending", file.Languages)
+	}
+}
+
+// TestPipeline_LogsFileFoundOncePerFileNotPerLanguage guards the
+// Found/Changed classification's per-file (not per-language) logging
+// contract: a brand-new file with multiple configured languages must
+// produce exactly one "file found" line, not one per (file, language) pair.
+func TestPipeline_LogsFileFoundOncePerFileNotPerLanguage(t *testing.T) {
+	libDir := t.TempDir()
+	videoName := "Test.Movie.2024.HDTV.x264-FAKEGROUP.mp4"
+	videoPath := filepath.Join(libDir, videoName)
+	writeVideoFixture(t, videoPath)
+
+	st := openTestStore(t)
+	lib := domain.Library{
+		Name:       "test-library",
+		Path:       libDir,
+		Languages:  []language.Tag{language.English, language.Spanish},
+		StripScope: domain.StripScopeAll,
+	}
+
+	var logBuf bytes.Buffer
+	p := &pipeline.Pipeline{Store: st, Logger: slog.New(slog.NewTextHandler(&logBuf, nil))}
+
+	ctx := context.Background()
+	if _, err := p.Run(ctx, lib); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	logOutput := logBuf.String()
+	if got := strings.Count(logOutput, "file found"); got != 1 {
+		t.Errorf(`"file found" count = %d, want 1; log output:\n%s`, got, logOutput)
+	}
+	if strings.Contains(logOutput, "file changed") {
+		t.Errorf("log output unexpectedly contains \"file changed\" for a brand-new file:\n%s", logOutput)
+	}
+}
+
+// TestPipeline_ForceReprocessLogsFileChangedAndMarksPairsForced guards a
+// manual reprocess request (pipeline.WithForce) against an already-tracked
+// file whose Content Hash hasn't changed: it must still log "file
+// changed", not "file found", and mark every one of the file's pending
+// pairs Force (store.PendingPair.Force) so a future Dispatcher bypasses the
+// Marker+Content-Hash gate for it.
+func TestPipeline_ForceReprocessLogsFileChangedAndMarksPairsForced(t *testing.T) {
+	libDir := t.TempDir()
+	videoName := "Test.Movie.2024.HDTV.x264-FAKEGROUP.mp4"
+	videoPath := filepath.Join(libDir, videoName)
+	writeVideoFixture(t, videoPath)
+
+	st := openTestStore(t)
+	lib := domain.Library{
+		Name:       "test-library",
+		Path:       libDir,
+		Languages:  []language.Tag{language.English},
+		StripScope: domain.StripScopeAll,
+	}
+
+	var logBuf bytes.Buffer
+	p := &pipeline.Pipeline{Store: st, Logger: slog.New(slog.NewTextHandler(&logBuf, nil))}
+
+	ctx := context.Background()
+	if _, err := p.Run(ctx, lib); err != nil {
+		t.Fatalf("first run: %v", err)
+	}
+
+	logBuf.Reset()
+	result2, err := p.RunFile(ctx, lib, videoPath, pipeline.WithForce())
+	if err != nil {
+		t.Fatalf("forced RunFile: %v", err)
+	}
+
+	logOutput := logBuf.String()
+	if !strings.Contains(logOutput, "file changed") {
+		t.Errorf(`log output missing "file changed":%s`, logOutput)
+	}
+	if strings.Contains(logOutput, "file found") {
+		t.Errorf(`log output unexpectedly contains "file found" for a forced reprocess of an already-tracked file:%s`, logOutput)
+	}
+	if result2.Changed != 1 {
+		t.Errorf("forced run Changed = %d, want 1", result2.Changed)
+	}
+
+	pairs, err := st.PendingPairs(ctx)
+	if err != nil {
+		t.Fatalf("PendingPairs: %v", err)
+	}
+	if len(pairs) != 1 || !pairs[0].Force {
+		t.Fatalf("PendingPairs = %+v, want a single Force pair", pairs)
+	}
+}
+
+// TestPipeline_RunFileAppliesSameFoundVsChangedClassificationAsRun guards
+// the single-file entrypoint (fsnotify watch events, manual reprocessing)
+// applying the identical Found-vs-Changed distinction as the bulk scan.
+func TestPipeline_RunFileAppliesSameFoundVsChangedClassificationAsRun(t *testing.T) {
+	libDir := t.TempDir()
+	videoName := "Test.Movie.2024.HDTV.x264-FAKEGROUP.mp4"
+	videoPath := filepath.Join(libDir, videoName)
+	writeVideoFixture(t, videoPath)
+
+	st := openTestStore(t)
+	lib := domain.Library{
+		Name:       "test-library",
+		Path:       libDir,
+		Languages:  []language.Tag{language.English},
+		StripScope: domain.StripScopeAll,
+	}
+
+	var logBuf bytes.Buffer
+	p := &pipeline.Pipeline{Store: st, Logger: slog.New(slog.NewTextHandler(&logBuf, nil))}
+
+	ctx := context.Background()
+
+	if _, err := p.RunFile(ctx, lib, videoPath); err != nil {
+		t.Fatalf("first RunFile: %v", err)
+	}
+	if got := strings.Count(logBuf.String(), "file found"); got != 1 {
+		t.Errorf(`"file found" count = %d, want 1; log output:%s`, got, logBuf.String())
+	}
+
+	videoContent, err := os.ReadFile(videoPath)
+	if err != nil {
+		t.Fatalf("reading video: %v", err)
+	}
+	if err := os.WriteFile(videoPath, append(videoContent, []byte("mutated")...), 0o644); err != nil {
+		t.Fatalf("mutating video: %v", err)
+	}
+
+	logBuf.Reset()
+	if _, err := p.RunFile(ctx, lib, videoPath); err != nil {
+		t.Fatalf("second RunFile: %v", err)
+	}
+
+	logOutput := logBuf.String()
+	if !strings.Contains(logOutput, "file changed") {
+		t.Errorf(`log output missing "file changed":%s`, logOutput)
+	}
+	if strings.Contains(logOutput, "file found") {
+		t.Errorf(`log output unexpectedly contains "file found" for an already-tracked file:%s`, logOutput)
+	}
+}
+
+func TestPipeline_RunReturnsPromptlyWithoutWaitingOnAnyDispatch(t *testing.T) {
+	libDir := t.TempDir()
+	const numFiles = 8
+	for i := 0; i < numFiles; i++ {
+		writeVideoFixture(t, filepath.Join(libDir, fileNameForIndex(i)))
+	}
+
+	st := openTestStore(t)
+	lib := domain.Library{
+		Name:       "test-library",
+		Path:       libDir,
+		Languages:  []language.Tag{language.English, language.Spanish},
+		StripScope: domain.StripScopeAll,
+	}
+	p := &pipeline.Pipeline{Store: st}
+
+	ctx := context.Background()
+	done := make(chan struct{})
+	start := time.Now()
+	go func() {
+		defer close(done)
+		if _, err := p.Run(ctx, lib); err != nil {
+			t.Errorf("run: %v", err)
+		}
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not return promptly; it must never wait on any Dispatcher claiming or processing its Pending rows")
+	}
+	elapsed := time.Since(start)
+
+	pairs, err := st.PendingPairs(ctx)
+	if err != nil {
+		t.Fatalf("PendingPairs: %v", err)
+	}
+	if len(pairs) != numFiles*len(lib.Languages) {
+		t.Errorf("PendingPairs = %d, want %d (every discovered pair fanned out to Pending)", len(pairs), numFiles*len(lib.Languages))
+	}
+	t.Logf("Run took %s for %d files with no Provider configured", elapsed, numFiles)
+}
+
+func fileNameForIndex(i int) string {
+	return "Movie." + string(rune('A'+i)) + ".2020.HDTV.x264-GRP.mp4"
+}
+
+// TestPipeline_ClaimLostSkipsWithoutError guards ProcessPending's handling
+// of store.ErrClaimLost from MarkInProgress: when another caller has
+// already claimed the (file, language) pair, ProcessPending must treat it
+// like an already-synced skip (no error, no ERROR log), not a processing
+// failure.
+func TestPipeline_ClaimLostSkipsWithoutError(t *testing.T) {
+	libDir := t.TempDir()
+	videoPath := filepath.Join(libDir, "Movie.One.2020.HDTV.x264-GRP.mp4")
+	writeVideoFixture(t, videoPath)
+
+	st := openTestStore(t)
+	ctx := context.Background()
+	en := language.English
+
+	hash, err := media.ComputeContentHash(videoPath)
+	if err != nil {
+		t.Fatalf("computing content hash: %v", err)
+	}
+	file, _, err := st.ObserveFileHash(ctx, "test-library", videoPath, string(hash))
+	if err != nil {
+		t.Fatalf("ObserveFileHash: %v", err)
+	}
+	if err := st.EnsureLanguage(ctx, file.ID, en); err != nil {
+		t.Fatalf("EnsureLanguage: %v", err)
+	}
+	// Simulate a concurrent caller having already claimed this pair before
+	// this call reaches it.
+	if err := st.MarkInProgress(ctx, file.ID, en); err != nil {
+		t.Fatalf("pre-claiming MarkInProgress: %v", err)
+	}
+
+	fakeProvider := &provider.Fake{
+		SearchFunc: func(ctx context.Context, q provider.Query) ([]domain.Candidate, error) {
+			t.Fatal("Search should not be called for a pair that lost its claim")
+			return nil, nil
+		},
+	}
+
+	lib := domain.Library{
+		Name:       "test-library",
+		Path:       libDir,
+		Languages:  []language.Tag{en},
+		StripScope: domain.StripScopeAll,
+	}
+
+	var logBuf bytes.Buffer
+	var logMu sync.Mutex
+	p := &pipeline.Pipeline{
+		Store:      st,
+		Provider:   fakeProvider,
+		SyncEngine: &syncengine.FakeSyncEngine{},
+		Stripper:   &pipeline.FakeStripper{},
+		Logger:     slog.New(slog.NewTextHandler(&syncedWriter{mu: &logMu, buf: &logBuf}, nil)),
+	}
+
+	if err := p.ProcessPending(ctx, lib, file.ID, string(hash), videoPath, en, false); err != nil {
+		t.Fatalf("ProcessPending: %v", err)
+	}
+
+	logMu.Lock()
+	logOutput := logBuf.String()
+	logMu.Unlock()
+	if strings.Contains(logOutput, "level=ERROR") {
+		t.Errorf("expected no ERROR log for a lost claim, got: %s", logOutput)
+	}
+
+	got, _, err := st.GetFile(ctx, "test-library", videoPath)
+	if err != nil {
+		t.Fatalf("GetFile: %v", err)
+	}
+	if got.Languages[0].Status != domain.StatusInProgress {
+		t.Errorf("expected the other claimant's status %q to survive untouched, got %q", domain.StatusInProgress, got.Languages[0].Status)
+	}
+}
+
+// TestPipeline_MarkerGateFastPathSkipsInProgress guards the Marker-gate-hit
+// fast path: when a valid Marker already exists (no Provider work needed),
+// the (file, language) pair must transition directly from Pending to
+// Synced, never touching In Progress — not even transiently.
+func TestPipeline_MarkerGateFastPathSkipsInProgress(t *testing.T) {
+	libDir := t.TempDir()
+	videoName := "Test.Movie.2024.HDTV.x264-FAKEGROUP.mp4"
+	videoPath := filepath.Join(libDir, videoName)
+	if err := os.WriteFile(videoPath, []byte("original video bytes"), 0o644); err != nil {
 		t.Fatalf("writing video to library: %v", err)
 	}
 
-	dbPath := filepath.Join(t.TempDir(), "sublime.db")
-	st, err := store.Open(dbPath)
-	if err != nil {
-		t.Fatalf("opening store: %v", err)
-	}
-	defer func() { _ = st.Close() }()
-
+	st := openTestStore(t)
 	candidateContent := "1\n00:00:00,500 --> 00:00:01,900\nOne two three\n"
 	fakeProvider := &provider.Fake{
 		SearchFunc: func(ctx context.Context, q provider.Query) ([]domain.Candidate, error) {
@@ -481,89 +598,89 @@ func TestPipeline_RunWithForceReprocessesSyncedFile(t *testing.T) {
 		StripScope: domain.StripScopeAll,
 	}
 
-	fakeSyncEngine := &syncengine.FakeSyncEngine{}
-	fakeStripper := &pipeline.FakeStripper{}
-
 	p := &pipeline.Pipeline{
-		Store:       st,
-		Provider:    fakeProvider,
-		SyncEngine:  fakeSyncEngine,
-		Stripper:    fakeStripper,
-		WorkerCount: 1,
+		Store:      st,
+		Provider:   fakeProvider,
+		SyncEngine: &syncengine.FakeSyncEngine{},
+		Stripper:   &pipeline.FakeStripper{},
 	}
 
 	ctx := context.Background()
-
-	// First run: synced normally.
 	if _, err := p.Run(ctx, lib); err != nil {
 		t.Fatalf("first run: %v", err)
 	}
+	dispatchPending(t, ctx, p, st, lib)
 
-	// Second run without Force: gate skips it, no Provider/SyncEngine/Stripper calls.
-	fakeSyncEngine.Calls = nil
-	fakeStripper.Calls = nil
-	result2, err := p.Run(ctx, lib)
+	file, found, err := st.GetFile(ctx, lib.Name, videoPath)
 	if err != nil {
+		t.Fatalf("getting file from store: %v", err)
+	}
+	if !found || file.Languages[0].Status != domain.StatusSynced {
+		t.Fatalf("expected Synced after first dispatch, got %+v", file)
+	}
+
+	// Simulate total state loss: a brand-new, empty state store. The video
+	// and its Marker-bearing sidecar are untouched on disk, so the Marker
+	// gate alone must recognize it as already synced.
+	freshStore := openTestStore(t)
+
+	var logBuf bytes.Buffer
+	p2 := &pipeline.Pipeline{
+		Store:      freshStore,
+		Provider:   fakeProvider,
+		SyncEngine: &syncengine.FakeSyncEngine{},
+		Stripper:   &pipeline.FakeStripper{},
+		Logger:     slog.New(slog.NewTextHandler(&logBuf, nil)),
+	}
+
+	if _, err := p2.Run(ctx, lib); err != nil {
 		t.Fatalf("second run: %v", err)
 	}
-	if result2.Skipped != 1 {
-		t.Errorf("second run Skipped = %d, want 1", result2.Skipped)
+	dispatchPending(t, ctx, p2, freshStore, lib)
+
+	logOutput := logBuf.String()
+	for _, want := range []string{`msg="status changed"`, "from=pending", "to=synced"} {
+		if !strings.Contains(logOutput, want) {
+			t.Errorf("log output = %q, want it to contain %q", logOutput, want)
+		}
 	}
-	if len(fakeSyncEngine.Calls) != 0 {
-		t.Errorf("second run SyncEngine.Calls = %d, want 0", len(fakeSyncEngine.Calls))
+	if got := strings.Count(logOutput, `msg="status changed"`); got != 1 {
+		t.Errorf(`"status changed" count = %d, want exactly 1 (Pending->Synced fast path only):%s`, got, logOutput)
+	}
+	if strings.Contains(logOutput, "in_progress") {
+		t.Errorf("log output unexpectedly mentions in_progress for the marker-gate fast path:%s", logOutput)
 	}
 
-	// Third run with WithForce: bypasses the gate and reprocesses despite the
-	// valid Marker from the first run.
-	result3, err := p.Run(ctx, lib, pipeline.WithForce())
+	file2, found, err := freshStore.GetFile(ctx, lib.Name, videoPath)
 	if err != nil {
-		t.Fatalf("forced run: %v", err)
+		t.Fatalf("getting file from store: %v", err)
 	}
-	if result3.Synced != 1 {
-		t.Errorf("forced run Synced = %d, want 1", result3.Synced)
+	if !found {
+		t.Fatal("file not found in store")
 	}
-	if result3.Skipped != 0 {
-		t.Errorf("forced run Skipped = %d, want 0", result3.Skipped)
-	}
-	if len(fakeSyncEngine.Calls) != 1 {
-		t.Errorf("forced run SyncEngine.Calls = %d, want 1", len(fakeSyncEngine.Calls))
-	}
-	if len(fakeStripper.Calls) != 1 {
-		t.Errorf("forced run Stripper.Calls = %d, want 1", len(fakeStripper.Calls))
+	if len(file2.Languages) != 1 || file2.Languages[0].Status != domain.StatusSynced {
+		t.Fatalf("file.Languages = %+v, want 1 entry with status synced", file2.Languages)
 	}
 }
 
-func TestPipeline_RunFileProcessesSingleFile(t *testing.T) {
+// TestPipeline_ContentHashReflectsPostStripState guards the Content Hash /
+// Strip-ordering fix: when Strip's embedded-stream removal actually
+// mutates the video, the Marker and store must bind to the file's settled
+// post-Strip hash, not the pre-Strip hash captured before ProcessPending
+// began.
+func TestPipeline_ContentHashReflectsPostStripState(t *testing.T) {
 	libDir := t.TempDir()
-
-	srcVideo := filepath.Join("..", "..", "testdata", "integration", "video", "sample.mp4")
-	videoContent, err := os.ReadFile(srcVideo)
-	if err != nil {
-		t.Fatalf("reading source video: %v", err)
+	videoName := "Test.Movie.2024.HDTV.x264-FAKEGROUP.mp4"
+	videoPath := filepath.Join(libDir, videoName)
+	if err := os.WriteFile(videoPath, []byte("original video bytes"), 0o644); err != nil {
+		t.Fatalf("writing video to library: %v", err)
 	}
 
-	video1 := filepath.Join(libDir, "Movie.One.2020.HDTV.x264-GRP.mp4")
-	video2 := filepath.Join(libDir, "Movie.Two.2021.HDTV.x264-GRP.mp4")
-	if err := os.WriteFile(video1, videoContent, 0o644); err != nil {
-		t.Fatalf("writing video1: %v", err)
-	}
-	if err := os.WriteFile(video2, videoContent, 0o644); err != nil {
-		t.Fatalf("writing video2: %v", err)
-	}
-
-	dbPath := filepath.Join(t.TempDir(), "sublime.db")
-	st, err := store.Open(dbPath)
-	if err != nil {
-		t.Fatalf("opening store: %v", err)
-	}
-	defer func() { _ = st.Close() }()
-
-	searchedPaths := map[string]int{}
+	st := openTestStore(t)
 	candidateContent := "1\n00:00:00,500 --> 00:00:01,900\nOne two three\n"
 	fakeProvider := &provider.Fake{
 		SearchFunc: func(ctx context.Context, q provider.Query) ([]domain.Candidate, error) {
-			searchedPaths[q.Path]++
-			return []domain.Candidate{{ID: "candidate", Title: q.Title, Year: q.Year}}, nil
+			return []domain.Candidate{{ID: "test-candidate", Title: "Test Movie", Year: 2024}}, nil
 		},
 		DownloadFunc: func(ctx context.Context, c domain.Candidate) ([]byte, error) {
 			return []byte(candidateContent), nil
@@ -577,66 +694,103 @@ func TestPipeline_RunFileProcessesSingleFile(t *testing.T) {
 		StripScope: domain.StripScopeAll,
 	}
 
+	// Simulate a Strip pass that finds and removes an embedded stream,
+	// mutating the video's on-disk bytes the way a real ffmpeg remux would.
+	fakeStripper := &pipeline.FakeStripper{StripEmbeddedIndices: []int{2}}
+
 	p := &pipeline.Pipeline{
-		Store:       st,
-		Provider:    fakeProvider,
-		SyncEngine:  &syncengine.FakeSyncEngine{},
-		Stripper:    &pipeline.FakeStripper{},
-		WorkerCount: 1,
+		Store:      st,
+		Provider:   fakeProvider,
+		SyncEngine: &syncengine.FakeSyncEngine{},
+		Stripper:   fakeStripper,
 	}
 
 	ctx := context.Background()
-	result, err := p.RunFile(ctx, lib, video1)
+	if _, err := p.Run(ctx, lib); err != nil {
+		t.Fatalf("first run: %v", err)
+	}
+	dispatchPending(t, ctx, p, st, lib)
+
+	if len(fakeStripper.StripEmbeddedCalls) != 1 {
+		t.Fatalf("StripEmbeddedCalls = %d, want 1", len(fakeStripper.StripEmbeddedCalls))
+	}
+
+	postStripHash, err := media.ComputeContentHash(videoPath)
 	if err != nil {
-		t.Fatalf("RunFile: %v", err)
+		t.Fatalf("computing post-strip video hash: %v", err)
 	}
 
-	if result.FilesScanned != 1 {
-		t.Errorf("FilesScanned = %d, want 1", result.FilesScanned)
+	sidecarPath := filepath.Join(libDir, "Test.Movie.2024.HDTV.x264-FAKEGROUP.en.srt")
+	sidecarContent, err := os.ReadFile(sidecarPath)
+	if err != nil {
+		t.Fatalf("reading sidecar: %v", err)
 	}
-	if result.Synced != 1 {
-		t.Errorf("Synced = %d, want 1", result.Synced)
+	codec, _ := marker.CodecFor(".srt")
+	foundMarker, presence := codec.Read(sidecarContent)
+	if presence != marker.Present {
+		t.Fatalf("marker presence = %v, want Present", presence)
 	}
-	if searchedPaths[video1] != 1 {
-		t.Errorf("searches for video1 = %d, want 1", searchedPaths[video1])
-	}
-	if searchedPaths[video2] != 0 {
-		t.Errorf("searches for video2 = %d, want 0 (RunFile must not touch other files)", searchedPaths[video2])
+	if foundMarker.ContentHash != postStripHash {
+		t.Errorf("marker hash = %q, want post-strip hash %q", foundMarker.ContentHash, postStripHash)
 	}
 
-	// video2's sidecar should not exist since RunFile only touched video1.
-	video2Sidecar := filepath.Join(libDir, "Movie.Two.2021.HDTV.x264-GRP.en.srt")
-	if _, err := os.Stat(video2Sidecar); !os.IsNotExist(err) {
-		t.Errorf("video2 sidecar should not exist, stat err = %v", err)
+	file, found, err := st.GetFile(ctx, lib.Name, videoPath)
+	if err != nil {
+		t.Fatalf("getting file from store: %v", err)
+	}
+	if !found {
+		t.Fatal("file not found in store")
+	}
+	if file.ContentHash != string(postStripHash) {
+		t.Errorf("store content hash = %q, want post-strip hash %q", file.ContentHash, postStripHash)
+	}
+	if len(file.Languages) != 1 || file.Languages[0].Status != domain.StatusSynced {
+		t.Fatalf("file.Languages = %+v, want 1 entry with status synced", file.Languages)
+	}
+
+	// Simulate total state loss: a brand-new, empty state store.
+	freshStore := openTestStore(t)
+
+	fakeStripper.StripEmbeddedCalls = nil
+	fakeSyncEngine := &syncengine.FakeSyncEngine{}
+	p2 := &pipeline.Pipeline{
+		Store:      freshStore,
+		Provider:   fakeProvider,
+		SyncEngine: fakeSyncEngine,
+		Stripper:   fakeStripper,
+	}
+
+	if _, err := p2.Run(ctx, lib); err != nil {
+		t.Fatalf("run against fresh store: %v", err)
+	}
+	dispatchPending(t, ctx, p2, freshStore, lib)
+
+	file2, found, err := freshStore.GetFile(ctx, lib.Name, videoPath)
+	if err != nil {
+		t.Fatalf("getting file from fresh store: %v", err)
+	}
+	if !found || file2.Languages[0].Status != domain.StatusSynced {
+		t.Fatalf("expected Marker-gate hit to leave file Synced, got %+v", file2)
+	}
+	if len(fakeSyncEngine.Calls) != 0 {
+		t.Errorf("SyncEngine.Calls = %d, want 0 (should not reprocess)", len(fakeSyncEngine.Calls))
+	}
+	if len(fakeStripper.StripEmbeddedCalls) != 0 {
+		t.Errorf("StripEmbeddedCalls = %d, want 0 (should not reprocess)", len(fakeStripper.StripEmbeddedCalls))
 	}
 }
 
 // TestPipeline_LogsStatusChangeForRetrievalFailure guards the uniform
 // "status changed" log line for a Failed landing whose reason isn't
 // no_candidate: it must log at ERROR with from=in_progress, to=failed, and
-// reason=retrieval_failed, replacing the old "subtitle sync failed" line.
+// reason=retrieval_failed.
 func TestPipeline_LogsStatusChangeForRetrievalFailure(t *testing.T) {
 	libDir := t.TempDir()
-
 	videoName := "Test.Movie.2024.HDTV.x264-FAKEGROUP.mp4"
 	videoPath := filepath.Join(libDir, videoName)
+	writeVideoFixture(t, videoPath)
 
-	srcVideo := filepath.Join("..", "..", "testdata", "integration", "video", "sample.mp4")
-	videoContent, err := os.ReadFile(srcVideo)
-	if err != nil {
-		t.Fatalf("reading source video: %v", err)
-	}
-	if err := os.WriteFile(videoPath, videoContent, 0o644); err != nil {
-		t.Fatalf("writing video to library: %v", err)
-	}
-
-	dbPath := filepath.Join(t.TempDir(), "sublime.db")
-	st, err := store.Open(dbPath)
-	if err != nil {
-		t.Fatalf("opening store: %v", err)
-	}
-	defer func() { _ = st.Close() }()
-
+	st := openTestStore(t)
 	wantErr := errors.New("provider unavailable: connection refused")
 	fakeProvider := &provider.Fake{
 		SearchFunc: func(ctx context.Context, q provider.Query) ([]domain.Candidate, error) {
@@ -653,22 +807,18 @@ func TestPipeline_LogsStatusChangeForRetrievalFailure(t *testing.T) {
 
 	var logBuf bytes.Buffer
 	p := &pipeline.Pipeline{
-		Store:       st,
-		Provider:    fakeProvider,
-		SyncEngine:  &syncengine.FakeSyncEngine{},
-		Stripper:    &pipeline.FakeStripper{},
-		WorkerCount: 1,
-		Logger:      slog.New(slog.NewTextHandler(&logBuf, nil)),
+		Store:      st,
+		Provider:   fakeProvider,
+		SyncEngine: &syncengine.FakeSyncEngine{},
+		Stripper:   &pipeline.FakeStripper{},
+		Logger:     slog.New(slog.NewTextHandler(&logBuf, nil)),
 	}
 
 	ctx := context.Background()
-	result, err := p.Run(ctx, lib)
-	if err != nil {
+	if _, err := p.Run(ctx, lib); err != nil {
 		t.Fatalf("run: %v", err)
 	}
-	if result.Failed != 1 {
-		t.Fatalf("Failed = %d, want 1", result.Failed)
-	}
+	dispatchPending(t, ctx, p, st, lib)
 
 	logOutput := logBuf.String()
 	for _, want := range []string{
@@ -679,8 +829,13 @@ func TestPipeline_LogsStatusChangeForRetrievalFailure(t *testing.T) {
 			t.Errorf("log output = %q, want it to contain %q", logOutput, want)
 		}
 	}
-	if strings.Contains(logOutput, "subtitle sync failed") {
-		t.Errorf("log output unexpectedly contains the old outcome-specific line:%s", logOutput)
+
+	file, found, err := st.GetFile(ctx, lib.Name, videoPath)
+	if err != nil {
+		t.Fatalf("GetFile: %v", err)
+	}
+	if !found || file.Languages[0].Status != domain.StatusFailed || file.Languages[0].FailureReason != domain.FailureRetrievalFailed {
+		t.Errorf("expected Failed/retrieval_failed, got %+v", file.Languages)
 	}
 }
 
@@ -690,26 +845,11 @@ func TestPipeline_LogsStatusChangeForRetrievalFailure(t *testing.T) {
 // land at INFO with to=pending and no reason, not an ERROR Failed landing.
 func TestPipeline_QuotaExhaustedOnSearchResetsToPending(t *testing.T) {
 	libDir := t.TempDir()
-
 	videoName := "Test.Movie.2024.HDTV.x264-FAKEGROUP.mp4"
 	videoPath := filepath.Join(libDir, videoName)
+	writeVideoFixture(t, videoPath)
 
-	srcVideo := filepath.Join("..", "..", "testdata", "integration", "video", "sample.mp4")
-	videoContent, err := os.ReadFile(srcVideo)
-	if err != nil {
-		t.Fatalf("reading source video: %v", err)
-	}
-	if err := os.WriteFile(videoPath, videoContent, 0o644); err != nil {
-		t.Fatalf("writing video to library: %v", err)
-	}
-
-	dbPath := filepath.Join(t.TempDir(), "sublime.db")
-	st, err := store.Open(dbPath)
-	if err != nil {
-		t.Fatalf("opening store: %v", err)
-	}
-	defer func() { _ = st.Close() }()
-
+	st := openTestStore(t)
 	quotaErr := &provider.QuotaExhaustedError{ResumeAt: time.Now().Add(24 * time.Hour)}
 	fakeProvider := &provider.Fake{
 		SearchFunc: func(ctx context.Context, q provider.Query) ([]domain.Candidate, error) {
@@ -726,22 +866,18 @@ func TestPipeline_QuotaExhaustedOnSearchResetsToPending(t *testing.T) {
 
 	var logBuf bytes.Buffer
 	p := &pipeline.Pipeline{
-		Store:       st,
-		Provider:    fakeProvider,
-		SyncEngine:  &syncengine.FakeSyncEngine{},
-		Stripper:    &pipeline.FakeStripper{},
-		WorkerCount: 1,
-		Logger:      slog.New(slog.NewTextHandler(&logBuf, nil)),
+		Store:      st,
+		Provider:   fakeProvider,
+		SyncEngine: &syncengine.FakeSyncEngine{},
+		Stripper:   &pipeline.FakeStripper{},
+		Logger:     slog.New(slog.NewTextHandler(&logBuf, nil)),
 	}
 
 	ctx := context.Background()
-	result, err := p.Run(ctx, lib)
-	if err != nil {
+	if _, err := p.Run(ctx, lib); err != nil {
 		t.Fatalf("run: %v", err)
 	}
-	if result.Failed != 0 {
-		t.Fatalf("Failed = %d, want 0; errors: %v", result.Failed, result.Errors)
-	}
+	dispatchPending(t, ctx, p, st, lib)
 
 	file, ok, err := st.GetFile(ctx, "test-library", videoPath)
 	if err != nil {
@@ -782,26 +918,11 @@ func TestPipeline_QuotaExhaustedOnSearchResetsToPending(t *testing.T) {
 // Search.
 func TestPipeline_QuotaExhaustedOnDownloadResetsToPending(t *testing.T) {
 	libDir := t.TempDir()
-
 	videoName := "Test.Movie.2024.HDTV.x264-FAKEGROUP.mp4"
 	videoPath := filepath.Join(libDir, videoName)
+	writeVideoFixture(t, videoPath)
 
-	srcVideo := filepath.Join("..", "..", "testdata", "integration", "video", "sample.mp4")
-	videoContent, err := os.ReadFile(srcVideo)
-	if err != nil {
-		t.Fatalf("reading source video: %v", err)
-	}
-	if err := os.WriteFile(videoPath, videoContent, 0o644); err != nil {
-		t.Fatalf("writing video to library: %v", err)
-	}
-
-	dbPath := filepath.Join(t.TempDir(), "sublime.db")
-	st, err := store.Open(dbPath)
-	if err != nil {
-		t.Fatalf("opening store: %v", err)
-	}
-	defer func() { _ = st.Close() }()
-
+	st := openTestStore(t)
 	quotaErr := &provider.QuotaExhaustedError{ResumeAt: time.Now().Add(24 * time.Hour)}
 	fakeProvider := &provider.Fake{
 		SearchFunc: func(ctx context.Context, q provider.Query) ([]domain.Candidate, error) {
@@ -821,22 +942,18 @@ func TestPipeline_QuotaExhaustedOnDownloadResetsToPending(t *testing.T) {
 
 	var logBuf bytes.Buffer
 	p := &pipeline.Pipeline{
-		Store:       st,
-		Provider:    fakeProvider,
-		SyncEngine:  &syncengine.FakeSyncEngine{},
-		Stripper:    &pipeline.FakeStripper{},
-		WorkerCount: 1,
-		Logger:      slog.New(slog.NewTextHandler(&logBuf, nil)),
+		Store:      st,
+		Provider:   fakeProvider,
+		SyncEngine: &syncengine.FakeSyncEngine{},
+		Stripper:   &pipeline.FakeStripper{},
+		Logger:     slog.New(slog.NewTextHandler(&logBuf, nil)),
 	}
 
 	ctx := context.Background()
-	result, err := p.Run(ctx, lib)
-	if err != nil {
+	if _, err := p.Run(ctx, lib); err != nil {
 		t.Fatalf("run: %v", err)
 	}
-	if result.Failed != 0 {
-		t.Fatalf("Failed = %d, want 0; errors: %v", result.Failed, result.Errors)
-	}
+	dispatchPending(t, ctx, p, st, lib)
 
 	file, ok, err := st.GetFile(ctx, "test-library", videoPath)
 	if err != nil {
@@ -845,11 +962,8 @@ func TestPipeline_QuotaExhaustedOnDownloadResetsToPending(t *testing.T) {
 	if !ok {
 		t.Fatal("expected GetFile to find the file")
 	}
-	if len(file.Languages) != 1 {
-		t.Fatalf("expected exactly 1 language row, got %d: %+v", len(file.Languages), file.Languages)
-	}
-	if file.Languages[0].Status != domain.StatusPending {
-		t.Errorf("expected language status %q, got %q", domain.StatusPending, file.Languages[0].Status)
+	if len(file.Languages) != 1 || file.Languages[0].Status != domain.StatusPending {
+		t.Errorf("expected single Pending language row, got %+v", file.Languages)
 	}
 	if file.Languages[0].FailureReason != domain.FailureNone {
 		t.Errorf("expected no failure reason, got %q", file.Languages[0].FailureReason)
@@ -861,109 +975,17 @@ func TestPipeline_QuotaExhaustedOnDownloadResetsToPending(t *testing.T) {
 	}
 }
 
-// TestPipeline_QuotaExhaustedAcrossMultipleFilesAllStayPending guards that
-// several (file, language) pairs processed while the Provider keeps
-// returning QuotaExhaustedError all land Pending, not Failed — the
-// per-pair reset must not leak state across files.
-func TestPipeline_QuotaExhaustedAcrossMultipleFilesAllStayPending(t *testing.T) {
-	libDir := t.TempDir()
-
-	srcVideo := filepath.Join("..", "..", "testdata", "integration", "video", "sample.mp4")
-	videoContent, err := os.ReadFile(srcVideo)
-	if err != nil {
-		t.Fatalf("reading source video: %v", err)
-	}
-
-	videoNames := []string{
-		"Movie.One.2024.HDTV.x264-FAKEGROUP.mp4",
-		"Movie.Two.2024.HDTV.x264-FAKEGROUP.mp4",
-		"Movie.Three.2024.HDTV.x264-FAKEGROUP.mp4",
-	}
-	for _, name := range videoNames {
-		if err := os.WriteFile(filepath.Join(libDir, name), videoContent, 0o644); err != nil {
-			t.Fatalf("writing video %q to library: %v", name, err)
-		}
-	}
-
-	dbPath := filepath.Join(t.TempDir(), "sublime.db")
-	st, err := store.Open(dbPath)
-	if err != nil {
-		t.Fatalf("opening store: %v", err)
-	}
-	defer func() { _ = st.Close() }()
-
-	quotaErr := &provider.QuotaExhaustedError{ResumeAt: time.Now().Add(24 * time.Hour)}
-	fakeProvider := &provider.Fake{
-		SearchFunc: func(ctx context.Context, q provider.Query) ([]domain.Candidate, error) {
-			return nil, quotaErr
-		},
-	}
-
-	lib := domain.Library{
-		Name:       "test-library",
-		Path:       libDir,
-		Languages:  []language.Tag{language.English},
-		StripScope: domain.StripScopeAll,
-	}
-
-	p := &pipeline.Pipeline{
-		Store:       st,
-		Provider:    fakeProvider,
-		SyncEngine:  &syncengine.FakeSyncEngine{},
-		Stripper:    &pipeline.FakeStripper{},
-		WorkerCount: 1,
-	}
-
-	ctx := context.Background()
-	result, err := p.Run(ctx, lib)
-	if err != nil {
-		t.Fatalf("run: %v", err)
-	}
-	if result.Failed != 0 {
-		t.Fatalf("Failed = %d, want 0; errors: %v", result.Failed, result.Errors)
-	}
-
-	for _, name := range videoNames {
-		file, ok, err := st.GetFile(ctx, "test-library", filepath.Join(libDir, name))
-		if err != nil {
-			t.Fatalf("GetFile(%q) returned error: %v", name, err)
-		}
-		if !ok {
-			t.Fatalf("expected GetFile(%q) to find the file", name)
-		}
-		if len(file.Languages) != 1 || file.Languages[0].Status != domain.StatusPending {
-			t.Errorf("%q: expected single Pending language row, got %+v", name, file.Languages)
-		}
-	}
-}
-
 // TestPipeline_LogsStatusChangeForNoCandidate guards the uniform "status
 // changed" log line for a Failed landing whose reason is no_candidate: it
 // must log at WARN (not ERROR) with from=in_progress, to=failed, and
-// reason=no_candidate, replacing the old "no candidate cleared the scoring
-// cutoff" line.
+// reason=no_candidate.
 func TestPipeline_LogsStatusChangeForNoCandidate(t *testing.T) {
 	libDir := t.TempDir()
-
 	videoName := "Test.Movie.2024.HDTV.x264-FAKEGROUP.mp4"
 	videoPath := filepath.Join(libDir, videoName)
+	writeVideoFixture(t, videoPath)
 
-	srcVideo := filepath.Join("..", "..", "testdata", "integration", "video", "sample.mp4")
-	videoContent, err := os.ReadFile(srcVideo)
-	if err != nil {
-		t.Fatalf("reading source video: %v", err)
-	}
-	if err := os.WriteFile(videoPath, videoContent, 0o644); err != nil {
-		t.Fatalf("writing video to library: %v", err)
-	}
-
-	dbPath := filepath.Join(t.TempDir(), "sublime.db")
-	st, err := store.Open(dbPath)
-	if err != nil {
-		t.Fatalf("opening store: %v", err)
-	}
-	defer func() { _ = st.Close() }()
-
+	st := openTestStore(t)
 	fakeProvider := &provider.Fake{
 		SearchFunc: func(ctx context.Context, q provider.Query) ([]domain.Candidate, error) {
 			return []domain.Candidate{{ID: "wrong-candidate", Title: "Wrong Title", Year: 1999}}, nil
@@ -979,22 +1001,18 @@ func TestPipeline_LogsStatusChangeForNoCandidate(t *testing.T) {
 
 	var logBuf bytes.Buffer
 	p := &pipeline.Pipeline{
-		Store:       st,
-		Provider:    fakeProvider,
-		SyncEngine:  &syncengine.FakeSyncEngine{},
-		Stripper:    &pipeline.FakeStripper{},
-		WorkerCount: 1,
-		Logger:      slog.New(slog.NewTextHandler(&logBuf, nil)),
+		Store:      st,
+		Provider:   fakeProvider,
+		SyncEngine: &syncengine.FakeSyncEngine{},
+		Stripper:   &pipeline.FakeStripper{},
+		Logger:     slog.New(slog.NewTextHandler(&logBuf, nil)),
 	}
 
 	ctx := context.Background()
-	result, err := p.Run(ctx, lib)
-	if err != nil {
+	if _, err := p.Run(ctx, lib); err != nil {
 		t.Fatalf("run: %v", err)
 	}
-	if result.NoCandidate != 1 {
-		t.Fatalf("NoCandidate = %d, want 1", result.NoCandidate)
-	}
+	dispatchPending(t, ctx, p, st, lib)
 
 	logOutput := logBuf.String()
 	for _, want := range []string{
@@ -1005,38 +1023,28 @@ func TestPipeline_LogsStatusChangeForNoCandidate(t *testing.T) {
 			t.Errorf("log output = %q, want it to contain %q", logOutput, want)
 		}
 	}
-	if strings.Contains(logOutput, "no candidate cleared the scoring cutoff") {
-		t.Errorf("log output unexpectedly contains the old outcome-specific line:%s", logOutput)
+
+	file, found, err := st.GetFile(ctx, lib.Name, videoPath)
+	if err != nil {
+		t.Fatalf("GetFile: %v", err)
+	}
+	if !found || file.Languages[0].Status != domain.StatusFailed || file.Languages[0].FailureReason != domain.FailureNoCandidate {
+		t.Errorf("expected Failed/no_candidate, got %+v", file.Languages)
 	}
 }
 
 // TestPipeline_TransitionsPendingToInProgressToSynced guards the state
-// machine's normal path: a worker dequeuing a (file, language) job
-// transitions it to In Progress before its Marker gate check, then to
-// Synced on success — each transition emitting exactly one uniform
-// "status changed" log line at INFO.
+// machine's normal path: dispatching a (file, language) pair transitions
+// it to In Progress before its Marker gate check, then to Synced on
+// success — each transition emitting exactly one uniform "status changed"
+// log line at INFO.
 func TestPipeline_TransitionsPendingToInProgressToSynced(t *testing.T) {
 	libDir := t.TempDir()
-
 	videoName := "Test.Movie.2024.HDTV.x264-FAKEGROUP.mp4"
 	videoPath := filepath.Join(libDir, videoName)
+	writeVideoFixture(t, videoPath)
 
-	srcVideo := filepath.Join("..", "..", "testdata", "integration", "video", "sample.mp4")
-	videoContent, err := os.ReadFile(srcVideo)
-	if err != nil {
-		t.Fatalf("reading source video: %v", err)
-	}
-	if err := os.WriteFile(videoPath, videoContent, 0o644); err != nil {
-		t.Fatalf("writing video to library: %v", err)
-	}
-
-	dbPath := filepath.Join(t.TempDir(), "sublime.db")
-	st, err := store.Open(dbPath)
-	if err != nil {
-		t.Fatalf("opening store: %v", err)
-	}
-	defer func() { _ = st.Close() }()
-
+	st := openTestStore(t)
 	candidateContent := "1\n00:00:00,500 --> 00:00:01,900\nOne two three\n"
 	fakeProvider := &provider.Fake{
 		SearchFunc: func(ctx context.Context, q provider.Query) ([]domain.Candidate, error) {
@@ -1056,22 +1064,18 @@ func TestPipeline_TransitionsPendingToInProgressToSynced(t *testing.T) {
 
 	var logBuf bytes.Buffer
 	p := &pipeline.Pipeline{
-		Store:       st,
-		Provider:    fakeProvider,
-		SyncEngine:  &syncengine.FakeSyncEngine{},
-		Stripper:    &pipeline.FakeStripper{},
-		WorkerCount: 1,
-		Logger:      slog.New(slog.NewTextHandler(&logBuf, nil)),
+		Store:      st,
+		Provider:   fakeProvider,
+		SyncEngine: &syncengine.FakeSyncEngine{},
+		Stripper:   &pipeline.FakeStripper{},
+		Logger:     slog.New(slog.NewTextHandler(&logBuf, nil)),
 	}
 
 	ctx := context.Background()
-	result, err := p.Run(ctx, lib)
-	if err != nil {
+	if _, err := p.Run(ctx, lib); err != nil {
 		t.Fatalf("run: %v", err)
 	}
-	if result.Synced != 1 {
-		t.Fatalf("Synced = %d, want 1; errors: %v", result.Synced, result.Errors)
-	}
+	dispatchPending(t, ctx, p, st, lib)
 
 	logOutput := logBuf.String()
 	for _, want := range []string{
@@ -1101,817 +1105,4 @@ func TestPipeline_TransitionsPendingToInProgressToSynced(t *testing.T) {
 	if len(file.Languages) != 1 || file.Languages[0].Status != domain.StatusSynced {
 		t.Fatalf("file.Languages = %+v, want 1 entry with status synced", file.Languages)
 	}
-}
-
-// TestPipeline_MarkerGateFastPathSkipsInProgress guards the Marker-gate-hit
-// fast path: when a valid Marker already exists (no Provider work needed),
-// the (file, language) pair must transition directly from Pending to
-// Synced, never touching In Progress — not even transiently.
-func TestPipeline_MarkerGateFastPathSkipsInProgress(t *testing.T) {
-	libDir := t.TempDir()
-
-	videoName := "Test.Movie.2024.HDTV.x264-FAKEGROUP.mp4"
-	videoPath := filepath.Join(libDir, videoName)
-	if err := os.WriteFile(videoPath, []byte("original video bytes"), 0o644); err != nil {
-		t.Fatalf("writing video to library: %v", err)
-	}
-
-	dbPath := filepath.Join(t.TempDir(), "sublime.db")
-	st, err := store.Open(dbPath)
-	if err != nil {
-		t.Fatalf("opening store: %v", err)
-	}
-	defer func() { _ = st.Close() }()
-
-	candidateContent := "1\n00:00:00,500 --> 00:00:01,900\nOne two three\n"
-	fakeProvider := &provider.Fake{
-		SearchFunc: func(ctx context.Context, q provider.Query) ([]domain.Candidate, error) {
-			return []domain.Candidate{{ID: "test-candidate", Title: "Test Movie", Year: 2024}}, nil
-		},
-		DownloadFunc: func(ctx context.Context, c domain.Candidate) ([]byte, error) {
-			return []byte(candidateContent), nil
-		},
-	}
-
-	lib := domain.Library{
-		Name:       "test-library",
-		Path:       libDir,
-		Languages:  []language.Tag{language.English},
-		StripScope: domain.StripScopeAll,
-	}
-
-	p := &pipeline.Pipeline{
-		Store:       st,
-		Provider:    fakeProvider,
-		SyncEngine:  &syncengine.FakeSyncEngine{},
-		Stripper:    &pipeline.FakeStripper{},
-		WorkerCount: 1,
-	}
-
-	ctx := context.Background()
-	result, err := p.Run(ctx, lib)
-	if err != nil {
-		t.Fatalf("first run: %v", err)
-	}
-	if result.Synced != 1 {
-		t.Fatalf("first run Synced = %d, want 1; errors: %v", result.Synced, result.Errors)
-	}
-
-	// Simulate total state loss: a brand-new, empty state store. The video
-	// and its Marker-bearing sidecar are untouched on disk, so the Marker
-	// gate alone must recognize it as already synced.
-	freshDBPath := filepath.Join(t.TempDir(), "fresh.db")
-	freshStore, err := store.Open(freshDBPath)
-	if err != nil {
-		t.Fatalf("opening fresh store: %v", err)
-	}
-	defer func() { _ = freshStore.Close() }()
-
-	var logBuf bytes.Buffer
-	p2 := &pipeline.Pipeline{
-		Store:       freshStore,
-		Provider:    fakeProvider,
-		SyncEngine:  &syncengine.FakeSyncEngine{},
-		Stripper:    &pipeline.FakeStripper{},
-		WorkerCount: 1,
-		Logger:      slog.New(slog.NewTextHandler(&logBuf, nil)),
-	}
-
-	result2, err := p2.Run(ctx, lib)
-	if err != nil {
-		t.Fatalf("second run: %v", err)
-	}
-	if result2.Skipped != 1 {
-		t.Fatalf("Skipped = %d, want 1 (Marker recognized despite total state loss)", result2.Skipped)
-	}
-
-	logOutput := logBuf.String()
-	for _, want := range []string{`msg="status changed"`, "from=pending", "to=synced"} {
-		if !strings.Contains(logOutput, want) {
-			t.Errorf("log output = %q, want it to contain %q", logOutput, want)
-		}
-	}
-	if got := strings.Count(logOutput, `msg="status changed"`); got != 1 {
-		t.Errorf(`"status changed" count = %d, want exactly 1 (Pending->Synced fast path only):%s`, got, logOutput)
-	}
-	if strings.Contains(logOutput, "in_progress") {
-		t.Errorf("log output unexpectedly mentions in_progress for the marker-gate fast path:%s", logOutput)
-	}
-
-	file, found, err := freshStore.GetFile(ctx, lib.Name, videoPath)
-	if err != nil {
-		t.Fatalf("getting file from store: %v", err)
-	}
-	if !found {
-		t.Fatal("file not found in store")
-	}
-	if len(file.Languages) != 1 || file.Languages[0].Status != domain.StatusSynced {
-		t.Fatalf("file.Languages = %+v, want 1 entry with status synced", file.Languages)
-	}
-}
-
-// TestPipeline_ContentHashReflectsPostStripState guards the Content Hash /
-// Strip-ordering fix: when Strip's embedded-stream removal actually
-// mutates the video, the Marker and store must bind to the file's settled
-// post-Strip hash, not the pre-Strip hash captured at the top of the
-// per-file step. It uses FakeStripper (no real ffmpeg/ffprobe) configured
-// to simulate a removed stream by mutating the video's bytes.
-func TestPipeline_ContentHashReflectsPostStripState(t *testing.T) {
-	libDir := t.TempDir()
-
-	videoName := "Test.Movie.2024.HDTV.x264-FAKEGROUP.mp4"
-	videoPath := filepath.Join(libDir, videoName)
-	if err := os.WriteFile(videoPath, []byte("original video bytes"), 0o644); err != nil {
-		t.Fatalf("writing video to library: %v", err)
-	}
-
-	dbPath := filepath.Join(t.TempDir(), "sublime.db")
-	st, err := store.Open(dbPath)
-	if err != nil {
-		t.Fatalf("opening store: %v", err)
-	}
-	defer func() { _ = st.Close() }()
-
-	candidateContent := "1\n00:00:00,500 --> 00:00:01,900\nOne two three\n"
-	fakeProvider := &provider.Fake{
-		SearchFunc: func(ctx context.Context, q provider.Query) ([]domain.Candidate, error) {
-			return []domain.Candidate{{ID: "test-candidate", Title: "Test Movie", Year: 2024}}, nil
-		},
-		DownloadFunc: func(ctx context.Context, c domain.Candidate) ([]byte, error) {
-			return []byte(candidateContent), nil
-		},
-	}
-
-	lib := domain.Library{
-		Name:       "test-library",
-		Path:       libDir,
-		Languages:  []language.Tag{language.English},
-		StripScope: domain.StripScopeAll,
-	}
-
-	// Simulate a Strip pass that finds and removes an embedded stream,
-	// mutating the video's on-disk bytes the way a real ffmpeg remux would.
-	fakeStripper := &pipeline.FakeStripper{StripEmbeddedIndices: []int{2}}
-
-	p := &pipeline.Pipeline{
-		Store:       st,
-		Provider:    fakeProvider,
-		SyncEngine:  &syncengine.FakeSyncEngine{},
-		Stripper:    fakeStripper,
-		WorkerCount: 1,
-	}
-
-	ctx := context.Background()
-	result, err := p.Run(ctx, lib)
-	if err != nil {
-		t.Fatalf("first run: %v", err)
-	}
-	if result.Synced != 1 {
-		t.Fatalf("Synced = %d, want 1; errors: %v", result.Synced, result.Errors)
-	}
-	if len(fakeStripper.StripEmbeddedCalls) != 1 {
-		t.Fatalf("StripEmbeddedCalls = %d, want 1", len(fakeStripper.StripEmbeddedCalls))
-	}
-
-	// The video's Content Hash after the (simulated) Strip mutation.
-	postStripHash, err := media.ComputeContentHash(videoPath)
-	if err != nil {
-		t.Fatalf("computing post-strip video hash: %v", err)
-	}
-
-	sidecarPath := filepath.Join(libDir, "Test.Movie.2024.HDTV.x264-FAKEGROUP.en.srt")
-	sidecarContent, err := os.ReadFile(sidecarPath)
-	if err != nil {
-		t.Fatalf("reading sidecar: %v", err)
-	}
-	codec, _ := marker.CodecFor(".srt")
-	foundMarker, presence := codec.Read(sidecarContent)
-	if presence != marker.Present {
-		t.Fatalf("marker presence = %v, want Present", presence)
-	}
-	if foundMarker.ContentHash != postStripHash {
-		t.Errorf("marker hash = %q, want post-strip hash %q", foundMarker.ContentHash, postStripHash)
-	}
-
-	file, found, err := st.GetFile(ctx, lib.Name, videoPath)
-	if err != nil {
-		t.Fatalf("getting file from store: %v", err)
-	}
-	if !found {
-		t.Fatal("file not found in store")
-	}
-	if file.ContentHash != string(postStripHash) {
-		t.Errorf("store content hash = %q, want post-strip hash %q", file.ContentHash, postStripHash)
-	}
-	if len(file.Languages) != 1 || file.Languages[0].Status != domain.StatusSynced {
-		t.Fatalf("file.Languages = %+v, want 1 entry with status synced", file.Languages)
-	}
-
-	// Simulate total state loss: a brand-new, empty state store.
-	freshDBPath := filepath.Join(t.TempDir(), "fresh.db")
-	freshStore, err := store.Open(freshDBPath)
-	if err != nil {
-		t.Fatalf("opening fresh store: %v", err)
-	}
-	defer func() { _ = freshStore.Close() }()
-
-	fakeStripper.StripEmbeddedCalls = nil
-	fakeSyncEngine := &syncengine.FakeSyncEngine{}
-	p2 := &pipeline.Pipeline{
-		Store:       freshStore,
-		Provider:    fakeProvider,
-		SyncEngine:  fakeSyncEngine,
-		Stripper:    fakeStripper,
-		WorkerCount: 1,
-	}
-
-	result2, err := p2.Run(ctx, lib)
-	if err != nil {
-		t.Fatalf("run against fresh store: %v", err)
-	}
-	if result2.Skipped != 1 {
-		t.Errorf("Skipped = %d, want 1 (Marker recognized despite total state loss)", result2.Skipped)
-	}
-	if result2.Synced != 0 {
-		t.Errorf("Synced = %d, want 0 (should not reprocess)", result2.Synced)
-	}
-	if len(fakeSyncEngine.Calls) != 0 {
-		t.Errorf("SyncEngine.Calls = %d, want 0 (should not reprocess)", len(fakeSyncEngine.Calls))
-	}
-	if len(fakeStripper.StripEmbeddedCalls) != 0 {
-		t.Errorf("StripEmbeddedCalls = %d, want 0 (should not reprocess)", len(fakeStripper.StripEmbeddedCalls))
-	}
-}
-
-// TestPipeline_LogsFileFoundOncePerFileNotPerLanguage guards the
-// Found/Changed classification's per-file (not per-language) logging
-// contract: a brand-new file with multiple configured languages must
-// produce exactly one "file found" line, not one per (file, language) pair.
-func TestPipeline_LogsFileFoundOncePerFileNotPerLanguage(t *testing.T) {
-	libDir := t.TempDir()
-
-	videoName := "Test.Movie.2024.HDTV.x264-FAKEGROUP.mp4"
-	videoPath := filepath.Join(libDir, videoName)
-
-	srcVideo := filepath.Join("..", "..", "testdata", "integration", "video", "sample.mp4")
-	videoContent, err := os.ReadFile(srcVideo)
-	if err != nil {
-		t.Fatalf("reading source video: %v", err)
-	}
-	if err := os.WriteFile(videoPath, videoContent, 0o644); err != nil {
-		t.Fatalf("writing video to library: %v", err)
-	}
-
-	dbPath := filepath.Join(t.TempDir(), "sublime.db")
-	st, err := store.Open(dbPath)
-	if err != nil {
-		t.Fatalf("opening store: %v", err)
-	}
-	defer func() { _ = st.Close() }()
-
-	candidateContent := "1\n00:00:00,500 --> 00:00:01,900\nOne two three\n"
-	fakeProvider := &provider.Fake{
-		SearchFunc: func(ctx context.Context, q provider.Query) ([]domain.Candidate, error) {
-			return []domain.Candidate{{ID: "candidate", Title: "Test Movie", Year: 2024}}, nil
-		},
-		DownloadFunc: func(ctx context.Context, c domain.Candidate) ([]byte, error) {
-			return []byte(candidateContent), nil
-		},
-	}
-
-	lib := domain.Library{
-		Name:       "test-library",
-		Path:       libDir,
-		Languages:  []language.Tag{language.English, language.Spanish},
-		StripScope: domain.StripScopeAll,
-	}
-
-	var logBuf bytes.Buffer
-	p := &pipeline.Pipeline{
-		Store:       st,
-		Provider:    fakeProvider,
-		SyncEngine:  &syncengine.FakeSyncEngine{},
-		Stripper:    &pipeline.FakeStripper{},
-		WorkerCount: 2,
-		Logger:      slog.New(slog.NewTextHandler(&logBuf, nil)),
-	}
-
-	ctx := context.Background()
-	if _, err := p.Run(ctx, lib); err != nil {
-		t.Fatalf("run: %v", err)
-	}
-
-	logOutput := logBuf.String()
-	if got := strings.Count(logOutput, "file found"); got != 1 {
-		t.Errorf(`"file found" count = %d, want 1; log output:\n%s`, got, logOutput)
-	}
-	if strings.Contains(logOutput, "file changed") {
-		t.Errorf("log output unexpectedly contains \"file changed\" for a brand-new file:\n%s", logOutput)
-	}
-}
-
-// TestPipeline_ChangedFileLogsFileChangedAndResetsToPending guards the
-// Changed half of the classification for the bulk-scan entrypoint: an
-// already-tracked file whose Content Hash differs from its last-recorded
-// value must log "file changed" (not another "file found") and reset its
-// language state back to Pending in place.
-func TestPipeline_ChangedFileLogsFileChangedAndResetsToPending(t *testing.T) {
-	libDir := t.TempDir()
-
-	videoName := "Test.Movie.2024.HDTV.x264-FAKEGROUP.mp4"
-	videoPath := filepath.Join(libDir, videoName)
-
-	srcVideo := filepath.Join("..", "..", "testdata", "integration", "video", "sample.mp4")
-	videoContent, err := os.ReadFile(srcVideo)
-	if err != nil {
-		t.Fatalf("reading source video: %v", err)
-	}
-	if err := os.WriteFile(videoPath, videoContent, 0o644); err != nil {
-		t.Fatalf("writing video to library: %v", err)
-	}
-
-	dbPath := filepath.Join(t.TempDir(), "sublime.db")
-	st, err := store.Open(dbPath)
-	if err != nil {
-		t.Fatalf("opening store: %v", err)
-	}
-	defer func() { _ = st.Close() }()
-
-	candidateContent := "1\n00:00:00,500 --> 00:00:01,900\nOne two three\n"
-	fakeProvider := &provider.Fake{
-		SearchFunc: func(ctx context.Context, q provider.Query) ([]domain.Candidate, error) {
-			return []domain.Candidate{{ID: "candidate", Title: "Test Movie", Year: 2024}}, nil
-		},
-		DownloadFunc: func(ctx context.Context, c domain.Candidate) ([]byte, error) {
-			return []byte(candidateContent), nil
-		},
-	}
-
-	lib := domain.Library{
-		Name:       "test-library",
-		Path:       libDir,
-		Languages:  []language.Tag{language.English},
-		StripScope: domain.StripScopeAll,
-	}
-
-	var logBuf bytes.Buffer
-	p := &pipeline.Pipeline{
-		Store:       st,
-		Provider:    fakeProvider,
-		SyncEngine:  &syncengine.FakeSyncEngine{},
-		Stripper:    &pipeline.FakeStripper{},
-		WorkerCount: 1,
-		Logger:      slog.New(slog.NewTextHandler(&logBuf, nil)),
-	}
-
-	ctx := context.Background()
-	if _, err := p.Run(ctx, lib); err != nil {
-		t.Fatalf("first run: %v", err)
-	}
-
-	// An external edit: mutate the video's bytes so its Content Hash
-	// changes, without going through Sublime's own Strip pass.
-	if err := os.WriteFile(videoPath, append(videoContent, []byte("mutated")...), 0o644); err != nil {
-		t.Fatalf("mutating video: %v", err)
-	}
-	// Remove the sidecar written by the first run so the marker gate
-	// doesn't short-circuit the second run before we can observe the
-	// Pending reset play out into a fresh sync.
-	sidecarPath := filepath.Join(libDir, "Test.Movie.2024.HDTV.x264-FAKEGROUP.en.srt")
-	if err := os.Remove(sidecarPath); err != nil {
-		t.Fatalf("removing sidecar: %v", err)
-	}
-
-	logBuf.Reset()
-	result2, err := p.Run(ctx, lib)
-	if err != nil {
-		t.Fatalf("second run: %v", err)
-	}
-
-	logOutput := logBuf.String()
-	if !strings.Contains(logOutput, "file changed") {
-		t.Errorf(`log output missing "file changed":%s`, logOutput)
-	}
-	if strings.Contains(logOutput, "file found") {
-		t.Errorf(`log output unexpectedly contains "file found" for an already-tracked file:%s`, logOutput)
-	}
-
-	if result2.Synced != 1 {
-		t.Errorf("second run Synced = %d, want 1 (reset to Pending then resynced); errors: %v", result2.Synced, result2.Errors)
-	}
-
-	file, found, err := st.GetFile(ctx, lib.Name, videoPath)
-	if err != nil {
-		t.Fatalf("getting file from store: %v", err)
-	}
-	if !found {
-		t.Fatal("file not found in store")
-	}
-	if len(file.Languages) != 1 || file.Languages[0].Status != domain.StatusSynced {
-		t.Fatalf("file.Languages = %+v, want 1 entry with status synced", file.Languages)
-	}
-}
-
-// TestPipeline_RunFileAppliesSameFoundVsChangedClassificationAsRun guards
-// the single-file entrypoint (fsnotify watch events, manual reprocessing)
-// applying the identical Found-vs-Changed distinction as the bulk scan.
-func TestPipeline_RunFileAppliesSameFoundVsChangedClassificationAsRun(t *testing.T) {
-	libDir := t.TempDir()
-
-	videoName := "Test.Movie.2024.HDTV.x264-FAKEGROUP.mp4"
-	videoPath := filepath.Join(libDir, videoName)
-
-	srcVideo := filepath.Join("..", "..", "testdata", "integration", "video", "sample.mp4")
-	videoContent, err := os.ReadFile(srcVideo)
-	if err != nil {
-		t.Fatalf("reading source video: %v", err)
-	}
-	if err := os.WriteFile(videoPath, videoContent, 0o644); err != nil {
-		t.Fatalf("writing video to library: %v", err)
-	}
-
-	dbPath := filepath.Join(t.TempDir(), "sublime.db")
-	st, err := store.Open(dbPath)
-	if err != nil {
-		t.Fatalf("opening store: %v", err)
-	}
-	defer func() { _ = st.Close() }()
-
-	candidateContent := "1\n00:00:00,500 --> 00:00:01,900\nOne two three\n"
-	fakeProvider := &provider.Fake{
-		SearchFunc: func(ctx context.Context, q provider.Query) ([]domain.Candidate, error) {
-			return []domain.Candidate{{ID: "candidate", Title: "Test Movie", Year: 2024}}, nil
-		},
-		DownloadFunc: func(ctx context.Context, c domain.Candidate) ([]byte, error) {
-			return []byte(candidateContent), nil
-		},
-	}
-
-	lib := domain.Library{
-		Name:       "test-library",
-		Path:       libDir,
-		Languages:  []language.Tag{language.English},
-		StripScope: domain.StripScopeAll,
-	}
-
-	var logBuf bytes.Buffer
-	p := &pipeline.Pipeline{
-		Store:       st,
-		Provider:    fakeProvider,
-		SyncEngine:  &syncengine.FakeSyncEngine{},
-		Stripper:    &pipeline.FakeStripper{},
-		WorkerCount: 1,
-		Logger:      slog.New(slog.NewTextHandler(&logBuf, nil)),
-	}
-
-	ctx := context.Background()
-
-	// A brand-new file, seen via the single-file entrypoint, logs "file
-	// found".
-	if _, err := p.RunFile(ctx, lib, videoPath); err != nil {
-		t.Fatalf("first RunFile: %v", err)
-	}
-	if got := strings.Count(logBuf.String(), "file found"); got != 1 {
-		t.Errorf(`"file found" count = %d, want 1; log output:%s`, got, logBuf.String())
-	}
-
-	// An external edit changes the Content Hash; the sidecar is removed so
-	// the marker gate doesn't short-circuit before the resync.
-	if err := os.WriteFile(videoPath, append(videoContent, []byte("mutated")...), 0o644); err != nil {
-		t.Fatalf("mutating video: %v", err)
-	}
-	sidecarPath := filepath.Join(libDir, "Test.Movie.2024.HDTV.x264-FAKEGROUP.en.srt")
-	if err := os.Remove(sidecarPath); err != nil {
-		t.Fatalf("removing sidecar: %v", err)
-	}
-
-	logBuf.Reset()
-	if _, err := p.RunFile(ctx, lib, videoPath); err != nil {
-		t.Fatalf("second RunFile: %v", err)
-	}
-
-	logOutput := logBuf.String()
-	if !strings.Contains(logOutput, "file changed") {
-		t.Errorf(`log output missing "file changed":%s`, logOutput)
-	}
-	if strings.Contains(logOutput, "file found") {
-		t.Errorf(`log output unexpectedly contains "file found" for an already-tracked file:%s`, logOutput)
-	}
-}
-
-// TestPipeline_ForceReprocessLogsFileChangedNotFileFound guards a manual
-// reprocess request (pipeline.WithForce) against an already-tracked file
-// whose Content Hash hasn't changed: it must still log "file changed", not
-// "file found", since the file was already known to Sublime.
-func TestPipeline_ForceReprocessLogsFileChangedNotFileFound(t *testing.T) {
-	libDir := t.TempDir()
-
-	videoName := "Test.Movie.2024.HDTV.x264-FAKEGROUP.mp4"
-	videoPath := filepath.Join(libDir, videoName)
-
-	srcVideo := filepath.Join("..", "..", "testdata", "integration", "video", "sample.mp4")
-	videoContent, err := os.ReadFile(srcVideo)
-	if err != nil {
-		t.Fatalf("reading source video: %v", err)
-	}
-	if err := os.WriteFile(videoPath, videoContent, 0o644); err != nil {
-		t.Fatalf("writing video to library: %v", err)
-	}
-
-	dbPath := filepath.Join(t.TempDir(), "sublime.db")
-	st, err := store.Open(dbPath)
-	if err != nil {
-		t.Fatalf("opening store: %v", err)
-	}
-	defer func() { _ = st.Close() }()
-
-	candidateContent := "1\n00:00:00,500 --> 00:00:01,900\nOne two three\n"
-	fakeProvider := &provider.Fake{
-		SearchFunc: func(ctx context.Context, q provider.Query) ([]domain.Candidate, error) {
-			return []domain.Candidate{{ID: "candidate", Title: "Test Movie", Year: 2024}}, nil
-		},
-		DownloadFunc: func(ctx context.Context, c domain.Candidate) ([]byte, error) {
-			return []byte(candidateContent), nil
-		},
-	}
-
-	lib := domain.Library{
-		Name:       "test-library",
-		Path:       libDir,
-		Languages:  []language.Tag{language.English},
-		StripScope: domain.StripScopeAll,
-	}
-
-	var logBuf bytes.Buffer
-	p := &pipeline.Pipeline{
-		Store:       st,
-		Provider:    fakeProvider,
-		SyncEngine:  &syncengine.FakeSyncEngine{},
-		Stripper:    &pipeline.FakeStripper{},
-		WorkerCount: 1,
-		Logger:      slog.New(slog.NewTextHandler(&logBuf, nil)),
-	}
-
-	ctx := context.Background()
-	if _, err := p.Run(ctx, lib); err != nil {
-		t.Fatalf("first run: %v", err)
-	}
-
-	logBuf.Reset()
-	result2, err := p.RunFile(ctx, lib, videoPath, pipeline.WithForce())
-	if err != nil {
-		t.Fatalf("forced RunFile: %v", err)
-	}
-
-	logOutput := logBuf.String()
-	if !strings.Contains(logOutput, "file changed") {
-		t.Errorf(`log output missing "file changed":%s`, logOutput)
-	}
-	if strings.Contains(logOutput, "file found") {
-		t.Errorf(`log output unexpectedly contains "file found" for a forced reprocess of an already-tracked file:%s`, logOutput)
-	}
-	if result2.Synced != 1 {
-		t.Errorf("forced run Synced = %d, want 1; errors: %v", result2.Synced, result2.Errors)
-	}
-}
-
-// TestPipeline_StreamingDiscoveryRegistersPendingAheadOfWorkerPickup is the
-// core regression test for this ticket: Pending must reflect the true
-// discovered backlog as the Library's directory walk streams discoveries
-// in, not a worker-count-bounded snapshot. With a single worker
-// permanently stuck on its first Provider.Search call, every file in the
-// Library must still be registered (Found, logged, and given a Pending row
-// per language) well before that first job unblocks and completes.
-// TestPipeline_ClaimLostSkipsWithoutError guards processFile's handling of
-// store.ErrClaimLost from MarkInProgress: when another caller has already
-// claimed the (file, language) pair, processFile must treat it like an
-// already-synced skip (outcomeSkipped, no error, no ERROR log), not a
-// processing failure.
-func TestPipeline_ClaimLostSkipsWithoutError(t *testing.T) {
-	libDir := t.TempDir()
-
-	srcVideo := filepath.Join("..", "..", "testdata", "integration", "video", "sample.mp4")
-	videoContent, err := os.ReadFile(srcVideo)
-	if err != nil {
-		t.Fatalf("reading source video: %v", err)
-	}
-
-	videoPath := filepath.Join(libDir, "Movie.One.2020.HDTV.x264-GRP.mp4")
-	if err := os.WriteFile(videoPath, videoContent, 0o644); err != nil {
-		t.Fatalf("writing video: %v", err)
-	}
-
-	dbPath := filepath.Join(t.TempDir(), "sublime.db")
-	st, err := store.Open(dbPath)
-	if err != nil {
-		t.Fatalf("opening store: %v", err)
-	}
-	defer func() { _ = st.Close() }()
-
-	ctx := context.Background()
-	en := language.English
-
-	hash, err := media.ComputeContentHash(videoPath)
-	if err != nil {
-		t.Fatalf("computing content hash: %v", err)
-	}
-	file, _, err := st.ObserveFileHash(ctx, "test-library", videoPath, string(hash))
-	if err != nil {
-		t.Fatalf("ObserveFileHash: %v", err)
-	}
-	if err := st.EnsureLanguage(ctx, file.ID, en); err != nil {
-		t.Fatalf("EnsureLanguage: %v", err)
-	}
-	// Simulate a concurrent caller having already claimed this pair before
-	// this pipeline run reaches it.
-	if err := st.MarkInProgress(ctx, file.ID, en); err != nil {
-		t.Fatalf("pre-claiming MarkInProgress: %v", err)
-	}
-
-	fakeProvider := &provider.Fake{
-		SearchFunc: func(ctx context.Context, q provider.Query) ([]domain.Candidate, error) {
-			t.Fatal("Search should not be called for a pair that lost its claim")
-			return nil, nil
-		},
-	}
-
-	lib := domain.Library{
-		Name:       "test-library",
-		Path:       libDir,
-		Languages:  []language.Tag{en},
-		StripScope: domain.StripScopeAll,
-	}
-
-	var logBuf bytes.Buffer
-	var logMu sync.Mutex
-	p := &pipeline.Pipeline{
-		Store:       st,
-		Provider:    fakeProvider,
-		SyncEngine:  &syncengine.FakeSyncEngine{},
-		Stripper:    &pipeline.FakeStripper{},
-		WorkerCount: 1,
-		Logger:      slog.New(slog.NewTextHandler(&syncedWriter{mu: &logMu, buf: &logBuf}, nil)),
-	}
-
-	result, err := p.RunFile(ctx, lib, videoPath)
-	if err != nil {
-		t.Fatalf("RunFile: %v", err)
-	}
-
-	if result.Failed != 0 {
-		t.Errorf("Failed = %d, want 0", result.Failed)
-	}
-	if result.Skipped != 1 {
-		t.Errorf("Skipped = %d, want 1", result.Skipped)
-	}
-
-	logMu.Lock()
-	logOutput := logBuf.String()
-	logMu.Unlock()
-	if strings.Contains(logOutput, "level=ERROR") {
-		t.Errorf("expected no ERROR log for a lost claim, got: %s", logOutput)
-	}
-
-	got, _, err := st.GetFile(ctx, "test-library", videoPath)
-	if err != nil {
-		t.Fatalf("GetFile: %v", err)
-	}
-	if got.Languages[0].Status != domain.StatusInProgress {
-		t.Errorf("expected the other claimant's status %q to survive untouched, got %q", domain.StatusInProgress, got.Languages[0].Status)
-	}
-}
-
-func TestPipeline_StreamingDiscoveryRegistersPendingAheadOfWorkerPickup(t *testing.T) {
-	libDir := t.TempDir()
-
-	srcVideo := filepath.Join("..", "..", "testdata", "integration", "video", "sample.mp4")
-	videoContent, err := os.ReadFile(srcVideo)
-	if err != nil {
-		t.Fatalf("reading source video: %v", err)
-	}
-
-	const numFiles = 8
-	var videoPaths []string
-	for i := 0; i < numFiles; i++ {
-		videoPath := filepath.Join(libDir, fmt.Sprintf("Movie.%d.2020.HDTV.x264-GRP.mp4", i))
-		if err := os.WriteFile(videoPath, videoContent, 0o644); err != nil {
-			t.Fatalf("writing video %d: %v", i, err)
-		}
-		videoPaths = append(videoPaths, videoPath)
-	}
-
-	dbPath := filepath.Join(t.TempDir(), "sublime.db")
-	st, err := store.Open(dbPath)
-	if err != nil {
-		t.Fatalf("opening store: %v", err)
-	}
-	defer func() { _ = st.Close() }()
-
-	block := make(chan struct{})
-	fakeProvider := &provider.Fake{
-		SearchFunc: func(ctx context.Context, q provider.Query) ([]domain.Candidate, error) {
-			<-block
-			return nil, errors.New("search unblocked")
-		},
-	}
-
-	lib := domain.Library{
-		Name:       "test-library",
-		Path:       libDir,
-		Languages:  []language.Tag{language.English, language.Spanish},
-		StripScope: domain.StripScopeAll,
-	}
-
-	var logBuf bytes.Buffer
-	var logMu sync.Mutex
-	p := &pipeline.Pipeline{
-		Store:       st,
-		Provider:    fakeProvider,
-		SyncEngine:  &syncengine.FakeSyncEngine{},
-		Stripper:    &pipeline.FakeStripper{},
-		WorkerCount: 1,
-		Logger:      slog.New(slog.NewTextHandler(&syncedWriter{mu: &logMu, buf: &logBuf}, nil)),
-	}
-
-	ctx := context.Background()
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		if _, err := p.Run(ctx, lib); err != nil {
-			t.Errorf("run: %v", err)
-		}
-	}()
-
-	// With WorkerCount=1, exactly one (file, language) job is checked out
-	// as In Progress (blocked in Provider.Search) once the pipeline catches
-	// up to the worker's pickup; every other discovered job must still be
-	// Pending, not swallowed by the worker-count-bounded in-flight batch.
-	wantPending := numFiles*len(lib.Languages) - 1
-	wantInProgress := 1
-	deadline := time.Now().Add(5 * time.Second)
-	var lastPending, lastInProgress int
-	for time.Now().Before(deadline) {
-		summaries, err := st.LibrarySummaries(ctx)
-		if err != nil {
-			t.Fatalf("LibrarySummaries: %v", err)
-		}
-		for _, s := range summaries {
-			if s.LibraryName == lib.Name {
-				lastPending = s.Pending
-				lastInProgress = s.InProgress
-			}
-		}
-		if lastPending == wantPending && lastInProgress == wantInProgress {
-			break
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-
-	if lastPending != wantPending {
-		t.Fatalf("Pending = %d, want %d (streaming discovery must register every file ahead of worker pickup, with WorkerCount=1)", lastPending, wantPending)
-	}
-	if lastInProgress != wantInProgress {
-		t.Fatalf("InProgress = %d, want %d (bounded by WorkerCount=1)", lastInProgress, wantInProgress)
-	}
-
-	logMu.Lock()
-	foundCount := strings.Count(logBuf.String(), "file found")
-	logMu.Unlock()
-	if foundCount != numFiles {
-		t.Errorf(`"file found" count = %d, want %d (one per file, not per language)`, foundCount, numFiles)
-	}
-
-	close(block)
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("pipeline.Run did not finish after unblocking Provider.Search")
-	}
-
-	for _, videoPath := range videoPaths {
-		file, found, err := st.GetFile(ctx, lib.Name, videoPath)
-		if err != nil {
-			t.Fatalf("getting file %q from store: %v", videoPath, err)
-		}
-		if !found {
-			t.Errorf("file %q not found in store", videoPath)
-		}
-		if len(file.Languages) != len(lib.Languages) {
-			t.Errorf("file %q Languages = %+v, want %d entries", videoPath, file.Languages, len(lib.Languages))
-		}
-	}
-}
-
-// syncedWriter serializes concurrent writes to buf behind mu, letting a
-// slog.TextHandler be shared safely across the pipeline's per-file worker
-// goroutines in tests.
-type syncedWriter struct {
-	mu  *sync.Mutex
-	buf *bytes.Buffer
-}
-
-func (w *syncedWriter) Write(p []byte) (int, error) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	return w.buf.Write(p)
 }

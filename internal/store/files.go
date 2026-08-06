@@ -105,7 +105,7 @@ func (s *Store) ObserveFileHash(ctx context.Context, libraryName, path, contentH
 			// investigation (e.g. fencing the terminal-status writes on
 			// the Content Hash they were computed against).
 			if _, err := tx.ExecContext(ctx,
-				`UPDATE file_language_states SET status = ?, failure_reason = NULL, updated_at = ? WHERE file_id = ?`,
+				`UPDATE file_language_states SET status = ?, failure_reason = NULL, force = 0, updated_at = ? WHERE file_id = ?`,
 				domain.StatusPending, now, id,
 			); err != nil {
 				return fmt.Errorf("resetting language states after content hash change: %w", err)
@@ -141,11 +141,30 @@ func (s *Store) ObserveFileHash(ctx context.Context, libraryName, path, contentH
 // Changed event per CONTEXT.md even though the hash itself may be identical.
 func (s *Store) ResetToPending(ctx context.Context, fileID int64) error {
 	_, err := s.db.ExecContext(ctx,
-		`UPDATE file_language_states SET status = ?, failure_reason = NULL, updated_at = ? WHERE file_id = ?`,
+		`UPDATE file_language_states SET status = ?, failure_reason = NULL, force = 0, updated_at = ? WHERE file_id = ?`,
 		domain.StatusPending, nowString(), fileID,
 	)
 	if err != nil {
 		return fmt.Errorf("resetting language states to pending: %w", err)
+	}
+	return nil
+}
+
+// ResetToPendingForced is ResetToPending plus setting force = 1 on every one
+// of fileID's language rows, marking them so a future Dispatcher claim
+// bypasses the Marker+Content-Hash gate for this pass — see
+// docs/adr/0004-decouple-trigger-and-dispatcher.md. Used for a manual
+// reprocess request: unlike ResetToPending's plain reset, the whole point
+// of a forced reprocess is to resync even when a still-valid Marker would
+// otherwise make the gate skip straight to StatusSynced. The flag is
+// cleared by MarkInProgress once the Dispatcher claims the row.
+func (s *Store) ResetToPendingForced(ctx context.Context, fileID int64) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE file_language_states SET status = ?, failure_reason = NULL, force = 1, updated_at = ? WHERE file_id = ?`,
+		domain.StatusPending, nowString(), fileID,
+	)
+	if err != nil {
+		return fmt.Errorf("resetting language states to pending (forced): %w", err)
 	}
 	return nil
 }
@@ -263,7 +282,7 @@ func (s *Store) MarkSynced(ctx context.Context, fileID int64, lang language.Tag)
 // from a genuinely missing row. Callers must EnsureLanguage first.
 func (s *Store) MarkInProgress(ctx context.Context, fileID int64, lang language.Tag) error {
 	res, err := s.db.ExecContext(ctx,
-		`UPDATE file_language_states SET status = ?, failure_reason = NULL, updated_at = ? WHERE file_id = ? AND language = ? AND status = ?`,
+		`UPDATE file_language_states SET status = ?, failure_reason = NULL, force = 0, updated_at = ? WHERE file_id = ? AND language = ? AND status = ?`,
 		domain.StatusInProgress, nowString(), fileID, lang.String(), domain.StatusPending,
 	)
 	if err != nil {
