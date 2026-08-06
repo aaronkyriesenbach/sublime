@@ -264,6 +264,136 @@ func TestDispatcher_RunOnceIsBoundedByPipelineWorkerCount(t *testing.T) {
 	}
 }
 
+// TestDispatcher_SuspendedProviderLeavesPendingUntouched guards issue #64's
+// fix: a Pending pair whose Provider is currently Suspended is left
+// Pending — never claimed, never Failed — and is picked up on a later
+// RunOnce pass once Suspension() reports availability again, observable
+// only via the real Store's Sync Status transitions.
+func TestDispatcher_SuspendedProviderLeavesPendingUntouched(t *testing.T) {
+	libDir := t.TempDir()
+	videoPath := filepath.Join(libDir, "Test.Movie.2024.HDTV.x264-FAKEGROUP.mp4")
+	writeVideoFixture(t, videoPath)
+
+	st := openTestStore(t)
+	candidateContent := "1\n00:00:00,500 --> 00:00:01,900\nOne two three\n"
+	suspended := true
+	fakeProvider := &provider.Fake{
+		SearchFunc: func(ctx context.Context, q provider.Query) ([]domain.Candidate, error) {
+			if suspended {
+				t.Fatal("Search should not be called while the Provider is Suspended")
+			}
+			return []domain.Candidate{{ID: "candidate", Title: "Test Movie", Year: 2024}}, nil
+		},
+		DownloadFunc: func(ctx context.Context, c domain.Candidate) ([]byte, error) {
+			return []byte(candidateContent), nil
+		},
+		SuspendedFunc: func() (time.Time, bool) {
+			return time.Now().Add(time.Hour), suspended
+		},
+	}
+
+	lib := domain.Library{
+		Name:       "test-library",
+		Path:       libDir,
+		Languages:  []language.Tag{language.English},
+		StripScope: domain.StripScopeAll,
+	}
+
+	p := &pipeline.Pipeline{
+		Store:      st,
+		Provider:   fakeProvider,
+		SyncEngine: &syncengine.FakeSyncEngine{},
+		Stripper:   &pipeline.FakeStripper{},
+	}
+
+	ctx := context.Background()
+	if _, err := p.Run(ctx, lib); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	d := &dispatcher.Dispatcher{Pipeline: p, Store: st, Libraries: []domain.Library{lib}}
+
+	if err := d.RunOnce(ctx); err != nil {
+		t.Fatalf("RunOnce while suspended: %v", err)
+	}
+
+	file, found, err := st.GetFile(ctx, lib.Name, videoPath)
+	if err != nil {
+		t.Fatalf("GetFile while suspended: %v", err)
+	}
+	if !found || file.Languages[0].Status != domain.StatusPending {
+		t.Fatalf("expected the pair to remain Pending while Suspended, got %+v", file)
+	}
+
+	suspended = false
+	if err := d.RunOnce(ctx); err != nil {
+		t.Fatalf("RunOnce after resuming: %v", err)
+	}
+
+	file, found, err = st.GetFile(ctx, lib.Name, videoPath)
+	if err != nil {
+		t.Fatalf("GetFile after resuming: %v", err)
+	}
+	if !found || file.Languages[0].Status != domain.StatusSynced {
+		t.Fatalf("expected the pair to be Synced after the Provider resumed, got %+v", file)
+	}
+}
+
+// TestDispatcher_AvailableProviderIsUnaffectedBySuspensionCheck guards that
+// a Provider reporting not-suspended dispatches exactly as before — the
+// new gate never blocks a healthy Provider.
+func TestDispatcher_AvailableProviderIsUnaffectedBySuspensionCheck(t *testing.T) {
+	libDir := t.TempDir()
+	videoPath := filepath.Join(libDir, "Test.Movie.2024.HDTV.x264-FAKEGROUP.mp4")
+	writeVideoFixture(t, videoPath)
+
+	st := openTestStore(t)
+	candidateContent := "1\n00:00:00,500 --> 00:00:01,900\nOne two three\n"
+	fakeProvider := &provider.Fake{
+		SearchFunc: func(ctx context.Context, q provider.Query) ([]domain.Candidate, error) {
+			return []domain.Candidate{{ID: "candidate", Title: "Test Movie", Year: 2024}}, nil
+		},
+		DownloadFunc: func(ctx context.Context, c domain.Candidate) ([]byte, error) {
+			return []byte(candidateContent), nil
+		},
+		SuspendedFunc: func() (time.Time, bool) {
+			return time.Time{}, false
+		},
+	}
+
+	lib := domain.Library{
+		Name:       "test-library",
+		Path:       libDir,
+		Languages:  []language.Tag{language.English},
+		StripScope: domain.StripScopeAll,
+	}
+
+	p := &pipeline.Pipeline{
+		Store:      st,
+		Provider:   fakeProvider,
+		SyncEngine: &syncengine.FakeSyncEngine{},
+		Stripper:   &pipeline.FakeStripper{},
+	}
+
+	ctx := context.Background()
+	if _, err := p.Run(ctx, lib); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	d := &dispatcher.Dispatcher{Pipeline: p, Store: st, Libraries: []domain.Library{lib}}
+	if err := d.RunOnce(ctx); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+
+	file, found, err := st.GetFile(ctx, lib.Name, videoPath)
+	if err != nil {
+		t.Fatalf("GetFile: %v", err)
+	}
+	if !found || file.Languages[0].Status != domain.StatusSynced {
+		t.Fatalf("expected Synced after RunOnce with an available Provider, got %+v", file)
+	}
+}
+
 // TestDispatcher_UnconfiguredLibraryIsSkippedNotFatal guards that a
 // Pending pair whose Library name isn't present in Dispatcher.Libraries
 // (e.g. removed from config since it was registered) is skipped with a
