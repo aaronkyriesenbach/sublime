@@ -94,6 +94,16 @@ func (s *Store) ObserveFileHash(ctx context.Context, libraryName, path, contentH
 			); err != nil {
 				return fmt.Errorf("updating file content hash: %w", err)
 			}
+			// TODO(race): this reset is unconditional on the target rows'
+			// current status, so a Changed event for a file with a
+			// language pair currently In Progress resets it to Pending out
+			// from under the in-flight worker. That worker's eventual
+			// MarkSynced/MarkFailed (also unconditional) can then stomp
+			// this fresh Pending row with an outcome computed against the
+			// stale, pre-change content. Pre-existing, not introduced by
+			// Provider Suspension dispatch-gating — needs its own
+			// investigation (e.g. fencing the terminal-status writes on
+			// the Content Hash they were computed against).
 			if _, err := tx.ExecContext(ctx,
 				`UPDATE file_language_states SET status = ?, failure_reason = NULL, updated_at = ? WHERE file_id = ?`,
 				domain.StatusPending, now, id,
