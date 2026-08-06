@@ -36,6 +36,18 @@ _Avoid_: Paused (used informally above, but Suspended is the canonical term), ra
 The cause recorded for a Provider entering Suspended: it has used its full allotment of a rate-limited operation (e.g. OpenSubtitles' 24h download quota) and been told to wait until a reset time. Distinct from ordinary throttling (a 429/5xx response, handled by adaptive backoff on individual requests) — Quota Exhausted is a hard stop with a known-ish resume time, not a rate to slow down.
 _Avoid_: Rate limited, throttled
 
+**Trigger**:
+The mechanism by which a video file enters the pipeline's Pending state: an initial Library scan, a live fsnotify watch over the Library's tree, or a manual reprocess request. A Trigger only registers Found/Changed files and fans out Pending Sync Statuses for them — it never itself claims a (file, language) pair or calls a Provider; that's the Dispatcher's job.
+_Avoid_: Scanner, Watcher (the Go type implementing the live-watch Trigger specifically, not the whole concept)
+
+**Dispatcher**:
+The component that claims Pending (file, language) pairs and hands them to a Provider for real work (Search through Sync) — one dispatch loop shared across every Library, independent of any single Trigger. Honors each pair's Provider Chain and each Provider's Suspended state: a pair whose next Provider is Suspended is left Pending rather than dispatched, until that Provider resumes.
+_Avoid_: Scheduler, Worker (a Dispatcher's execution unit, not the Dispatcher itself)
+
+**Provider Chain**:
+The ordered sequence of Providers a single (file, language) pair may be attempted against, in priority order (e.g., highest subtitle quality first). A pair advances to the next Provider in its chain only when the current Provider completes a Search and finds no Candidate clearing the scoring cutoff — never because the current Provider is Suspended, which instead leaves the pair waiting on that same Provider. Failed's `no_candidate` reason is reached only once every Provider in the chain has been tried and found nothing.
+_Avoid_: Fallback (describes the mechanism informally; Provider Chain is the noun for the ordered list itself), Priority list
+
 **Sync Engine**:
 The tool Sublime uses to perform Sync (e.g., alass). Swappable independently of the Provider used to retrieve the Candidate.
 _Avoid_: Aligner, sync tool
@@ -46,7 +58,7 @@ _Avoid_: Match, align (as a standalone term — use Sync)
 
 **Sync Status**:
 The lifecycle state of a single (file, language) pair: Pending, In Progress, Synced, or Failed. Owned by the state store, not any Provider or Sync Engine.
-_Avoid_: State, status (too generic on their own — always qualify as Sync Status)
+_Avoid_: State, status (too generic on their own — always qualify as Sync Status), Job (a single (file, language) pair's retrieve/sync attempt — always name the pair and its Sync Status instead of calling it a Job)
 
 **Found**:
 The moment a video file is first recorded by the state store — via a Library scan's directory walk or a file-system watch event for a brand-new path — registering it and fanning out a Pending Sync Status for each of its Library's configured languages. Logged once per file, not per language.
