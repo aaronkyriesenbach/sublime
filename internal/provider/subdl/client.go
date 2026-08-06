@@ -30,13 +30,19 @@ func (e *apiError) Error() string {
 
 // client is the low-level HTTP transport for the SubDL API: request
 // building, response classification, and wire-format JSON, with every
-// outgoing request routed through retry.Pacer.
+// outgoing request routed through retry.Pacer. baseURL and downloadBaseURL
+// are deliberately separate hosts: SubDL's JSON search API lives at
+// api.subdl.com, but its actual subtitle bytes are served from a
+// different host, dl.subdl.com (see getRaw and SubDL's "Downloading
+// Subtitles" docs) -- a search response's own "url" field is only a path
+// relative to that second host, never a full URL.
 type client struct {
-	baseURL    string
-	userAgent  string
-	httpClient *http.Client
-	pacer      *retry.Pacer
-	now        func() time.Time
+	baseURL         string
+	downloadBaseURL string
+	userAgent       string
+	httpClient      *http.Client
+	pacer           *retry.Pacer
+	now             func() time.Time
 }
 
 // getJSON issues a GET request for path (relative to baseURL) through the
@@ -74,13 +80,15 @@ func (c *client) getJSON(ctx context.Context, path string, out any) error {
 	})
 }
 
-// getRaw issues a GET request for path (relative to baseURL) through the
-// Pacer and returns its raw response body — used for SubDL's download
-// endpoint, which returns subtitle bytes directly rather than JSON.
+// getRaw issues a GET request for path (relative to downloadBaseURL,
+// dl.subdl.com by default -- not baseURL, the JSON search host) through
+// the Pacer and returns its raw response body -- used for SubDL's
+// download endpoint, which returns subtitle bytes directly rather than
+// JSON.
 func (c *client) getRaw(ctx context.Context, path string) ([]byte, error) {
 	var data []byte
 	err := c.pacer.Do(ctx, func(ctx context.Context) (retry.Outcome, error) {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+path, nil)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.downloadBaseURL+path, nil)
 		if err != nil {
 			return retry.Outcome{}, err
 		}
@@ -197,19 +205,37 @@ func nextUTCMidnight(now time.Time) time.Time {
 
 // --- Wire-format JSON bodies ---
 
+// searchResponseBody mirrors SubDL's /subtitles response's two top-level
+// arrays. Results identifies the movie/show SubDL matched the query
+// against; Subtitles are, per SubDL's own docs, always "an array of
+// subtitles for the first movie/TV show in results" -- there is no
+// per-subtitle title, year, or n_id/file_n_id field at all (verified
+// against SubDL's published API docs and a live response; see
+// candidatesFromResponse in subdl.go, which is why both arrays are
+// decoded here rather than Subtitles alone).
 type searchResponseBody struct {
+	Results   []searchResultInfo `json:"results"`
 	Subtitles []searchResultItem `json:"subtitles"`
 }
 
-// searchResultItem mirrors one entry in SubDL's /subtitles response.
-// NID/FileNID are SubDL's own n_id/file_n_id pair identifying this
-// specific subtitle file — see candidateID.
+// searchResultInfo mirrors one entry in SubDL's /subtitles response
+// "results" array: the movie/show SubDL matched the query against. Every
+// Candidate built from one response shares results[0]'s Name/Year (see
+// candidatesFromResponse).
+type searchResultInfo struct {
+	Name string `json:"name"`
+	Year int    `json:"year"`
+}
+
+// searchResultItem mirrors one entry in SubDL's /subtitles response
+// "subtitles" array. URL is the subtitle's download path, relative to
+// dl.subdl.com (client.downloadBaseURL), not api.subdl.com -- see
+// client.getRaw. Season/Episode are 0 for a movie or a full-season pack
+// (SubDL leaves Episode null for those; decoding JSON null into an int
+// field is a no-op in Go, so it comes through as the zero value here).
 type searchResultItem struct {
-	ReleaseName   string `json:"release_name"`
-	Name          string `json:"name"`
-	Year          int    `json:"year"`
-	SeasonNumber  int    `json:"season_number"`
-	EpisodeNumber int    `json:"episode_number"`
-	NID           int    `json:"n_id"`
-	FileNID       int    `json:"file_n_id"`
+	ReleaseName string `json:"release_name"`
+	URL         string `json:"url"`
+	Season      int    `json:"season"`
+	Episode     int    `json:"episode"`
 }

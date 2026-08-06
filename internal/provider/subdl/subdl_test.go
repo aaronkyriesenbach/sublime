@@ -29,11 +29,12 @@ func (f *fakeClock) Sleep(_ context.Context, d time.Duration) error {
 func newTestProvider(t *testing.T, mock *mockServer, clock *fakeClock, paid bool) *subdl.Provider {
 	t.Helper()
 	p, err := subdl.New(subdl.Config{
-		APIKey:  "test-api-key",
-		Paid:    paid,
-		BaseURL: mock.URL(),
-		Clock:   clock,
-		Now:     func() time.Time { return time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC) },
+		APIKey:          "test-api-key",
+		Paid:            paid,
+		BaseURL:         mock.URL(),
+		DownloadBaseURL: mock.URL(),
+		Clock:           clock,
+		Now:             func() time.Time { return time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC) },
 	})
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
@@ -41,20 +42,36 @@ func newTestProvider(t *testing.T, mock *mockServer, clock *fakeClock, paid bool
 	return p
 }
 
-func searchItem(release, name string, year, season, episode, nID, fileNID int) map[string]any {
+// searchItem builds one entry of a /subtitles response's "subtitles"
+// array: release (release_name), a download url (relative to
+// dl.subdl.com, e.g. "/subtitle/1234-1.zip"), and season/episode (0 for a
+// movie or full-season pack). There is no per-item title or year field --
+// see searchResponseWithTitle.
+func searchItem(release, url string, season, episode int) map[string]any {
 	return map[string]any{
-		"release_name":   release,
-		"name":           name,
-		"year":           year,
-		"season_number":  season,
-		"episode_number": episode,
-		"n_id":           nID,
-		"file_n_id":      fileNID,
+		"release_name": release,
+		"url":          url,
+		"season":       season,
+		"episode":      episode,
 	}
 }
 
+// searchResponse builds a /subtitles response with no "results" entry, for
+// tests that only care about the outgoing request, not the returned
+// Candidates.
 func searchResponse(items ...map[string]any) map[string]any {
 	return map[string]any{"status": true, "subtitles": items}
+}
+
+// searchResponseWithTitle builds a /subtitles response with a single
+// "results" entry (title, year), matching SubDL's documented shape: every
+// item in "subtitles" belongs to that one results[0] identity.
+func searchResponseWithTitle(title string, year int, items ...map[string]any) map[string]any {
+	return map[string]any{
+		"status":    true,
+		"results":   []map[string]any{{"name": title, "year": year}},
+		"subtitles": items,
+	}
 }
 
 // --- New() validation ---
@@ -200,8 +217,8 @@ func TestSearch_LanguageTranslation_FallsBackToLowercaseISO6391(t *testing.T) {
 
 func TestSearch_ConvertsResponseItemsToCandidates(t *testing.T) {
 	mock := newMockServer(t)
-	mock.on(http.MethodGet, "/subtitles", jsonHandler(http.StatusOK, searchResponse(
-		searchItem("Arrival.2016.1080p.BluRay.x264-GROUP", "Arrival", 2016, 0, 0, 1234, 1),
+	mock.on(http.MethodGet, "/subtitles", jsonHandler(http.StatusOK, searchResponseWithTitle("Arrival", 2016,
+		searchItem("Arrival.2016.1080p.BluRay.x264-GROUP", "/subtitle/1234-1.zip", 0, 0),
 	)))
 
 	clock := &fakeClock{}
@@ -217,7 +234,7 @@ func TestSearch_ConvertsResponseItemsToCandidates(t *testing.T) {
 	}
 
 	want := domain.Candidate{
-		ID:           "1234-1",
+		ID:           "/subtitle/1234-1.zip",
 		Title:        "Arrival",
 		Year:         2016,
 		Source:       "BluRay",
@@ -233,9 +250,9 @@ func TestSearch_ConvertsResponseItemsToCandidates(t *testing.T) {
 
 func TestSearch_MultipleItems_YieldsOneCandidateEach(t *testing.T) {
 	mock := newMockServer(t)
-	mock.on(http.MethodGet, "/subtitles", jsonHandler(http.StatusOK, searchResponse(
-		searchItem("Arrival.2016.1080p.BluRay.x264-GROUP", "Arrival", 2016, 0, 0, 1234, 1),
-		searchItem("Arrival.2016.720p.WEBRip.x265-OTHER", "Arrival", 2016, 0, 0, 5678, 1),
+	mock.on(http.MethodGet, "/subtitles", jsonHandler(http.StatusOK, searchResponseWithTitle("Arrival", 2016,
+		searchItem("Arrival.2016.1080p.BluRay.x264-GROUP", "/subtitle/1234-1.zip", 0, 0),
+		searchItem("Arrival.2016.720p.WEBRip.x265-OTHER", "/subtitle/5678-1.zip", 0, 0),
 	)))
 
 	clock := &fakeClock{}
@@ -276,12 +293,12 @@ func TestSearch_NoResults_ReturnsEmptyNotError(t *testing.T) {
 
 func TestDownload_UnpaidOmitsAPIKey(t *testing.T) {
 	mock := newMockServer(t)
-	mock.on(http.MethodGet, "/download", rawHandler(http.StatusOK, "subtitle content"))
+	mock.on(http.MethodGet, "/subtitle/1234-1.zip", rawHandler(http.StatusOK, "subtitle content"))
 
 	clock := &fakeClock{}
 	p := newTestProvider(t, mock, clock, false)
 
-	data, err := p.Download(context.Background(), domain.Candidate{ID: "1234-1"})
+	data, err := p.Download(context.Background(), domain.Candidate{ID: "/subtitle/1234-1.zip"})
 	if err != nil {
 		t.Fatalf("Download() error = %v", err)
 	}
@@ -289,9 +306,9 @@ func TestDownload_UnpaidOmitsAPIKey(t *testing.T) {
 		t.Errorf("Download() = %q, want %q", data, "subtitle content")
 	}
 
-	reqs := mock.requestsFor(http.MethodGet, "/download")
+	reqs := mock.requestsFor(http.MethodGet, "/subtitle/1234-1.zip")
 	if len(reqs) != 1 {
-		t.Fatalf("got %d /download requests, want 1", len(reqs))
+		t.Fatalf("got %d download requests, want 1", len(reqs))
 	}
 	params, err := url.ParseQuery(reqs[0].Query)
 	if err != nil {
@@ -300,26 +317,46 @@ func TestDownload_UnpaidOmitsAPIKey(t *testing.T) {
 	if params.Has("api_key") {
 		t.Errorf("unpaid download query %q must not include api_key", reqs[0].Query)
 	}
-	if got, want := params.Get("n_id"), "1234"; got != want {
-		t.Errorf("n_id = %q, want %q", got, want)
+}
+
+// TestDownload_UnpaidStripsEmbeddedAPIKeyFromCandidateURL guards against
+// SubDL's search response sometimes echoing an api_key already embedded in
+// a subtitle's "url" field (observed live against the real API): Paid
+// alone must decide whether a key is sent, never whatever Search happened
+// to return.
+func TestDownload_UnpaidStripsEmbeddedAPIKeyFromCandidateURL(t *testing.T) {
+	mock := newMockServer(t)
+	mock.on(http.MethodGet, "/subtitle/1234-1.zip", rawHandler(http.StatusOK, "subtitle content"))
+
+	clock := &fakeClock{}
+	p := newTestProvider(t, mock, clock, false)
+
+	if _, err := p.Download(context.Background(), domain.Candidate{ID: "/subtitle/1234-1.zip?api_key=leaked-key"}); err != nil {
+		t.Fatalf("Download() error = %v", err)
 	}
-	if got, want := params.Get("file_n_id"), "1"; got != want {
-		t.Errorf("file_n_id = %q, want %q", got, want)
+
+	reqs := mock.requestsFor(http.MethodGet, "/subtitle/1234-1.zip")
+	params, err := url.ParseQuery(reqs[0].Query)
+	if err != nil {
+		t.Fatalf("parsing query %q: %v", reqs[0].Query, err)
+	}
+	if params.Has("api_key") {
+		t.Errorf("unpaid download query %q must not include api_key, even if the candidate URL already had one", reqs[0].Query)
 	}
 }
 
 func TestDownload_PaidAttachesAPIKey(t *testing.T) {
 	mock := newMockServer(t)
-	mock.on(http.MethodGet, "/download", rawHandler(http.StatusOK, "subtitle content"))
+	mock.on(http.MethodGet, "/subtitle/1234-1.zip", rawHandler(http.StatusOK, "subtitle content"))
 
 	clock := &fakeClock{}
 	p := newTestProvider(t, mock, clock, true)
 
-	if _, err := p.Download(context.Background(), domain.Candidate{ID: "1234-1"}); err != nil {
+	if _, err := p.Download(context.Background(), domain.Candidate{ID: "/subtitle/1234-1.zip"}); err != nil {
 		t.Fatalf("Download() error = %v", err)
 	}
 
-	reqs := mock.requestsFor(http.MethodGet, "/download")
+	reqs := mock.requestsFor(http.MethodGet, "/subtitle/1234-1.zip")
 	params, err := url.ParseQuery(reqs[0].Query)
 	if err != nil {
 		t.Fatalf("parsing query %q: %v", reqs[0].Query, err)
@@ -344,8 +381,8 @@ func TestDownload_InvalidCandidateID(t *testing.T) {
 func TestSearch_RetriesOn429ThenSucceeds(t *testing.T) {
 	mock := newMockServer(t)
 	mock.on(http.MethodGet, "/subtitles", jsonHandler(http.StatusTooManyRequests, map[string]any{"status": false, "error": "slow down"}))
-	mock.on(http.MethodGet, "/subtitles", jsonHandler(http.StatusOK, searchResponse(
-		searchItem("Arrival.2016.1080p.BluRay.x264-GROUP", "Arrival", 2016, 0, 0, 1234, 1),
+	mock.on(http.MethodGet, "/subtitles", jsonHandler(http.StatusOK, searchResponseWithTitle("Arrival", 2016,
+		searchItem("Arrival.2016.1080p.BluRay.x264-GROUP", "/subtitle/1234-1.zip", 0, 0),
 	)))
 
 	clock := &fakeClock{}
@@ -437,12 +474,12 @@ func TestSearch_QuotaExhausted_NoResetHeader_FallsBackToNextUTCMidnight(t *testi
 // documented shape from an authenticated download request.
 func TestDownload_Paid_QuotaExhausted_429WithResetHeader(t *testing.T) {
 	mock := newMockServer(t)
-	mock.on(http.MethodGet, "/download", withHeader("X-RateLimit-Reset", "1767225600", quotaExceededHandler()))
+	mock.on(http.MethodGet, "/subtitle/1234-1.zip", withHeader("X-RateLimit-Reset", "1767225600", quotaExceededHandler()))
 
 	clock := &fakeClock{}
 	p := newTestProvider(t, mock, clock, true)
 
-	_, err := p.Download(context.Background(), domain.Candidate{ID: "1234-1"})
+	_, err := p.Download(context.Background(), domain.Candidate{ID: "/subtitle/1234-1.zip"})
 
 	var quotaErr *provider.QuotaExhaustedError
 	if !errors.As(err, &quotaErr) {
@@ -461,12 +498,12 @@ func TestDownload_Paid_QuotaExhausted_429WithResetHeader(t *testing.T) {
 // error for that one (file, language) pair.
 func TestDownload_Anonymous_NonQuotaShapeNeverSuspends(t *testing.T) {
 	mock := newMockServer(t)
-	mock.on(http.MethodGet, "/download", quotaExceededHandler())
+	mock.on(http.MethodGet, "/subtitle/1234-1.zip", quotaExceededHandler())
 
 	clock := &fakeClock{}
 	p := newTestProvider(t, mock, clock, false)
 
-	_, err := p.Download(context.Background(), domain.Candidate{ID: "1234-1"})
+	_, err := p.Download(context.Background(), domain.Candidate{ID: "/subtitle/1234-1.zip"})
 	if err == nil {
 		t.Fatal("expected an error for a 429 anonymous download response")
 	}
