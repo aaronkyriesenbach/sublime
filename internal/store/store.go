@@ -32,6 +32,15 @@ var ErrLanguageStateNotFound = errors.New("store: language state not found")
 // ObserveFileContentHash.
 var ErrFileNotFound = errors.New("store: file not found")
 
+// ErrClaimLost is returned by MarkInProgress when the (file, language) row
+// exists but is no longer StatusPending, whether because another caller
+// already claimed it or for any other reason. It is not distinguished from
+// ErrLanguageStateNotFound beyond that: nothing in the store deletes
+// file_language_states rows, so a genuinely missing row is practically
+// unreachable once a pair has been registered, and both cases warrant the
+// same reaction from a caller (skip, don't treat as a processing failure).
+var ErrClaimLost = errors.New("store: claim lost, language state is no longer pending")
+
 // bootstrapSQL is Sublime's entire schema. There is no migration framework:
 // every statement uses IF NOT EXISTS so Open is safe to call against an
 // existing database file.

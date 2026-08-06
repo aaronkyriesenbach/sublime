@@ -619,7 +619,10 @@ func TestMarkInProgress_TransitionsFromPendingAndBackToSyncedOrFailed(t *testing
 		t.Errorf("expected status %q, got %q", domain.StatusSynced, got.Languages[0].Status)
 	}
 
-	// back to in_progress, then to failed
+	// back to pending, then in_progress, then to failed
+	if err := s.ResetLanguageToPending(ctx, file.ID, en); err != nil {
+		t.Fatalf("ResetLanguageToPending returned error: %v", err)
+	}
 	if err := s.MarkInProgress(ctx, file.ID, en); err != nil {
 		t.Fatalf("second MarkInProgress returned error: %v", err)
 	}
@@ -645,9 +648,47 @@ func TestMarkInProgress_UnknownLanguageState(t *testing.T) {
 		t.Fatalf("ObserveFileContentHash returned error: %v", err)
 	}
 
+	// No row exists at all for this (file, language) pair, which surfaces
+	// the same way as a row that's no longer pending: nothing in the store
+	// deletes file_language_states rows, so callers can't tell these apart
+	// and shouldn't need to.
 	err = s.MarkInProgress(ctx, file.ID, en)
-	if !errors.Is(err, store.ErrLanguageStateNotFound) {
-		t.Fatalf("expected ErrLanguageStateNotFound, got %v", err)
+	if !errors.Is(err, store.ErrClaimLost) {
+		t.Fatalf("expected ErrClaimLost, got %v", err)
+	}
+}
+
+func TestMarkInProgress_ClaimLostWhenNotPending(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	en := mustLang(t, "en")
+
+	file, err := s.ObserveFileContentHash(ctx, "movies", "/media/movies/a.mkv", "hash-1")
+	if err != nil {
+		t.Fatalf("ObserveFileContentHash returned error: %v", err)
+	}
+	if err := s.EnsureLanguage(ctx, file.ID, en); err != nil {
+		t.Fatalf("EnsureLanguage returned error: %v", err)
+	}
+
+	// First claim succeeds from pending.
+	if err := s.MarkInProgress(ctx, file.ID, en); err != nil {
+		t.Fatalf("first MarkInProgress returned error: %v", err)
+	}
+
+	// A second claim attempt against the same (now in_progress) row must
+	// lose, leaving the first claim's state untouched.
+	err = s.MarkInProgress(ctx, file.ID, en)
+	if !errors.Is(err, store.ErrClaimLost) {
+		t.Fatalf("expected ErrClaimLost, got %v", err)
+	}
+
+	got, _, err := s.GetFile(ctx, "movies", "/media/movies/a.mkv")
+	if err != nil {
+		t.Fatalf("GetFile returned error: %v", err)
+	}
+	if got.Languages[0].Status != domain.StatusInProgress {
+		t.Errorf("expected status to remain %q, got %q", domain.StatusInProgress, got.Languages[0].Status)
 	}
 }
 
