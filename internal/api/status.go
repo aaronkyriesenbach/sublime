@@ -147,7 +147,7 @@ func toFileEntries(files []domain.File) []FileEntry {
 	for _, f := range files {
 		languages := make(map[string]LanguageStateEntry, len(f.Languages))
 		for _, ls := range f.Languages {
-			entry := LanguageStateEntry{Status: string(ls.Status)}
+			entry := LanguageStateEntry{Status: string(ls.Status), Attempted: ls.Attempted}
 			if ls.Status == domain.StatusFailed {
 				entry.Reason = string(ls.FailureReason)
 			}

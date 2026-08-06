@@ -67,6 +67,12 @@ type FileLanguageState struct {
 	// FailureReason explains why Status is StatusFailed. It is
 	// FailureNone whenever Status is not StatusFailed.
 	FailureReason FailureReason
+
+	// Attempted is the set of Provider names already recorded as
+	// tried-and-missed for this pair's current cycle (see
+	// Store.RecordProviderMiss), in the order they were recorded. Empty
+	// when no Provider has missed on this pair yet this cycle.
+	Attempted []string
 }
 
 // File is a single tracked video file's durable state: its identity within a

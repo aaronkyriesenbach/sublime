@@ -421,7 +421,7 @@ type querier interface {
 
 func queryLanguageStates(ctx context.Context, q querier, fileID int64) ([]domain.FileLanguageState, error) {
 	rows, err := q.QueryContext(ctx,
-		`SELECT language, status, COALESCE(failure_reason, '') FROM file_language_states WHERE file_id = ? ORDER BY language`,
+		`SELECT language, status, COALESCE(failure_reason, ''), attempted_providers FROM file_language_states WHERE file_id = ? ORDER BY language`,
 		fileID,
 	)
 	if err != nil {
@@ -431,8 +431,8 @@ func queryLanguageStates(ctx context.Context, q querier, fileID int64) ([]domain
 
 	var states []domain.FileLanguageState
 	for rows.Next() {
-		var langTag, status, failureReason string
-		if err := rows.Scan(&langTag, &status, &failureReason); err != nil {
+		var langTag, status, failureReason, attempted string
+		if err := rows.Scan(&langTag, &status, &failureReason, &attempted); err != nil {
 			return nil, fmt.Errorf("scanning language state: %w", err)
 		}
 
@@ -445,6 +445,7 @@ func queryLanguageStates(ctx context.Context, q querier, fileID int64) ([]domain
 			Language:      parsed,
 			Status:        domain.SyncStatus(status),
 			FailureReason: domain.FailureReason(failureReason),
+			Attempted:     splitAttemptedProviders(attempted),
 		})
 	}
 	if err := rows.Err(); err != nil {

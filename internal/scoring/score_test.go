@@ -218,3 +218,74 @@ func TestScore_EpisodeWithUnknownYearStillRejectsWrongEpisode(t *testing.T) {
 		t.Errorf("Score(...) eligible = true, want false: wrong episode number must reject the candidate even when the video's year is unknown")
 	}
 }
+
+func TestBest_ReturnsTopScoringCandidateEvenWhenIneligible(t *testing.T) {
+	info := scoring.Info{ContentType: media.Movie, Title: "Blue Mountain State: The Rise of Thadland", Year: 2016}
+	// Punctuation dropped from the filename-derived title never matches
+	// info.Title's exact EqualFold check, so this candidate is ineligible --
+	// but it's still the only, and therefore top-scoring, candidate.
+	candidate := domain.Candidate{ID: "only-candidate", Title: "Blue Mountain State the Rise of Thadland", Year: 2016}
+
+	best, score, cutoff, ok := scoring.Best(info, []domain.Candidate{candidate})
+
+	if !ok {
+		t.Fatalf("Best(...) ok = false, want true")
+	}
+	if best.ID != candidate.ID {
+		t.Errorf("Best(...) = %q, want %q", best.ID, candidate.ID)
+	}
+	if want := 32; score != want { // year matches (32), title doesn't (0)
+		t.Errorf("Best(...) score = %d, want %d", score, want)
+	}
+	if want := 64 + 32; cutoff != want { // movie cutoff: title + year
+		t.Errorf("Best(...) cutoff = %d, want %d", cutoff, want)
+	}
+	if score >= cutoff {
+		t.Errorf("score %d >= cutoff %d, want the candidate to actually miss", score, cutoff)
+	}
+}
+
+func TestBest_PicksHighestRawScoreAmongMultipleIneligibleCandidates(t *testing.T) {
+	info := scoring.Info{ContentType: media.Movie, Title: "Arrival", Year: 2016}
+	worse := domain.Candidate{ID: "worse", Title: "Wrong Title", Year: 1999}
+	better := domain.Candidate{ID: "better", Title: "Wrong Title", Year: 2016}
+
+	best, score, _, ok := scoring.Best(info, []domain.Candidate{worse, better})
+
+	if !ok {
+		t.Fatalf("Best(...) ok = false, want true")
+	}
+	if best.ID != better.ID {
+		t.Errorf("Best(...) = %q, want %q (matches year, the higher-scoring signal)", best.ID, better.ID)
+	}
+	if want := 32; score != want {
+		t.Errorf("Best(...) score = %d, want %d", score, want)
+	}
+}
+
+func TestBest_EmptyCandidatesReturnsNotOk(t *testing.T) {
+	info := scoring.Info{ContentType: media.Movie, Title: "Arrival", Year: 2016}
+
+	_, _, _, ok := scoring.Best(info, nil)
+
+	if ok {
+		t.Errorf("Best(...) ok = true, want false: no candidates to report")
+	}
+}
+
+func TestBest_EligibleCandidateStillReportedWithOkTrue(t *testing.T) {
+	info := scoring.Info{ContentType: media.Movie, Title: "Arrival", Year: 2016}
+	match := domain.Candidate{ID: "match", Title: "Arrival", Year: 2016}
+
+	best, score, cutoff, ok := scoring.Best(info, []domain.Candidate{match})
+
+	if !ok {
+		t.Fatalf("Best(...) ok = false, want true")
+	}
+	if best.ID != match.ID {
+		t.Errorf("Best(...) = %q, want %q", best.ID, match.ID)
+	}
+	if score < cutoff {
+		t.Errorf("score %d < cutoff %d, want an eligible candidate to clear it", score, cutoff)
+	}
+}

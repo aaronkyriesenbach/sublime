@@ -55,15 +55,35 @@ func cosmeticScore(weight int, videoValue, candidateValue string) int {
 // broken in favor of the first candidate reaching the winning score, in
 // candidates' original order.
 func Select(info Info, candidates []domain.Candidate) (best domain.Candidate, ok bool) {
-	bestScore := -1
+	best, _, _, ok = bestOf(info, candidates, true)
+	return best, ok
+}
+
+// Best returns the highest-raw-scoring Candidate among candidates
+// regardless of eligibility, along with its score and the cutoff it needed
+// to clear (see identityCutoff). ok is false only when candidates is empty.
+// Callers use this for diagnostics when Select finds nothing eligible — it
+// surfaces exactly what was decoded and how close it came, instead of just
+// "no candidate".
+func Best(info Info, candidates []domain.Candidate) (best domain.Candidate, score, cutoff int, ok bool) {
+	return bestOf(info, candidates, false)
+}
+
+// bestOf is the shared scoring loop behind Select and Best. When
+// eligibleOnly is true, ineligible candidates are skipped entirely
+// (Select's contract); when false, every candidate is considered by raw
+// score alone (Best's contract).
+func bestOf(info Info, candidates []domain.Candidate, eligibleOnly bool) (best domain.Candidate, bestScore, cutoff int, ok bool) {
+	cutoff = identityCutoff(info)
+	bestScore = -1
 	for _, candidate := range candidates {
 		score, eligible := Score(info, candidate)
-		if !eligible {
+		if eligibleOnly && !eligible {
 			continue
 		}
 		if score > bestScore {
 			best, bestScore, ok = candidate, score, true
 		}
 	}
-	return best, ok
+	return best, bestScore, cutoff, ok
 }

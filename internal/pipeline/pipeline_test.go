@@ -1047,6 +1047,114 @@ func TestPipeline_LogsStatusChangeForNoCandidate(t *testing.T) {
 	}
 }
 
+// TestPipeline_LogsProviderSearchCandidateCount guards the debug-level
+// per-search signal from docs/subdl-smoke-test-findings.md: every Search
+// call must log its candidate count, so "the Provider found nothing" and
+// "the Provider found candidates that all missed" are distinguishable from
+// GET /status' single no_candidate outcome without an out-of-band request.
+func TestPipeline_LogsProviderSearchCandidateCount(t *testing.T) {
+	libDir := t.TempDir()
+	videoName := "Test.Movie.2024.HDTV.x264-FAKEGROUP.mp4"
+	videoPath := filepath.Join(libDir, videoName)
+	writeVideoFixture(t, videoPath)
+
+	st := openTestStore(t)
+	fakeProvider := &provider.Fake{
+		SearchFunc: func(ctx context.Context, q provider.Query) ([]domain.Candidate, error) {
+			return []domain.Candidate{
+				{ID: "a", Title: "Wrong Title", Year: 1999},
+				{ID: "b", Title: "Also Wrong", Year: 1998},
+			}, nil
+		},
+	}
+
+	lib := domain.Library{
+		Name:       "test-library",
+		Path:       libDir,
+		Languages:  []language.Tag{language.English},
+		StripScope: domain.StripScopeAll,
+	}
+
+	var logBuf bytes.Buffer
+	p := &pipeline.Pipeline{
+		Store:      st,
+		Provider:   fakeProvider,
+		SyncEngine: &syncengine.FakeSyncEngine{},
+		Stripper:   &pipeline.FakeStripper{},
+		Logger:     slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug})),
+	}
+
+	ctx := context.Background()
+	if _, err := p.Run(ctx, lib); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	dispatchPending(t, ctx, p, st, lib)
+
+	logOutput := logBuf.String()
+	for _, want := range []string{
+		"level=DEBUG", `msg="provider search"`, "provider=test-provider",
+		"path=" + videoPath, "language=en", "candidates=2",
+	} {
+		if !strings.Contains(logOutput, want) {
+			t.Errorf("log output = %q, want it to contain %q", logOutput, want)
+		}
+	}
+}
+
+// TestPipeline_LogsScoringMissTopCandidate guards the other half of the
+// same debug signal: when nothing clears the eligibility cutoff, the log
+// must carry the top-scoring miss's decoded identity fields and its score
+// vs. cutoff — the exact data docs/subdl-smoke-test-findings.md says would
+// have made the punctuation/title mismatch and wire-format bugs immediate
+// instead of requiring a manual curl diff.
+func TestPipeline_LogsScoringMissTopCandidate(t *testing.T) {
+	libDir := t.TempDir()
+	videoName := "Test.Movie.2024.HDTV.x264-FAKEGROUP.mp4"
+	videoPath := filepath.Join(libDir, videoName)
+	writeVideoFixture(t, videoPath)
+
+	st := openTestStore(t)
+	fakeProvider := &provider.Fake{
+		SearchFunc: func(ctx context.Context, q provider.Query) ([]domain.Candidate, error) {
+			return []domain.Candidate{{ID: "wrong-candidate", Title: "Wrong Title", Year: 1999}}, nil
+		},
+	}
+
+	lib := domain.Library{
+		Name:       "test-library",
+		Path:       libDir,
+		Languages:  []language.Tag{language.English},
+		StripScope: domain.StripScopeAll,
+	}
+
+	var logBuf bytes.Buffer
+	p := &pipeline.Pipeline{
+		Store:      st,
+		Provider:   fakeProvider,
+		SyncEngine: &syncengine.FakeSyncEngine{},
+		Stripper:   &pipeline.FakeStripper{},
+		Logger:     slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug})),
+	}
+
+	ctx := context.Background()
+	if _, err := p.Run(ctx, lib); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	dispatchPending(t, ctx, p, st, lib)
+
+	logOutput := logBuf.String()
+	for _, want := range []string{
+		"level=DEBUG", `msg="scoring miss"`, "provider=test-provider",
+		"path=" + videoPath, "language=en",
+		`top_title="Wrong Title"`, "top_year=1999", "top_season=0", "top_episode=0",
+		"score=0", "cutoff=96",
+	} {
+		if !strings.Contains(logOutput, want) {
+			t.Errorf("log output = %q, want it to contain %q", logOutput, want)
+		}
+	}
+}
+
 // TestPipeline_TransitionsPendingToInProgressToSynced guards the state
 // machine's normal path: dispatching a (file, language) pair transitions
 // it to In Progress before its Marker gate check, then to Synced on

@@ -513,6 +513,7 @@ func (p *Pipeline) processFile(
 		}
 		return ProcessResult{Outcome: OutcomeFailed, Err: fmt.Errorf("searching provider: %w", err)}
 	}
+	p.logger().Debug("provider search", "provider", providerName, "library", lib.Name, "path", videoPath, "language", lang.String(), "candidates", len(candidates))
 
 	info, parseErr := scoring.Parse(filepath.Base(videoPath))
 	if parseErr != nil {
@@ -524,6 +525,11 @@ func (p *Pipeline) processFile(
 
 	best, ok := scoring.Select(info, candidates)
 	if !ok {
+		if topMiss, score, cutoff, found := scoring.Best(info, candidates); found {
+			p.logger().Debug("scoring miss", "provider", providerName, "library", lib.Name, "path", videoPath, "language", lang.String(),
+				"top_title", topMiss.Title, "top_year", topMiss.Year, "top_season", topMiss.Season, "top_episode", topMiss.Episode,
+				"score", score, "cutoff", cutoff)
+		}
 		if err := p.Store.RecordProviderMiss(ctx, file.ID, lang, providerName); err != nil {
 			return ProcessResult{Outcome: OutcomeFailed, Err: fmt.Errorf("recording provider miss: %w", err)}
 		}
