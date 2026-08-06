@@ -1086,3 +1086,359 @@ func TestDispatcher_TierScopedSuspension_SingleProviderTierBehavesLikeLegacy(t *
 		t.Fatalf("expected pair to stay Pending, got %+v", file)
 	}
 }
+
+// TestDispatcher_NoCandidateMissRecordsProviderAndResetsToPending guards
+// issue #76's first acceptance criterion: a Provider's Search miss against
+// a non-final entry in the walk records that Provider's name and resets
+// the pair to Pending, rather than marking Failed.
+func TestDispatcher_NoCandidateMissRecordsProviderAndResetsToPending(t *testing.T) {
+	libDir := t.TempDir()
+	videoPath := filepath.Join(libDir, "Test.Movie.2024.HDTV.x264-FAKEGROUP.mp4")
+	writeVideoFixture(t, videoPath)
+
+	st := openTestStore(t)
+
+	// Provider 1: returns no candidate (no scoring match)
+	provider1 := &provider.Fake{
+		SearchFunc: func(ctx context.Context, q provider.Query) ([]domain.Candidate, error) {
+			return []domain.Candidate{{ID: "wrong", Title: "Wrong Title", Year: 1900}}, nil
+		},
+		SuspendedFunc: func() (time.Time, bool) {
+			return time.Time{}, false
+		},
+	}
+
+	// Provider 2: has a matching candidate (not called on first pass)
+	candidateContent := "1\n00:00:00,500 --> 00:00:01,900\nSubtitle text\n"
+	provider2Called := false
+	provider2 := &provider.Fake{
+		SearchFunc: func(ctx context.Context, q provider.Query) ([]domain.Candidate, error) {
+			provider2Called = true
+			return []domain.Candidate{{ID: "match", Title: "Test Movie", Year: 2024}}, nil
+		},
+		DownloadFunc: func(ctx context.Context, c domain.Candidate) ([]byte, error) {
+			return []byte(candidateContent), nil
+		},
+		SuspendedFunc: func() (time.Time, bool) {
+			return time.Time{}, false
+		},
+	}
+
+	lib := domain.Library{
+		Name:       "test-library",
+		Path:       libDir,
+		Languages:  []language.Tag{language.English},
+		StripScope: domain.StripScopeAll,
+	}
+
+	pipeline1 := &pipeline.Pipeline{
+		Store:      st,
+		Provider:   provider1,
+		SyncEngine: &syncengine.FakeSyncEngine{},
+		Stripper:   &pipeline.FakeStripper{},
+	}
+	pipeline2 := &pipeline.Pipeline{
+		Store:      st,
+		Provider:   provider2,
+		SyncEngine: &syncengine.FakeSyncEngine{},
+		Stripper:   &pipeline.FakeStripper{},
+	}
+
+	ctx := context.Background()
+	if _, err := pipeline1.Run(ctx, lib); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	d := &dispatcher.Dispatcher{
+		ProviderTiers: []dispatcher.ProviderTier{{
+			Providers: []dispatcher.ProviderEntry{
+				{Name: "provider1", Pipeline: pipeline1, WorkerCount: 2},
+				{Name: "provider2", Pipeline: pipeline2, WorkerCount: 2},
+			},
+		}},
+		Store:     st,
+		Libraries: []domain.Library{lib},
+	}
+
+	// First pass: provider1 misses, pair should reset to Pending
+	if err := d.RunOnce(ctx); err != nil {
+		t.Fatalf("first RunOnce: %v", err)
+	}
+
+	file, found, err := st.GetFile(ctx, lib.Name, videoPath)
+	if err != nil {
+		t.Fatalf("GetFile: %v", err)
+	}
+	if !found {
+		t.Fatal("file not found")
+	}
+	if file.Languages[0].Status == domain.StatusFailed {
+		t.Fatal("pair was marked Failed after first provider's miss; should be Pending")
+	}
+	if file.Languages[0].Status != domain.StatusPending {
+		t.Fatalf("expected Pending after provider1 miss, got %v", file.Languages[0].Status)
+	}
+
+	attempted, err := st.AttemptedProviders(ctx, file.ID, language.English)
+	if err != nil {
+		t.Fatalf("AttemptedProviders: %v", err)
+	}
+	if len(attempted) != 1 || attempted[0] != "provider1" {
+		t.Fatalf("expected [provider1], got %v", attempted)
+	}
+
+	if provider2Called {
+		t.Error("provider2 should not have been called on first pass")
+	}
+}
+
+// TestDispatcher_LaterPassRetriesWithNextProvider guards issue #76's
+// second acceptance criterion: a later dispatch pass retries a pair against
+// the next Provider after an earlier provider's miss.
+func TestDispatcher_LaterPassRetriesWithNextProvider(t *testing.T) {
+	libDir := t.TempDir()
+	videoPath := filepath.Join(libDir, "Test.Movie.2024.HDTV.x264-FAKEGROUP.mp4")
+	writeVideoFixture(t, videoPath)
+
+	st := openTestStore(t)
+
+	// Provider 1: returns no candidate
+	provider1 := &provider.Fake{
+		SearchFunc: func(ctx context.Context, q provider.Query) ([]domain.Candidate, error) {
+			return []domain.Candidate{{ID: "wrong", Title: "Wrong", Year: 1900}}, nil
+		},
+		SuspendedFunc: func() (time.Time, bool) {
+			return time.Time{}, false
+		},
+	}
+
+	// Provider 2: has a matching candidate
+	candidateContent := "1\n00:00:00,500 --> 00:00:01,900\nSubtitle text\n"
+	provider2 := &provider.Fake{
+		SearchFunc: func(ctx context.Context, q provider.Query) ([]domain.Candidate, error) {
+			return []domain.Candidate{{ID: "match", Title: "Test Movie", Year: 2024}}, nil
+		},
+		DownloadFunc: func(ctx context.Context, c domain.Candidate) ([]byte, error) {
+			return []byte(candidateContent), nil
+		},
+		SuspendedFunc: func() (time.Time, bool) {
+			return time.Time{}, false
+		},
+	}
+
+	lib := domain.Library{
+		Name:       "test-library",
+		Path:       libDir,
+		Languages:  []language.Tag{language.English},
+		StripScope: domain.StripScopeAll,
+	}
+
+	pipeline1 := &pipeline.Pipeline{
+		Store:      st,
+		Provider:   provider1,
+		SyncEngine: &syncengine.FakeSyncEngine{},
+		Stripper:   &pipeline.FakeStripper{},
+	}
+	pipeline2 := &pipeline.Pipeline{
+		Store:      st,
+		Provider:   provider2,
+		SyncEngine: &syncengine.FakeSyncEngine{},
+		Stripper:   &pipeline.FakeStripper{},
+	}
+
+	ctx := context.Background()
+	if _, err := pipeline1.Run(ctx, lib); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	d := &dispatcher.Dispatcher{
+		ProviderTiers: []dispatcher.ProviderTier{{
+			Providers: []dispatcher.ProviderEntry{
+				{Name: "provider1", Pipeline: pipeline1, WorkerCount: 2},
+				{Name: "provider2", Pipeline: pipeline2, WorkerCount: 2},
+			},
+		}},
+		Store:     st,
+		Libraries: []domain.Library{lib},
+	}
+
+	// First pass: provider1 misses
+	if err := d.RunOnce(ctx); err != nil {
+		t.Fatalf("first RunOnce: %v", err)
+	}
+
+	// Second pass: provider2 should find a match and sync
+	if err := d.RunOnce(ctx); err != nil {
+		t.Fatalf("second RunOnce: %v", err)
+	}
+
+	file, found, err := st.GetFile(ctx, lib.Name, videoPath)
+	if err != nil {
+		t.Fatalf("GetFile: %v", err)
+	}
+	if !found || file.Languages[0].Status != domain.StatusSynced {
+		t.Fatalf("expected Synced via provider2, got %+v", file.Languages)
+	}
+}
+
+// TestDispatcher_ChainExhaustedMarksFailedNoCandidate guards issue #76's
+// fourth acceptance criterion: a pair only lands on Failed(no_candidate)
+// once every configured Provider across every Tier has been searched and
+// missed - not on the first miss.
+func TestDispatcher_ChainExhaustedMarksFailedNoCandidate(t *testing.T) {
+	libDir := t.TempDir()
+	videoPath := filepath.Join(libDir, "Test.Movie.2024.HDTV.x264-FAKEGROUP.mp4")
+	writeVideoFixture(t, videoPath)
+
+	st := openTestStore(t)
+
+	// Both providers return no matching candidate
+	noMatch := &provider.Fake{
+		SearchFunc: func(ctx context.Context, q provider.Query) ([]domain.Candidate, error) {
+			return []domain.Candidate{{ID: "wrong", Title: "Wrong", Year: 1900}}, nil
+		},
+		SuspendedFunc: func() (time.Time, bool) {
+			return time.Time{}, false
+		},
+	}
+
+	lib := domain.Library{
+		Name:       "test-library",
+		Path:       libDir,
+		Languages:  []language.Tag{language.English},
+		StripScope: domain.StripScopeAll,
+	}
+
+	pipeline1 := &pipeline.Pipeline{
+		Store:      st,
+		Provider:   noMatch,
+		SyncEngine: &syncengine.FakeSyncEngine{},
+		Stripper:   &pipeline.FakeStripper{},
+	}
+	pipeline2 := &pipeline.Pipeline{
+		Store:      st,
+		Provider:   noMatch,
+		SyncEngine: &syncengine.FakeSyncEngine{},
+		Stripper:   &pipeline.FakeStripper{},
+	}
+
+	ctx := context.Background()
+	if _, err := pipeline1.Run(ctx, lib); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	d := &dispatcher.Dispatcher{
+		ProviderTiers: []dispatcher.ProviderTier{{
+			Providers: []dispatcher.ProviderEntry{
+				{Name: "provider1", Pipeline: pipeline1, WorkerCount: 2},
+				{Name: "provider2", Pipeline: pipeline2, WorkerCount: 2},
+			},
+		}},
+		Store:     st,
+		Libraries: []domain.Library{lib},
+	}
+
+	// First pass: provider1 misses, pair should stay Pending
+	if err := d.RunOnce(ctx); err != nil {
+		t.Fatalf("first RunOnce: %v", err)
+	}
+
+	file, found, err := st.GetFile(ctx, lib.Name, videoPath)
+	if err != nil {
+		t.Fatalf("GetFile after first pass: %v", err)
+	}
+	if !found || file.Languages[0].Status != domain.StatusPending {
+		t.Fatalf("after first pass: expected Pending, got %+v", file.Languages)
+	}
+
+	// Second pass: provider2 misses, pair should now be Failed(no_candidate)
+	if err := d.RunOnce(ctx); err != nil {
+		t.Fatalf("second RunOnce: %v", err)
+	}
+
+	file, found, err = st.GetFile(ctx, lib.Name, videoPath)
+	if err != nil {
+		t.Fatalf("GetFile after second pass: %v", err)
+	}
+	if !found {
+		t.Fatal("file not found")
+	}
+	if file.Languages[0].Status != domain.StatusFailed {
+		t.Fatalf("after second pass: expected Failed, got %v", file.Languages[0].Status)
+	}
+	if file.Languages[0].FailureReason != domain.FailureNoCandidate {
+		t.Fatalf("expected reason no_candidate, got %v", file.Languages[0].FailureReason)
+	}
+}
+
+// TestDispatcher_SingleProviderMissIsImmediatelyTerminal guards issue #76's
+// fifth acceptance criterion: a single-Provider (no chain / one-Tier-one-
+// Provider) configuration is unaffected in observable outcome - a miss is
+// still immediately terminal.
+func TestDispatcher_SingleProviderMissIsImmediatelyTerminal(t *testing.T) {
+	libDir := t.TempDir()
+	videoPath := filepath.Join(libDir, "Test.Movie.2024.HDTV.x264-FAKEGROUP.mp4")
+	writeVideoFixture(t, videoPath)
+
+	st := openTestStore(t)
+
+	// Single provider that returns no matching candidate
+	noMatch := &provider.Fake{
+		SearchFunc: func(ctx context.Context, q provider.Query) ([]domain.Candidate, error) {
+			return []domain.Candidate{{ID: "wrong", Title: "Wrong", Year: 1900}}, nil
+		},
+		SuspendedFunc: func() (time.Time, bool) {
+			return time.Time{}, false
+		},
+	}
+
+	lib := domain.Library{
+		Name:       "test-library",
+		Path:       libDir,
+		Languages:  []language.Tag{language.English},
+		StripScope: domain.StripScopeAll,
+	}
+
+	p := &pipeline.Pipeline{
+		Store:      st,
+		Provider:   noMatch,
+		SyncEngine: &syncengine.FakeSyncEngine{},
+		Stripper:   &pipeline.FakeStripper{},
+	}
+
+	ctx := context.Background()
+	if _, err := p.Run(ctx, lib); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	// Single-Provider Tier
+	d := &dispatcher.Dispatcher{
+		ProviderTiers: []dispatcher.ProviderTier{{
+			Providers: []dispatcher.ProviderEntry{
+				{Name: "provider", Pipeline: p, WorkerCount: 2},
+			},
+		}},
+		Store:     st,
+		Libraries: []domain.Library{lib},
+	}
+
+	// Single pass should immediately land on Failed(no_candidate)
+	if err := d.RunOnce(ctx); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+
+	file, found, err := st.GetFile(ctx, lib.Name, videoPath)
+	if err != nil {
+		t.Fatalf("GetFile: %v", err)
+	}
+	if !found {
+		t.Fatal("file not found")
+	}
+	t.Logf("DEBUG: Status=%v, FailureReason=%v", file.Languages[0].Status, file.Languages[0].FailureReason)
+	if file.Languages[0].Status != domain.StatusFailed {
+		t.Fatalf("expected Failed, got %v", file.Languages[0].Status)
+	}
+	if file.Languages[0].FailureReason != domain.FailureNoCandidate {
+		t.Fatalf("expected reason no_candidate, got %v", file.Languages[0].FailureReason)
+	}
+}

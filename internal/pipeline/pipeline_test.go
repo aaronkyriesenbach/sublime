@@ -77,11 +77,24 @@ func dispatchPending(t *testing.T, ctx context.Context, p *pipeline.Pipeline, st
 		if pair.LibraryName != lib.Name {
 			continue
 		}
-		// ProcessPending's error return also carries expected, already-
-		// recorded outcomes (e.g. a Provider error landing the pair on
-		// StatusFailed) — callers assert against the resulting Store state,
-		// not this error, so it's deliberately not t.Fatal'd here.
-		_ = p.ProcessPending(ctx, lib, pair.FileID, pair.ContentHash, pair.Path, pair.Language, pair.Force)
+		result := p.ProcessPending(ctx, lib, pair.FileID, pair.ContentHash, pair.Path, pair.Language, pair.Force, "test-provider")
+
+		// For single-provider tests, a no-candidate miss means exhaustion:
+		// mark failed and log through p.Logger to match real Dispatcher behavior.
+		if result.Outcome == pipeline.OutcomeNoCandidateMiss {
+			if err := st.MarkFailed(ctx, pair.FileID, pair.Language, domain.FailureNoCandidate); err != nil {
+				t.Fatalf("MarkFailed: %v", err)
+			}
+			if p.Logger != nil {
+				p.Logger.Warn("status changed",
+					"library", lib.Name,
+					"path", pair.Path,
+					"language", pair.Language.String(),
+					"from", "in_progress",
+					"to", "failed",
+					"reason", "no_candidate")
+			}
+		}
 	}
 }
 
@@ -548,8 +561,9 @@ func TestPipeline_ClaimLostSkipsWithoutError(t *testing.T) {
 		Logger:     slog.New(slog.NewTextHandler(&syncedWriter{mu: &logMu, buf: &logBuf}, nil)),
 	}
 
-	if err := p.ProcessPending(ctx, lib, file.ID, string(hash), videoPath, en, false); err != nil {
-		t.Fatalf("ProcessPending: %v", err)
+	result := p.ProcessPending(ctx, lib, file.ID, string(hash), videoPath, en, false, "test-provider")
+	if result.Err != nil {
+		t.Fatalf("ProcessPending: %v", result.Err)
 	}
 
 	logMu.Lock()
