@@ -25,7 +25,7 @@ type PacerConfig struct {
 // than guessing at a status that was never observed.
 type Outcome struct {
 	Responded bool
-	Retryable bool        // true on a 429/5xx response
+	Retryable bool          // true on a 429/5xx response
 	DelayHint time.Duration // a Provider-supplied delay hint (e.g. Retry-After), zero if absent
 }
 

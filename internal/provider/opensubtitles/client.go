@@ -84,43 +84,43 @@ func (c *client) newRequest(ctx context.Context, method, path string, body any, 
 	return req, nil
 }
 
-	// do sends a single JSON request through the retry.Pacer and decodes a
-	// successful response into out (ignored if nil). It is an internal
-	// plumbing helper: doJSON is the typed entry point every caller outside
-	// this file actually uses. body and out are any here only because that is
-	// encoding/json's own Marshal/Unmarshal contract (as in the standard
-	// library, there is no way to call them without it) — doJSON's type
-	// parameters are what keep every real call site fully typed.
-	func (c *client) do(ctx context.Context, method, path string, body any, bearer string, out any) error {
-		return c.pacer.Do(ctx, func(ctx context.Context) (retry.Outcome, error) {
-			req, err := c.newRequest(ctx, method, path, body, bearer)
-			if err != nil {
-				return retry.Outcome{}, err
-			}
+// do sends a single JSON request through the retry.Pacer and decodes a
+// successful response into out (ignored if nil). It is an internal
+// plumbing helper: doJSON is the typed entry point every caller outside
+// this file actually uses. body and out are any here only because that is
+// encoding/json's own Marshal/Unmarshal contract (as in the standard
+// library, there is no way to call them without it) — doJSON's type
+// parameters are what keep every real call site fully typed.
+func (c *client) do(ctx context.Context, method, path string, body any, bearer string, out any) error {
+	return c.pacer.Do(ctx, func(ctx context.Context) (retry.Outcome, error) {
+		req, err := c.newRequest(ctx, method, path, body, bearer)
+		if err != nil {
+			return retry.Outcome{}, err
+		}
 
-			resp, err := c.httpClient.Do(req)
-			if err != nil {
-				return retry.Outcome{}, err
-			}
-			defer func() { _ = resp.Body.Close() }()
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			return retry.Outcome{}, err
+		}
+		defer func() { _ = resp.Body.Close() }()
 
-			data, err := io.ReadAll(resp.Body)
-			if err != nil {
-				return retry.Outcome{Responded: true}, fmt.Errorf("opensubtitles: reading response from %s: %w", path, err)
-			}
+		data, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return retry.Outcome{Responded: true}, fmt.Errorf("opensubtitles: reading response from %s: %w", path, err)
+		}
 
-			oc, classifyErr := classifyResponse(resp.StatusCode, data, resp.Header, c.now())
-			if classifyErr != nil {
-				return oc, classifyErr
+		oc, classifyErr := classifyResponse(resp.StatusCode, data, resp.Header, c.now())
+		if classifyErr != nil {
+			return oc, classifyErr
+		}
+		if out != nil && len(data) > 0 {
+			if err := json.Unmarshal(data, out); err != nil {
+				return oc, fmt.Errorf("opensubtitles: decoding response from %s: %w", path, err)
 			}
-			if out != nil && len(data) > 0 {
-				if err := json.Unmarshal(data, out); err != nil {
-					return oc, fmt.Errorf("opensubtitles: decoding response from %s: %w", path, err)
-				}
-			}
-			return oc, nil
-		})
-	}
+		}
+		return oc, nil
+	})
+}
 
 // doJSON is the typed entry point for a single JSON request: body is a
 // pointer to the request's own wire-format type (nil for a bodyless
@@ -143,37 +143,37 @@ func doJSON[Req any, Resp any](ctx context.Context, c *client, method, path stri
 	return out, err
 }
 
-	// getRaw fetches path (an absolute URL, e.g. a signed download link)
-	// through the retry.Pacer and returns its raw response body.
-	func (c *client) getRaw(ctx context.Context, absoluteURL string) ([]byte, error) {
-		var data []byte
-		err := c.pacer.Do(ctx, func(ctx context.Context) (retry.Outcome, error) {
-			req, err := http.NewRequestWithContext(ctx, http.MethodGet, absoluteURL, nil)
-			if err != nil {
-				return retry.Outcome{}, err
-			}
-			req.Header.Set("User-Agent", c.userAgent)
+// getRaw fetches path (an absolute URL, e.g. a signed download link)
+// through the retry.Pacer and returns its raw response body.
+func (c *client) getRaw(ctx context.Context, absoluteURL string) ([]byte, error) {
+	var data []byte
+	err := c.pacer.Do(ctx, func(ctx context.Context) (retry.Outcome, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, absoluteURL, nil)
+		if err != nil {
+			return retry.Outcome{}, err
+		}
+		req.Header.Set("User-Agent", c.userAgent)
 
-			resp, err := c.httpClient.Do(req)
-			if err != nil {
-				return retry.Outcome{}, err
-			}
-			defer func() { _ = resp.Body.Close() }()
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			return retry.Outcome{}, err
+		}
+		defer func() { _ = resp.Body.Close() }()
 
-			body, err := io.ReadAll(resp.Body)
-			if err != nil {
-				return retry.Outcome{Responded: true}, fmt.Errorf("opensubtitles: reading downloaded subtitle: %w", err)
-			}
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return retry.Outcome{Responded: true}, fmt.Errorf("opensubtitles: reading downloaded subtitle: %w", err)
+		}
 
-			oc, classifyErr := classifyResponse(resp.StatusCode, body, resp.Header, c.now())
-			if classifyErr != nil {
-				return oc, classifyErr
-			}
-			data = body
-			return oc, nil
-		})
-		return data, err
-	}
+		oc, classifyErr := classifyResponse(resp.StatusCode, body, resp.Header, c.now())
+		if classifyErr != nil {
+			return oc, classifyErr
+		}
+		data = body
+		return oc, nil
+	})
+	return data, err
+}
 
 // classifyResponse turns a completed HTTP response into the retry.Pacer outcome
 // to record and the error the caller should see: nil on 2xx, a
