@@ -4,24 +4,30 @@
 // Sublime falls back to when OpenSubtitles has no Candidate, or is
 // currently Suspended for quota exhaustion.
 //
-// This package covers only the happy path (issue #69): mapping a
-// provider.Query to SubDL's /subtitles search params, converting results
-// into domain.Candidates via the shared cosmetics parser
+// This package covers the happy path (issue #69): mapping a provider.Query
+// to SubDL's /subtitles search params, converting results into
+// domain.Candidates via the shared cosmetics parser
 // (internal/provider.ParseCosmetics), and downloading a Candidate's raw
 // subtitle bytes via either SubDL's anonymous per-IP path or its
-// authenticated/paid path, selected by Config.Paid alone (see ADR 0006).
-// Quota-exhaustion detection and Provider Suspension (ADR 0007) are a
-// separate, later ticket (issue #70).
+// authenticated/paid path, selected by Config.Paid alone (see ADR 0006) —
+// plus quota-exhaustion detection and Provider Suspension (issue #70, ADR
+// 0007): the one documented shape, 429 + {"error":"quota_exceeded"}, from
+// either Search or an authenticated Download, suspends the Provider until
+// its resume time, short-circuiting further Search/Download calls until
+// then. The anonymous download path's undocumented rejection shape is
+// deliberately excluded from this detection (ADR 0007).
 package subdl
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/text/language"
@@ -85,6 +91,15 @@ type Config struct {
 	// await delays; defaults to retry.RealClock{}. Tests inject a fake
 	// that records requested delays instead of sleeping.
 	Clock retry.Clock
+
+	// Now overrides the wall clock used for quota-suspension bookkeeping;
+	// defaults to time.Now.
+	Now func() time.Time
+
+	// Logger receives the Provider's own quota-suspension transition logs
+	// (entering and resuming); defaults to slog.Default() if nil,
+	// mirroring opensubtitles.Config.Logger's convention.
+	Logger *slog.Logger
 }
 
 // Provider is Sublime's real SubDL Provider.
@@ -93,6 +108,11 @@ type Provider struct {
 	executor *retry.Executor
 	apiKey   string
 	paid     bool
+	now      func() time.Time
+	log      *slog.Logger
+
+	mu             sync.Mutex
+	suspendedUntil time.Time
 }
 
 var _ provider.Provider = (*Provider)(nil)
@@ -123,6 +143,10 @@ func New(cfg Config) (*Provider, error) {
 	if clock == nil {
 		clock = retry.RealClock{}
 	}
+	now := cfg.Now
+	if now == nil {
+		now = time.Now
+	}
 
 	pacerCfg := retry.PacerConfig{Pace: pace, MaxDelay: defaultMaxDelay, DecayThreshold: defaultDecayThreshold}
 	c := &client{
@@ -130,6 +154,7 @@ func New(cfg Config) (*Provider, error) {
 		userAgent:  userAgent,
 		httpClient: httpClient,
 		pacer:      retry.NewPacer(pacerCfg, clock),
+		now:        now,
 	}
 
 	return &Provider{
@@ -137,7 +162,84 @@ func New(cfg Config) (*Provider, error) {
 		executor: retry.NewExecutor(clock),
 		apiKey:   cfg.APIKey,
 		paid:     cfg.Paid,
+		now:      now,
+		log:      cfg.Logger,
 	}, nil
+}
+
+// logger returns p.log, or slog.Default() if it isn't set.
+func (p *Provider) logger() *slog.Logger {
+	if p.log != nil {
+		return p.log
+	}
+	return slog.Default()
+}
+
+// suspendedError returns the quota-exhaustion signal to short-circuit the
+// caller with if p is still suspended as of now, or nil if p is free to
+// make a real request. Once the suspension's resume time has passed, it
+// clears the suspension and logs the resume transition before returning
+// nil, mirroring opensubtitles.Provider.suspendedError.
+func (p *Provider) suspendedError() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.suspendedUntil.IsZero() {
+		return nil
+	}
+	if p.now().Before(p.suspendedUntil) {
+		return &provider.QuotaExhaustedError{ResumeAt: p.suspendedUntil}
+	}
+
+	resumedAt := p.suspendedUntil
+	p.suspendedUntil = time.Time{}
+	p.logger().Info("subdl: resuming after quota suspension", "resume_at", resumedAt)
+	return nil
+}
+
+// Suspension reports p's current quota-suspension state: resumeAt is when
+// p will resume issuing real requests, and suspended is whether p is
+// currently in that state as of now. It implements the optional
+// suspension-reporting capability internal/pipeline's production wiring
+// type-asserts for (see pipeline.NewProduction's suspensionReporter),
+// mirroring opensubtitles.Provider.Suspension.
+func (p *Provider) Suspension() (resumeAt time.Time, suspended bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.suspendedUntil.IsZero() || !p.now().Before(p.suspendedUntil) {
+		return time.Time{}, false
+	}
+	return p.suspendedUntil, true
+}
+
+// suspend enters the Suspended state until resumeAt and returns the
+// provider.QuotaExhaustedError callers should see, wrapping cause so it
+// stays inspectable via errors.As/Is.
+func (p *Provider) suspend(cause error, resumeAt time.Time) error {
+	p.mu.Lock()
+	p.suspendedUntil = resumeAt
+	p.mu.Unlock()
+
+	p.logger().Warn("subdl: suspending due to quota exhaustion", "cause", cause, "resume_at", resumeAt)
+	return &provider.QuotaExhaustedError{ResumeAt: resumeAt, Cause: cause}
+}
+
+// quotaOrWrap inspects err for SubDL's one recognized quota-exhaustion
+// shape (quotaExhaustion) and, if found, suspends p and returns the
+// provider.QuotaExhaustedError to surface; otherwise it returns ok=false so
+// the caller applies its own (non-quota) error handling. Callers on the
+// anonymous download path must not call this at all (ADR 0007).
+func (p *Provider) quotaOrWrap(err error) (wrapped error, ok bool) {
+	var apiErr *apiError
+	if !errors.As(err, &apiErr) {
+		return nil, false
+	}
+	resumeAt, exhausted := quotaExhaustion(apiErr)
+	if !exhausted {
+		return nil, false
+	}
+	return p.suspend(apiErr, resumeAt), true
 }
 
 // Search implements provider.Provider. It maps query to SubDL's
@@ -145,6 +247,10 @@ func New(cfg Config) (*Provider, error) {
 // episode_number, and a translated languages value — never full_season or
 // unpack, since SubDL season-pack results aren't supported (issue #69).
 func (p *Provider) Search(ctx context.Context, query provider.Query) ([]domain.Candidate, error) {
+	if err := p.suspendedError(); err != nil {
+		return nil, err
+	}
+
 	params := url.Values{}
 	params.Set("api_key", p.apiKey)
 	if query.Title != "" {
@@ -171,6 +277,9 @@ func (p *Provider) Search(ctx context.Context, query provider.Query) ([]domain.C
 	}
 	resp, err := retry.Do(ctx, p.executor, op)
 	if err != nil {
+		if wrapped, ok := p.quotaOrWrap(err); ok {
+			return nil, wrapped
+		}
 		return nil, fmt.Errorf("subdl: search: %w", err)
 	}
 	return candidatesFromResponse(resp), nil
@@ -180,8 +289,15 @@ func (p *Provider) Search(ctx context.Context, query provider.Query) ([]domain.C
 // authenticated/paid download path) only when Config.Paid is true;
 // otherwise the key is omitted entirely, using SubDL's anonymous per-IP
 // download path (ADR 0006). This choice is fixed by config, never
-// runtime-detected or retried across paths.
+// runtime-detected or retried across paths. Quota-exhaustion detection
+// (quotaOrWrap) only ever applies to the paid path: the anonymous path's
+// rejection response has no documented shape and must never be
+// pattern-matched into a Provider Suspension (ADR 0007).
 func (p *Provider) Download(ctx context.Context, candidate domain.Candidate) ([]byte, error) {
+	if err := p.suspendedError(); err != nil {
+		return nil, err
+	}
+
 	nID, fileNID, err := parseCandidateID(candidate.ID)
 	if err != nil {
 		return nil, fmt.Errorf("subdl: %w", err)
@@ -200,6 +316,11 @@ func (p *Provider) Download(ctx context.Context, candidate domain.Candidate) ([]
 	}
 	data, err := retry.Do(ctx, p.executor, op)
 	if err != nil {
+		if p.paid {
+			if wrapped, ok := p.quotaOrWrap(err); ok {
+				return nil, wrapped
+			}
+		}
 		return nil, fmt.Errorf("subdl: download: %w", err)
 	}
 	return data, nil

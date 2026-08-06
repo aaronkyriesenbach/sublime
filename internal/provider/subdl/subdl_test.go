@@ -2,6 +2,7 @@ package subdl_test
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/url"
 	"testing"
@@ -32,6 +33,7 @@ func newTestProvider(t *testing.T, mock *mockServer, clock *fakeClock, paid bool
 		Paid:    paid,
 		BaseURL: mock.URL(),
 		Clock:   clock,
+		Now:     func() time.Time { return time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC) },
 	})
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
@@ -373,5 +375,206 @@ func TestSearch_NonRetryableClientError_FailsImmediately(t *testing.T) {
 	}
 	if len(clock.delays) != 0 {
 		t.Errorf("recorded delays = %v, want none (400 is terminal, not retried)", clock.delays)
+	}
+}
+
+// --- Quota exhaustion / Suspension (ADR 0006/0007, issue #70) ---
+
+func quotaExceededHandler() func(w http.ResponseWriter, r *http.Request) {
+	return jsonHandler(http.StatusTooManyRequests, map[string]any{"status": false, "error": "quota_exceeded"})
+}
+
+// TestSearch_QuotaExhausted_429WithResetHeader covers ADR 0007's one
+// recognized shape from a search request: a 429 with
+// {"error":"quota_exceeded"}, with ResumeAt parsed from X-RateLimit-Reset.
+func TestSearch_QuotaExhausted_429WithResetHeader(t *testing.T) {
+	mock := newMockServer(t)
+	mock.on(http.MethodGet, "/subtitles", withHeader("X-RateLimit-Reset", "1767225600", quotaExceededHandler()))
+
+	clock := &fakeClock{}
+	p := newTestProvider(t, mock, clock, false)
+
+	_, err := p.Search(context.Background(), provider.Query{Title: "Arrival", Year: 2016})
+
+	var quotaErr *provider.QuotaExhaustedError
+	if !errors.As(err, &quotaErr) {
+		t.Fatalf("Search() error = %v, want a *provider.QuotaExhaustedError", err)
+	}
+	if want := time.Unix(1767225600, 0).UTC(); !quotaErr.ResumeAt.Equal(want) {
+		t.Errorf("ResumeAt = %v, want %v", quotaErr.ResumeAt, want)
+	}
+
+	// Quota exhaustion is terminal: no retry attempts.
+	if reqs := mock.requestsFor(http.MethodGet, "/subtitles"); len(reqs) != 1 {
+		t.Errorf("got %d /subtitles requests, want 1 (no retry on quota exhaustion)", len(reqs))
+	}
+	if len(clock.delays) != 0 {
+		t.Errorf("recorded delays = %v, want none", clock.delays)
+	}
+}
+
+// TestSearch_QuotaExhausted_NoResetHeader_FallsBackToNextUTCMidnight covers
+// ADR 0007's fallback: a calendar-day reset, not a flat duration.
+func TestSearch_QuotaExhausted_NoResetHeader_FallsBackToNextUTCMidnight(t *testing.T) {
+	mock := newMockServer(t)
+	mock.on(http.MethodGet, "/subtitles", quotaExceededHandler())
+
+	clock := &fakeClock{}
+	p := newTestProvider(t, mock, clock, false) // newTestProvider's fixed Now is 2026-01-01T00:00:00Z
+
+	_, err := p.Search(context.Background(), provider.Query{Title: "Arrival", Year: 2016})
+
+	var quotaErr *provider.QuotaExhaustedError
+	if !errors.As(err, &quotaErr) {
+		t.Fatalf("Search() error = %v, want a *provider.QuotaExhaustedError", err)
+	}
+	if want := time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC); !quotaErr.ResumeAt.Equal(want) {
+		t.Errorf("ResumeAt = %v, want %v (next UTC midnight)", quotaErr.ResumeAt, want)
+	}
+}
+
+// TestDownload_Paid_QuotaExhausted_429WithResetHeader covers ADR 0007's
+// documented shape from an authenticated download request.
+func TestDownload_Paid_QuotaExhausted_429WithResetHeader(t *testing.T) {
+	mock := newMockServer(t)
+	mock.on(http.MethodGet, "/download", withHeader("X-RateLimit-Reset", "1767225600", quotaExceededHandler()))
+
+	clock := &fakeClock{}
+	p := newTestProvider(t, mock, clock, true)
+
+	_, err := p.Download(context.Background(), domain.Candidate{ID: "1234-1"})
+
+	var quotaErr *provider.QuotaExhaustedError
+	if !errors.As(err, &quotaErr) {
+		t.Fatalf("Download() error = %v, want a *provider.QuotaExhaustedError", err)
+	}
+	if want := time.Unix(1767225600, 0).UTC(); !quotaErr.ResumeAt.Equal(want) {
+		t.Errorf("ResumeAt = %v, want %v", quotaErr.ResumeAt, want)
+	}
+}
+
+// TestDownload_Anonymous_NonQuotaShapeNeverSuspends is ADR 0007's explicit
+// scope boundary: the anonymous download path's rejection response has no
+// documented shape and must never be pattern-matched into a
+// provider.QuotaExhaustedError, even one shaped exactly like the
+// documented quota_exceeded response -- it's just an ordinary Download
+// error for that one (file, language) pair.
+func TestDownload_Anonymous_NonQuotaShapeNeverSuspends(t *testing.T) {
+	mock := newMockServer(t)
+	mock.on(http.MethodGet, "/download", quotaExceededHandler())
+
+	clock := &fakeClock{}
+	p := newTestProvider(t, mock, clock, false)
+
+	_, err := p.Download(context.Background(), domain.Candidate{ID: "1234-1"})
+	if err == nil {
+		t.Fatal("expected an error for a 429 anonymous download response")
+	}
+
+	var quotaErr *provider.QuotaExhaustedError
+	if errors.As(err, &quotaErr) {
+		t.Fatalf("Download() error = %v, want an ordinary error, not a *provider.QuotaExhaustedError", err)
+	}
+	if resumeAt, suspended := p.Suspension(); suspended {
+		t.Errorf("Suspension() after anonymous rejection = (%v, %v), want suspended=false", resumeAt, suspended)
+	}
+}
+
+// TestQuotaSuspension_ShortCircuitsUntilResumeTimeThenResumes drives the
+// Provider's full Suspended lifecycle: a quota-exhaustion response
+// suspends it; a subsequent Search/Download before the resume time makes
+// no HTTP request at all and returns the same signal; once the resume
+// time passes, a further call issues a real request again.
+func TestQuotaSuspension_ShortCircuitsUntilResumeTimeThenResumes(t *testing.T) {
+	mock := newMockServer(t)
+	mock.on(http.MethodGet, "/subtitles", quotaExceededHandler())
+
+	clock := &fakeClock{}
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	p, err := subdl.New(subdl.Config{
+		APIKey:  "test-api-key",
+		BaseURL: mock.URL(),
+		Clock:   clock,
+		Now:     func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	_, err = p.Search(context.Background(), provider.Query{Title: "Arrival"})
+	var quotaErr *provider.QuotaExhaustedError
+	if !errors.As(err, &quotaErr) {
+		t.Fatalf("first Search() error = %v, want a *provider.QuotaExhaustedError", err)
+	}
+	resumeAt := quotaErr.ResumeAt
+
+	// Still before resumeAt: no handler queued for /subtitles, so a real
+	// request would fail the mock server outright.
+	now = now.Add(time.Hour)
+	_, err = p.Search(context.Background(), provider.Query{Title: "Arrival"})
+	var secondQuotaErr *provider.QuotaExhaustedError
+	if !errors.As(err, &secondQuotaErr) {
+		t.Fatalf("second Search() error = %v, want a *provider.QuotaExhaustedError", err)
+	}
+	if !secondQuotaErr.ResumeAt.Equal(resumeAt) {
+		t.Errorf("second ResumeAt = %v, want %v (unchanged while still suspended)", secondQuotaErr.ResumeAt, resumeAt)
+	}
+	if reqs := mock.requestsFor(http.MethodGet, "/subtitles"); len(reqs) != 1 {
+		t.Errorf("got %d /subtitles requests, want 1 (suspended call must not hit the network)", len(reqs))
+	}
+
+	// Past resumeAt: a real request should go out again.
+	now = resumeAt.Add(time.Minute)
+	mock.on(http.MethodGet, "/subtitles", jsonHandler(http.StatusOK, searchResponse()))
+
+	if _, err := p.Search(context.Background(), provider.Query{Title: "Arrival"}); err != nil {
+		t.Fatalf("third Search() error = %v, want success after resume time", err)
+	}
+	if reqs := mock.requestsFor(http.MethodGet, "/subtitles"); len(reqs) != 2 {
+		t.Errorf("got %d /subtitles requests, want 2 (a real request after resuming)", len(reqs))
+	}
+}
+
+// TestSuspension_ReportsSuspendedAndResumeTime covers the Provider's
+// suspensionReporter capability (internal/pipeline/production.go): a
+// not-yet-suspended Provider reports suspended=false, a live suspension
+// reports suspended=true with the resume time, and a resume time that has
+// passed reports suspended=false again.
+func TestSuspension_ReportsSuspendedAndResumeTime(t *testing.T) {
+	mock := newMockServer(t)
+	mock.on(http.MethodGet, "/subtitles", quotaExceededHandler())
+
+	clock := &fakeClock{}
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	p, err := subdl.New(subdl.Config{
+		APIKey:  "test-api-key",
+		BaseURL: mock.URL(),
+		Clock:   clock,
+		Now:     func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	if resumeAt, suspended := p.Suspension(); suspended {
+		t.Errorf("Suspension() before any exhaustion = (%v, %v), want suspended=false", resumeAt, suspended)
+	}
+
+	if _, err := p.Search(context.Background(), provider.Query{Title: "Arrival"}); err == nil {
+		t.Fatal("expected Search() to fail with quota exhaustion")
+	}
+
+	wantResumeAt := time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC)
+	resumeAt, suspended := p.Suspension()
+	if !suspended {
+		t.Fatal("Suspension() after exhaustion = suspended=false, want true")
+	}
+	if !resumeAt.Equal(wantResumeAt) {
+		t.Errorf("Suspension() resumeAt = %v, want %v", resumeAt, wantResumeAt)
+	}
+
+	now = wantResumeAt.Add(time.Minute)
+	if _, suspended := p.Suspension(); suspended {
+		t.Error("Suspension() past resume time = suspended=true, want false")
 	}
 }

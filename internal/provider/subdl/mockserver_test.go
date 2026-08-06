@@ -109,3 +109,13 @@ func rawHandler(status int, body string) func(w http.ResponseWriter, r *http.Req
 		_, _ = w.Write([]byte(body))
 	}
 }
+
+// withHeader wraps handler to also set a response header, e.g.
+// X-RateLimit-Reset on a quota-exhausted response, mirroring
+// opensubtitles' own withRetryAfter test helper.
+func withHeader(key, value string, handler func(w http.ResponseWriter, r *http.Request)) func(w http.ResponseWriter, r *http.Request) {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(key, value)
+		handler(w, r)
+	}
+}
