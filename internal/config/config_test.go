@@ -247,6 +247,13 @@ libraries:
 	if cfg.ProviderChain[0].Name != "opensubtitles" {
 		t.Errorf("expected default provider %q, got %q", "opensubtitles", cfg.ProviderChain[0].Name)
 	}
+
+	if len(cfg.ProviderTiers) != 1 {
+		t.Fatalf("expected default provider chain with 1 tier, got %d", len(cfg.ProviderTiers))
+	}
+	if tier := cfg.ProviderTiers[0].Providers; len(tier) != 1 || tier[0].Name != "opensubtitles" {
+		t.Errorf("expected default tier [opensubtitles], got %+v", tier)
+	}
 }
 
 func TestLoad_ProviderChainExplicit(t *testing.T) {
@@ -277,6 +284,152 @@ providers:
 	}
 	if cfg.ProviderChain[1].Name != "subdl" || cfg.ProviderChain[1].WorkerCount != 2 || !cfg.ProviderChain[1].Paid {
 		t.Errorf("unexpected second provider: %+v", cfg.ProviderChain[1])
+	}
+
+	if len(cfg.ProviderTiers) != 2 {
+		t.Fatalf("expected 2 tiers, got %d", len(cfg.ProviderTiers))
+	}
+	if tier := cfg.ProviderTiers[0].Providers; len(tier) != 1 || tier[0].Name != "opensubtitles" {
+		t.Errorf("expected first tier [opensubtitles], got %+v", tier)
+	}
+	if tier := cfg.ProviderTiers[1].Providers; len(tier) != 1 || tier[0].Name != "subdl" {
+		t.Errorf("expected second tier [subdl], got %+v", tier)
+	}
+}
+
+func TestLoad_ProviderChainNestedTierMultipleProviders(t *testing.T) {
+	path := writeConfig(t, `
+libraries:
+  - name: movies
+    path: /media/movies
+    languages: [en]
+providers:
+  chain: [[opensubtitles, subdl]]
+`)
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+
+	if len(cfg.ProviderChain) != 2 {
+		t.Fatalf("expected flattened chain with 2 entries, got %d", len(cfg.ProviderChain))
+	}
+	if cfg.ProviderChain[0].Name != "opensubtitles" || cfg.ProviderChain[1].Name != "subdl" {
+		t.Errorf("unexpected flattened chain order: %+v", cfg.ProviderChain)
+	}
+
+	if len(cfg.ProviderTiers) != 1 {
+		t.Fatalf("expected 1 tier, got %d", len(cfg.ProviderTiers))
+	}
+	tier := cfg.ProviderTiers[0].Providers
+	if len(tier) != 2 || tier[0].Name != "opensubtitles" || tier[1].Name != "subdl" {
+		t.Errorf("expected tier [opensubtitles, subdl] in list order, got %+v", tier)
+	}
+}
+
+func TestLoad_ProviderChainMultipleTiersMixedShape(t *testing.T) {
+	path := writeConfig(t, `
+libraries:
+  - name: movies
+    path: /media/movies
+    languages: [en]
+providers:
+  chain:
+    - [opensubtitles, subdl]
+`)
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+
+	if len(cfg.ProviderTiers) != 1 {
+		t.Fatalf("expected 1 tier, got %d", len(cfg.ProviderTiers))
+	}
+	tier := cfg.ProviderTiers[0].Providers
+	if len(tier) != 2 {
+		t.Fatalf("expected 2 providers in tier, got %d", len(tier))
+	}
+}
+
+func TestLoad_ProviderChainEmptyTierIsError(t *testing.T) {
+	path := writeConfig(t, `
+libraries:
+  - name: movies
+    path: /media/movies
+    languages: [en]
+providers:
+  chain: [[]]
+`)
+
+	_, err := config.Load(path)
+	if err == nil {
+		t.Fatal("expected an error for an empty tier, got nil")
+	}
+}
+
+func TestLoad_ProviderChainUnknownProviderNameBare(t *testing.T) {
+	path := writeConfig(t, `
+libraries:
+  - name: movies
+    path: /media/movies
+    languages: [en]
+providers:
+  chain: [not-a-real-provider]
+`)
+
+	_, err := config.Load(path)
+	if err == nil {
+		t.Fatal("expected an error for an unknown provider name, got nil")
+	}
+}
+
+func TestLoad_ProviderChainUnknownProviderNameInTier(t *testing.T) {
+	path := writeConfig(t, `
+libraries:
+  - name: movies
+    path: /media/movies
+    languages: [en]
+providers:
+  chain: [[opensubtitles, not-a-real-provider]]
+`)
+
+	_, err := config.Load(path)
+	if err == nil {
+		t.Fatal("expected an error for an unknown provider name inside a tier, got nil")
+	}
+}
+
+func TestLoad_ProviderChainDuplicateNameWithinTier(t *testing.T) {
+	path := writeConfig(t, `
+libraries:
+  - name: movies
+    path: /media/movies
+    languages: [en]
+providers:
+  chain: [[opensubtitles, opensubtitles]]
+`)
+
+	_, err := config.Load(path)
+	if err == nil {
+		t.Fatal("expected an error for a duplicate provider name within a tier, got nil")
+	}
+}
+
+func TestLoad_ProviderChainDuplicateNameAcrossTiers(t *testing.T) {
+	path := writeConfig(t, `
+libraries:
+  - name: movies
+    path: /media/movies
+    languages: [en]
+providers:
+  chain: [[opensubtitles, subdl], [opensubtitles]]
+`)
+
+	_, err := config.Load(path)
+	if err == nil {
+		t.Fatal("expected an error for a duplicate provider name across tiers, got nil")
 	}
 }
 
@@ -309,6 +462,51 @@ providers:
 	_, err := config.Load(path)
 	if err == nil {
 		t.Fatal("expected an error for missing provider name, got nil")
+	}
+}
+
+func TestLoad_ProviderChainInvalidEntryKind(t *testing.T) {
+	path := writeConfig(t, `
+libraries:
+  - name: movies
+    path: /media/movies
+    languages: [en]
+providers:
+  chain: [{name: opensubtitles}]
+`)
+
+	_, err := config.Load(path)
+	if err == nil {
+		t.Fatal("expected an error for a mapping providers.chain entry, got nil")
+	}
+}
+
+func TestLoad_ProviderChainTierProviderSettingsPreserved(t *testing.T) {
+	path := writeConfig(t, `
+libraries:
+  - name: movies
+    path: /media/movies
+    languages: [en]
+providers:
+  chain: [[opensubtitles, subdl]]
+  opensubtitles:
+    worker_count: 4
+  subdl:
+    worker_count: 2
+    paid: true
+`)
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+
+	tier := cfg.ProviderTiers[0].Providers
+	if tier[0].WorkerCount != 4 {
+		t.Errorf("expected opensubtitles worker_count 4, got %d", tier[0].WorkerCount)
+	}
+	if tier[1].WorkerCount != 2 || !tier[1].Paid {
+		t.Errorf("expected subdl worker_count 2 and paid true, got %+v", tier[1])
 	}
 }
 
