@@ -255,11 +255,13 @@ libraries:
   - name: movies
     path: /media/movies
     languages: [en]
-provider_chain:
-  - name: opensubtitles
+providers:
+  chain: [opensubtitles, subdl]
+  opensubtitles:
     worker_count: 4
-  - name: future-provider
+  subdl:
     worker_count: 2
+    paid: true
 `)
 
 	cfg, err := config.Load(path)
@@ -273,7 +275,7 @@ provider_chain:
 	if cfg.ProviderChain[0].Name != "opensubtitles" || cfg.ProviderChain[0].WorkerCount != 4 {
 		t.Errorf("unexpected first provider: %+v", cfg.ProviderChain[0])
 	}
-	if cfg.ProviderChain[1].Name != "future-provider" || cfg.ProviderChain[1].WorkerCount != 2 {
+	if cfg.ProviderChain[1].Name != "subdl" || cfg.ProviderChain[1].WorkerCount != 2 || !cfg.ProviderChain[1].Paid {
 		t.Errorf("unexpected second provider: %+v", cfg.ProviderChain[1])
 	}
 }
@@ -284,9 +286,8 @@ libraries:
   - name: movies
     path: /media/movies
     languages: [en]
-provider_chain:
-  - name: opensubtitles
-  - name: opensubtitles
+providers:
+  chain: [opensubtitles, opensubtitles]
 `)
 
 	_, err := config.Load(path)
@@ -301,12 +302,47 @@ libraries:
   - name: movies
     path: /media/movies
     languages: [en]
-provider_chain:
-  - worker_count: 4
+providers:
+  chain: [""]
 `)
 
 	_, err := config.Load(path)
 	if err == nil {
 		t.Fatal("expected an error for missing provider name, got nil")
+	}
+}
+
+func TestLoad_ProvidersUnknownProviderLevelKey(t *testing.T) {
+	path := writeConfig(t, `
+libraries:
+  - name: movies
+    path: /media/movies
+    languages: [en]
+providers:
+  chain: [opensubtitles]
+  priority: [opensubtitles]
+`)
+
+	_, err := config.Load(path)
+	if err == nil {
+		t.Fatal("expected an error for an unrecognized providers: level key, got nil")
+	}
+}
+
+func TestLoad_ProvidersUnknownProviderBlockKey(t *testing.T) {
+	path := writeConfig(t, `
+libraries:
+  - name: movies
+    path: /media/movies
+    languages: [en]
+providers:
+  chain: [opensubtitles]
+  opensubtitles:
+    api_key: should-not-be-here
+`)
+
+	_, err := config.Load(path)
+	if err == nil {
+		t.Fatal("expected an error for an unrecognized key inside a provider block, got nil")
 	}
 }
