@@ -15,6 +15,7 @@ libraries:
 #   SUBLIME_OPENSUBTITLES_API_KEY
 #   SUBLIME_OPENSUBTITLES_USERNAME
 #   SUBLIME_OPENSUBTITLES_PASSWORD
+#   SUBLIME_SUBDL_API_KEY
 
 providers:
   # chain is the ordered Provider Chain: Providers are tried in this order
