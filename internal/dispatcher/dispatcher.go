@@ -18,6 +18,19 @@ import (
 // (file, language) pairs when PollInterval isn't set.
 const defaultPollInterval = 5 * time.Second
 
+// ProviderEntry represents a single Provider in the chain with its own
+// Pipeline and per-Provider worker pool budget. Each entry in the chain
+// is tried in order until one is found that isn't Suspended and has
+// spare worker capacity.
+type ProviderEntry struct {
+	// Pipeline runs the actual per-pair work for this Provider.
+	Pipeline *pipeline.Pipeline
+
+	// WorkerCount is the number of concurrent workers allocated to this
+	// Provider's pool. Zero means use a share of the default budget.
+	WorkerCount int
+}
+
 // Dispatcher is the single, process-wide dispatch loop that claims Pending
 // (file, language) pairs across every configured Library and hands them to
 // Pipeline for the actual Search/Score/Download/Sync/Strip work. It
@@ -29,8 +42,17 @@ type Dispatcher struct {
 	// Pipeline runs the actual per-pair work (pipeline.Pipeline.ProcessPending)
 	// and supplies WorkerCount for this Dispatcher's worker pool — the same
 	// budget that used to be recreated per Library scan is now a single
-	// pool shared across every Library.
+	// pool shared across every Library. Used only when Providers is empty
+	// (legacy single-provider mode).
 	Pipeline *pipeline.Pipeline
+
+	// Providers is the ordered Provider Chain: each entry is tried in
+	// priority order until one is found that isn't Suspended and has spare
+	// worker capacity. When non-empty, Pipeline is ignored and each entry's
+	// own Pipeline is used. Each entry has its own per-Provider worker pool
+	// budget, so a Suspended or slow Provider can't starve capacity meant
+	// for a different Provider.
+	Providers []ProviderEntry
 
 	// Store is queried each pass for every currently claimable Pending
 	// pair. Required.
@@ -80,7 +102,16 @@ type suspensionReporter interface {
 // state on every call — no persisted state of its own. A Provider that
 // doesn't implement suspensionReporter is never considered Suspended.
 func (d *Dispatcher) providerSuspended() bool {
-	sr, ok := d.Pipeline.Provider.(suspensionReporter)
+	return d.pipelineSuspended(d.Pipeline)
+}
+
+// pipelineSuspended reports whether the Provider backing p is currently
+// Suspended.
+func (d *Dispatcher) pipelineSuspended(p *pipeline.Pipeline) bool {
+	if p == nil {
+		return false
+	}
+	sr, ok := p.Provider.(suspensionReporter)
 	if !ok {
 		return false
 	}
@@ -91,19 +122,19 @@ func (d *Dispatcher) providerSuspended() bool {
 // RunOnce performs one deterministic dispatch pass: it snapshots every
 // (file, language) pair currently in StatusPending across every configured
 // Library (store.Store.PendingPairs), then processes that snapshot
-// concurrently, bounded by Pipeline.WorkerCount workers, exactly as
-// Pipeline.Run's per-file fan-out used to. It returns once every pair from
-// that snapshot has been processed (or ctx is cancelled) — it does not
-// loop; see Run for the production polling wrapper.
+// concurrently. When Providers is set, each Provider gets its own worker
+// pool and the chain is walked in priority order to find the first
+// available Provider for each pair. It returns once every pair from that
+// snapshot has been processed (or ctx is cancelled) — it does not loop;
+// see Run for the production polling wrapper.
 //
 // A pair whose gate check finds an already-valid Marker never gets claimed
 // at all: it goes straight from Pending to Synced inside
 // Pipeline.ProcessPending, unchanged from today.
 //
-// A pair whose (today: single-entry) Provider Chain's Provider is
-// currently Suspended is left Pending too: it's neither claimed nor
-// touched at all, and is picked up automatically on a later poll once
-// Suspension() reports availability again — see providerSuspended.
+// A pair whose entire Provider Chain is currently Suspended or over
+// capacity is left Pending: it's neither claimed nor touched at all, and
+// is picked up automatically on a later poll once capacity frees up.
 func (d *Dispatcher) RunOnce(ctx context.Context) error {
 	pairs, err := d.Store.PendingPairs(ctx)
 	if err != nil {
@@ -115,6 +146,17 @@ func (d *Dispatcher) RunOnce(ctx context.Context) error {
 		librariesByName[lib.Name] = lib
 	}
 
+	// Chain mode: use per-provider worker pools
+	if len(d.Providers) > 0 {
+		return d.runOnceChainMode(ctx, pairs, librariesByName)
+	}
+
+	// Legacy single-pipeline mode
+	return d.runOnceLegacyMode(ctx, pairs, librariesByName)
+}
+
+// runOnceLegacyMode handles the single-pipeline dispatch mode (Providers empty).
+func (d *Dispatcher) runOnceLegacyMode(ctx context.Context, pairs []store.PendingPair, librariesByName map[string]domain.Library) error {
 	workerCount := d.Pipeline.WorkerCount
 	if workerCount <= 0 {
 		workerCount = runtime.NumCPU()
@@ -152,6 +194,84 @@ func (d *Dispatcher) RunOnce(ctx context.Context) error {
 					"library", lib.Name, "path", pair.Path, "language", pair.Language.String(), "error", err)
 			}
 		}(pair, lib)
+	}
+
+	wg.Wait()
+	return ctx.Err()
+}
+
+// runOnceChainMode handles the Provider Chain dispatch mode (Providers non-empty).
+// Each Provider gets its own semaphore, and for each pair we walk the chain
+// to find the first Provider that isn't Suspended and has spare capacity.
+func (d *Dispatcher) runOnceChainMode(ctx context.Context, pairs []store.PendingPair, librariesByName map[string]domain.Library) error {
+	// Build per-provider semaphores
+	type providerPool struct {
+		entry ProviderEntry
+		sem   chan struct{}
+	}
+	pools := make([]providerPool, len(d.Providers))
+	for i, entry := range d.Providers {
+		wc := entry.WorkerCount
+		if wc <= 0 {
+			wc = runtime.NumCPU() / len(d.Providers)
+			if wc < 1 {
+				wc = 1
+			}
+		}
+		pools[i] = providerPool{
+			entry: entry,
+			sem:   make(chan struct{}, wc),
+		}
+	}
+
+	var wg sync.WaitGroup
+
+	for _, pair := range pairs {
+		lib, ok := librariesByName[pair.LibraryName]
+		if !ok {
+			d.logger().Warn("dispatcher: pending pair references an unconfigured library; skipping",
+				"library", pair.LibraryName, "path", pair.Path)
+			continue
+		}
+
+		// Walk the chain to find the first available provider
+		var claimed bool
+		for i := range pools {
+			pool := &pools[i]
+
+			// Skip if this provider is Suspended
+			if d.pipelineSuspended(pool.entry.Pipeline) {
+				continue
+			}
+
+			// Try to acquire a worker slot (non-blocking)
+			select {
+			case pool.sem <- struct{}{}:
+				claimed = true
+				wg.Add(1)
+				go func(p *pipeline.Pipeline, sem chan struct{}, pair store.PendingPair, lib domain.Library) {
+					defer wg.Done()
+					defer func() { <-sem }()
+
+					if err := p.ProcessPending(ctx, lib, pair.FileID, pair.ContentHash, pair.Path, pair.Language, pair.Force); err != nil {
+						d.logger().Error("dispatcher: processing pending pair failed",
+							"library", lib.Name, "path", pair.Path, "language", pair.Language.String(), "error", err)
+					}
+				}(pool.entry.Pipeline, pool.sem, pair, lib)
+			default:
+				// No capacity in this provider's pool, try next
+				continue
+			}
+
+			if claimed {
+				break
+			}
+		}
+
+		// If no provider had capacity, the pair stays Pending (not claimed)
+		if ctx.Err() != nil {
+			break
+		}
 	}
 
 	wg.Wait()

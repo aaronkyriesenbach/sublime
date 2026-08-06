@@ -227,3 +227,86 @@ libraries:
 		t.Fatal("expected an error for an invalid strip_scope, got nil")
 	}
 }
+
+func TestLoad_ProviderChainDefaultsToOpenSubtitles(t *testing.T) {
+	path := writeConfig(t, `
+libraries:
+  - name: movies
+    path: /media/movies
+    languages: [en]
+`)
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+
+	if len(cfg.ProviderChain) != 1 {
+		t.Fatalf("expected default provider chain with 1 entry, got %d", len(cfg.ProviderChain))
+	}
+	if cfg.ProviderChain[0].Name != "opensubtitles" {
+		t.Errorf("expected default provider %q, got %q", "opensubtitles", cfg.ProviderChain[0].Name)
+	}
+}
+
+func TestLoad_ProviderChainExplicit(t *testing.T) {
+	path := writeConfig(t, `
+libraries:
+  - name: movies
+    path: /media/movies
+    languages: [en]
+provider_chain:
+  - name: opensubtitles
+    worker_count: 4
+  - name: future-provider
+    worker_count: 2
+`)
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+
+	if len(cfg.ProviderChain) != 2 {
+		t.Fatalf("expected provider chain with 2 entries, got %d", len(cfg.ProviderChain))
+	}
+	if cfg.ProviderChain[0].Name != "opensubtitles" || cfg.ProviderChain[0].WorkerCount != 4 {
+		t.Errorf("unexpected first provider: %+v", cfg.ProviderChain[0])
+	}
+	if cfg.ProviderChain[1].Name != "future-provider" || cfg.ProviderChain[1].WorkerCount != 2 {
+		t.Errorf("unexpected second provider: %+v", cfg.ProviderChain[1])
+	}
+}
+
+func TestLoad_ProviderChainDuplicateName(t *testing.T) {
+	path := writeConfig(t, `
+libraries:
+  - name: movies
+    path: /media/movies
+    languages: [en]
+provider_chain:
+  - name: opensubtitles
+  - name: opensubtitles
+`)
+
+	_, err := config.Load(path)
+	if err == nil {
+		t.Fatal("expected an error for duplicate provider names, got nil")
+	}
+}
+
+func TestLoad_ProviderChainMissingName(t *testing.T) {
+	path := writeConfig(t, `
+libraries:
+  - name: movies
+    path: /media/movies
+    languages: [en]
+provider_chain:
+  - worker_count: 4
+`)
+
+	_, err := config.Load(path)
+	if err == nil {
+		t.Fatal("expected an error for missing provider name, got nil")
+	}
+}
