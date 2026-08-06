@@ -1,5 +1,11 @@
 # Provider Suspension gates dispatch; only a no-candidate result advances the Provider Chain
 
+Status: superseded by docs/adr/0008-tiered-provider-chain.md — this rule turned
+out to describe intent that issue #65 shipped a contradiction of (Suspension
+was allowed to skip the entire flat chain, not just wait); ADR 0008
+reconciles the two by scoping this document's rule to a Tier boundary
+instead of the whole chain.
+
 A (file, language) pair may be attempted against an ordered Provider Chain
 (e.g., highest subtitle quality first). Provider Suspension and Provider
 Chain fallback are kept as independent, non-overlapping triggers: a
