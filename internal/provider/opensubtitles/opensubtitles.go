@@ -403,5 +403,3 @@ func candidatesFromResponse(resp searchResponseBody, hashMatch bool) []domain.Ca
 	}
 	return candidates
 }
-
-
