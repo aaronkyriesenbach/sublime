@@ -3,6 +3,7 @@ package provider
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/aaronkyriesenbach/sublime/internal/domain"
 )
@@ -19,6 +20,14 @@ import (
 type Fake struct {
 	SearchFunc   func(ctx context.Context, query Query) ([]domain.Candidate, error)
 	DownloadFunc func(ctx context.Context, candidate domain.Candidate) ([]byte, error)
+
+	// SuspendedFunc mirrors the optional suspensionReporter capability real
+	// Providers implement (see opensubtitles.Provider.Suspension and
+	// internal/pipeline's production wiring), letting tests drive a Fake's
+	// Suspended state directly instead of forcing a real quota exhaustion.
+	// A nil SuspendedFunc reports not-suspended, matching a Provider that
+	// has never suspended.
+	SuspendedFunc func() (resumeAt time.Time, suspended bool)
 }
 
 var _ Provider = (*Fake)(nil)
@@ -38,4 +47,14 @@ func (f *Fake) Download(ctx context.Context, candidate domain.Candidate) ([]byte
 		return nil, fmt.Errorf("provider: fake has no DownloadFunc configured for candidate %q", candidate.ID)
 	}
 	return f.DownloadFunc(ctx, candidate)
+}
+
+// Suspension delegates to SuspendedFunc, or reports not-suspended if
+// unset. It implements the same suspensionReporter capability real
+// Providers implement (see opensubtitles.Provider.Suspension).
+func (f *Fake) Suspension() (resumeAt time.Time, suspended bool) {
+	if f.SuspendedFunc == nil {
+		return time.Time{}, false
+	}
+	return f.SuspendedFunc()
 }

@@ -66,6 +66,28 @@ func (d *Dispatcher) pollInterval() time.Duration {
 	return defaultPollInterval
 }
 
+// suspensionReporter is the optional capability interface a Provider may
+// implement to report its own quota-suspension status (see
+// opensubtitles.Provider.Suspension and pipeline.NewProduction). Defined
+// here, at this package's own wiring seam, so Dispatcher can gate claims
+// on it without importing the concrete Provider type.
+type suspensionReporter interface {
+	Suspension() (resumeAt time.Time, suspended bool)
+}
+
+// providerSuspended reports whether the Provider backing d.Pipeline is
+// currently Suspended, checked fresh against the Provider's own in-memory
+// state on every call — no persisted state of its own. A Provider that
+// doesn't implement suspensionReporter is never considered Suspended.
+func (d *Dispatcher) providerSuspended() bool {
+	sr, ok := d.Pipeline.Provider.(suspensionReporter)
+	if !ok {
+		return false
+	}
+	_, suspended := sr.Suspension()
+	return suspended
+}
+
 // RunOnce performs one deterministic dispatch pass: it snapshots every
 // (file, language) pair currently in StatusPending across every configured
 // Library (store.Store.PendingPairs), then processes that snapshot
@@ -77,6 +99,11 @@ func (d *Dispatcher) pollInterval() time.Duration {
 // A pair whose gate check finds an already-valid Marker never gets claimed
 // at all: it goes straight from Pending to Synced inside
 // Pipeline.ProcessPending, unchanged from today.
+//
+// A pair whose (today: single-entry) Provider Chain's Provider is
+// currently Suspended is left Pending too: it's neither claimed nor
+// touched at all, and is picked up automatically on a later poll once
+// Suspension() reports availability again — see providerSuspended.
 func (d *Dispatcher) RunOnce(ctx context.Context) error {
 	pairs, err := d.Store.PendingPairs(ctx)
 	if err != nil {
@@ -101,6 +128,10 @@ func (d *Dispatcher) RunOnce(ctx context.Context) error {
 		if !ok {
 			d.logger().Warn("dispatcher: pending pair references an unconfigured library; skipping",
 				"library", pair.LibraryName, "path", pair.Path)
+			continue
+		}
+
+		if d.providerSuspended() {
 			continue
 		}
 
