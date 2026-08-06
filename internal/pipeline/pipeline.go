@@ -8,9 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
-	"sync"
 
 	"golang.org/x/text/language"
 
@@ -36,20 +34,24 @@ var videoExtensions = map[string]bool{
 	".wmv":  true,
 }
 
-// Pipeline orchestrates the end-to-end subtitle sync workflow for a Library.
+// Pipeline orchestrates the end-to-end subtitle sync workflow shared by
+// Trigger (registration: Run/RunFile) and Dispatcher (claim-and-fetch:
+// ProcessPending) — see docs/adr/0004-decouple-trigger-and-dispatcher.md.
 type Pipeline struct {
 	Store      *store.Store
 	Provider   provider.Provider
 	SyncEngine syncengine.SyncEngine
 	Stripper   Stripper
 
-	// WorkerCount is the number of concurrent workers for CPU/IO-bound
-	// operations. Zero means runtime.NumCPU().
+	// WorkerCount is the number of concurrent workers a Dispatcher should
+	// use when calling ProcessPending concurrently for this Pipeline. Zero
+	// means runtime.NumCPU(). Unused by Run/RunFile, which no longer fan
+	// out any per-pair work themselves.
 	WorkerCount int
 
-	// Logger receives per-file outcome logging (failures and no-candidate
-	// terminal states) as Run/RunFile process a Library. Defaults to
-	// slog.Default() if nil.
+	// Logger receives per-file registration logging (Run/RunFile) and
+	// per-pair outcome logging (ProcessPending). Defaults to slog.Default()
+	// if nil.
 	Logger *slog.Logger
 }
 
@@ -192,60 +194,57 @@ type runConfig struct {
 	force bool
 }
 
-// WithForce bypasses the Marker+Content-Hash gate so every (file, language)
-// pair is searched, downloaded, synced, and stripped again regardless of
-// prior state. Used for manual reprocessing; normal scans and
-// watch-triggered runs should leave it unset so already-synced files are
-// skipped.
+// WithForce marks every (file, language) pair Run or RunFile registers as
+// force-reset (store.Store.ResetToPendingForced) instead of an ordinary
+// reset, so the Dispatcher that later claims and processes them bypasses
+// the Marker+Content-Hash gate regardless of whether a still-valid Marker
+// exists. Used for manual reprocessing; normal scans and watch-triggered
+// runs should leave it unset so already-synced files are left for the
+// Dispatcher's gate to skip.
 func WithForce() RunOption {
 	return func(c *runConfig) { c.force = true }
 }
 
-// Result summarizes what the pipeline did for one Library run.
-type Result struct {
+// RegistrationResult summarizes what Run or RunFile registered for one
+// Trigger pass: the files it scanned and how each was classified (see
+// CONTEXT.md's Found and Changed entries). It says nothing about whether
+// any (file, language) pair was actually synced — that outcome is now
+// entirely the Dispatcher's, observable only via the state store (e.g.
+// GET /status) and the per-transition "status changed" logs, never
+// returned synchronously to a Trigger caller. See
+// docs/adr/0004-decouple-trigger-and-dispatcher.md.
+type RegistrationResult struct {
 	// FilesScanned is the total number of video files found in the Library.
 	FilesScanned int
 
-	// Synced counts (file, language) pairs that produced a new sidecar.
-	Synced int
+	// Found counts files that had never been tracked before this pass.
+	Found int
 
-	// Skipped counts (file, language) pairs where a valid Marker already
-	// existed — no fetch needed.
-	Skipped int
-
-	// NoCandidate counts (file, language) pairs where no Candidate cleared
-	// the scoring cutoff.
-	NoCandidate int
-
-	// Requeued counts (file, language) pairs reset to Pending after a
-	// provider.QuotaExhaustedError — they'll be retried on a future run.
-	Requeued int
-
-	// Failed counts (file, language) pairs that failed with an error.
-	Failed int
-
-	// Errors collects the first error per failed (file, language) pair,
-	// keyed by "path:lang".
-	Errors map[string]error
+	// Changed counts already-tracked files whose Content Hash differed
+	// from its last-recorded value, or that were targeted by a forced
+	// reprocess request.
+	Changed int
 }
 
-// Run processes every video file in lib, syncing subtitles for each of
-// lib.Languages. Files are streamed to workers as the Library's directory
-// walk discovers them — each is registered (Found or Changed — see
-// CONTEXT.md) and fanned out to Pending the instant it's seen, rather than
-// waiting for the whole tree to be walked first. It returns after all
-// files have been processed (or ctx is cancelled).
-func (p *Pipeline) Run(ctx context.Context, lib domain.Library, opts ...RunOption) (Result, error) {
+// Run registers every video file in lib, classifying each as Found or
+// Changed (see CONTEXT.md) and fanning out a Pending Sync Status for each
+// of lib.Languages the instant it's seen, rather than waiting for the
+// whole tree to be walked first. It returns as soon as registration for
+// every discovered file has completed (or ctx is cancelled) — it never
+// waits on any Dispatcher claiming or processing the Pending rows it just
+// wrote.
+func (p *Pipeline) Run(ctx context.Context, lib domain.Library, opts ...RunOption) (RegistrationResult, error) {
 	paths, walkErrCh := p.scanLibraryStream(ctx, lib.Path)
 	return p.runFiles(ctx, lib, paths, walkErrCh, opts...)
 }
 
-// RunFile processes a single video file within lib for each of
+// RunFile registers a single video file within lib for each of
 // lib.Languages, without scanning the rest of the Library. It's the
 // entrypoint triggers use for fsnotify watch events and single-file manual
 // reprocessing, where a full Library scan would be wasteful. It applies the
-// same Found-vs-Changed classification as Run (see CONTEXT.md).
-func (p *Pipeline) RunFile(ctx context.Context, lib domain.Library, videoPath string, opts ...RunOption) (Result, error) {
+// same Found-vs-Changed classification as Run (see CONTEXT.md) and returns
+// just as promptly, without waiting on the Dispatcher.
+func (p *Pipeline) RunFile(ctx context.Context, lib domain.Library, videoPath string, opts ...RunOption) (RegistrationResult, error) {
 	paths := make(chan string, 1)
 	paths <- videoPath
 	close(paths)
@@ -253,109 +252,48 @@ func (p *Pipeline) RunFile(ctx context.Context, lib domain.Library, videoPath st
 }
 
 // runFiles registers each path read from videoPaths (Found or Changed — see
-// registerFile) and fans its languages out to a worker pool bounded by
-// p.WorkerCount, as paths stream in. Registration happens on this method's
-// own goroutine and is never blocked by worker availability: a per-file
-// registration (and its Pending rows) completes as soon as the file is
-// read from videoPaths, regardless of how backed up the workers are, so a
-// slow worker pool never delays a later file from being registered. Actual
-// per-language work is throttled to WorkerCount concurrent goroutines via
-// sem; walkErrCh, if non-nil, carries an error from the goroutine feeding
-// videoPaths (nil once it's exhausted successfully).
+// registerFile) as it streams in, tallying a RegistrationResult; it never
+// fans work out to any worker pool — that's the Dispatcher's job, running
+// independently and coordinating only through the rows this method writes
+// to the store. walkErrCh, if non-nil, carries an error from the goroutine
+// feeding videoPaths (nil once it's exhausted successfully).
 func (p *Pipeline) runFiles(
 	ctx context.Context,
 	lib domain.Library,
 	videoPaths <-chan string,
 	walkErrCh <-chan error,
 	opts ...RunOption,
-) (Result, error) {
+) (RegistrationResult, error) {
 	var cfg runConfig
 	for _, opt := range opts {
 		opt(&cfg)
 	}
 
-	workerCount := p.WorkerCount
-	if workerCount <= 0 {
-		workerCount = runtime.NumCPU()
-	}
+	var result RegistrationResult
 
-	type outcome struct {
-		videoPath string
-		lang      language.Tag
-		outcome   processOutcome
-		err       error
-	}
-
-	outcomes := make(chan outcome)
-	sem := make(chan struct{}, workerCount)
-	var wg sync.WaitGroup
-
-	resultCh := make(chan Result, 1)
-	go func() {
-		result := Result{Errors: make(map[string]error)}
-		for o := range outcomes {
-			switch o.outcome {
-			case outcomeFailed:
-				result.Failed++
-				if o.err != nil {
-					result.Errors[fmt.Sprintf("%s:%s", o.videoPath, o.lang)] = o.err
-				}
-			case outcomeSkipped:
-				result.Skipped++
-			case outcomeSynced:
-				result.Synced++
-			case outcomeTerminal:
-				result.NoCandidate++
-			case outcomePending:
-				result.Requeued++
+scan:
+	for {
+		select {
+		case videoPath, ok := <-videoPaths:
+			if !ok {
+				break scan
 			}
-		}
-		resultCh <- result
-	}()
+			result.FilesScanned++
 
-	filesScanned := 0
-	for videoPath := range videoPaths {
-		filesScanned++
-
-		file, err := p.registerFile(ctx, lib, videoPath, cfg.force)
-		if err != nil {
-			registerErr := fmt.Errorf("registering file: %w", err)
-			p.logger().Error("registering file failed", "library", lib.Name, "path", videoPath, "error", err)
-			for _, lang := range lib.Languages {
-				wg.Add(1)
-				go func() {
-					defer wg.Done()
-					outcomes <- outcome{videoPath: videoPath, lang: lang, outcome: outcomeFailed, err: registerErr}
-				}()
+			_, classification, err := p.registerFile(ctx, lib, videoPath, cfg.force)
+			if err != nil {
+				p.logger().Error("registering file failed", "library", lib.Name, "path", videoPath, "error", err)
+				continue
 			}
-			continue
-		}
 
-		for _, lang := range lib.Languages {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-
-				select {
-				case sem <- struct{}{}:
-				case <-ctx.Done():
-					p.logger().Error("processing cancelled", "library", lib.Name, "path", videoPath, "language", lang.String(), "error", ctx.Err())
-					outcomes <- outcome{videoPath: videoPath, lang: lang, outcome: outcomeFailed, err: ctx.Err()}
-					return
-				}
-				defer func() { <-sem }()
-
-				select {
-				case <-ctx.Done():
-					p.logger().Error("processing cancelled", "library", lib.Name, "path", videoPath, "language", lang.String(), "error", ctx.Err())
-					outcomes <- outcome{videoPath: videoPath, lang: lang, outcome: outcomeFailed, err: ctx.Err()}
-					return
-				default:
-				}
-
-				res, syncErr := p.processFile(ctx, lib, file, videoPath, lang, cfg.force)
-				outcomes <- outcome{videoPath: videoPath, lang: lang, outcome: res, err: syncErr}
-			}()
+			switch classification {
+			case fileFound:
+				result.Found++
+			case fileChanged:
+				result.Changed++
+			}
+		case <-ctx.Done():
+			break scan
 		}
 	}
 
@@ -364,13 +302,11 @@ func (p *Pipeline) runFiles(
 		walkErr = <-walkErrCh
 	}
 
-	wg.Wait()
-	close(outcomes)
-	result := <-resultCh
-	result.FilesScanned = filesScanned
-
 	if walkErr != nil {
 		return result, fmt.Errorf("pipeline: scanning library %q: %w", lib.Name, walkErr)
+	}
+	if ctx.Err() != nil {
+		return result, ctx.Err()
 	}
 
 	return result, nil
@@ -418,6 +354,21 @@ func (p *Pipeline) scanLibraryStream(ctx context.Context, root string) (<-chan s
 	return paths, errCh
 }
 
+// fileClassification reports how registerFile classified a video path —
+// see CONTEXT.md's Found and Changed entries.
+type fileClassification int
+
+const (
+	// fileUnchanged means videoPath was already tracked, its hash is
+	// unchanged, and force wasn't set.
+	fileUnchanged fileClassification = iota
+	// fileFound means videoPath had never been tracked before.
+	fileFound
+	// fileChanged means videoPath was already tracked but its Content Hash
+	// differs from its last-recorded value, or force is set.
+	fileChanged
+)
+
 // registerFile classifies videoPath as Found or Changed (see CONTEXT.md)
 // the instant it's seen — whether by the bulk scan or a single-file
 // trigger — and logs exactly one "file found" or "file changed" line for
@@ -428,41 +379,62 @@ func (p *Pipeline) scanLibraryStream(ctx context.Context, root string) (<-chan s
 //   - Changed: videoPath is already tracked and either its Content Hash
 //     differs from its last-recorded value, or force is set (a manual
 //     reprocess request). Its existing language states are reset to
-//     Pending in place.
+//     Pending in place — force-reset via store.Store.ResetToPendingForced
+//     so a future Dispatcher claim bypasses the Marker+Content-Hash gate,
+//     plain store.Store.ResetToPending otherwise.
 //   - Neither: videoPath is already tracked, its hash is unchanged, and
 //     force isn't set — nothing is logged. lib.Languages still get Pending
 //     rows fanned out for any newly configured language absent from the
 //     file's existing rows.
-func (p *Pipeline) registerFile(ctx context.Context, lib domain.Library, videoPath string, force bool) (domain.File, error) {
+func (p *Pipeline) registerFile(ctx context.Context, lib domain.Library, videoPath string, force bool) (domain.File, fileClassification, error) {
 	hash, err := media.ComputeContentHash(videoPath)
 	if err != nil {
-		return domain.File{}, fmt.Errorf("computing content hash: %w", err)
+		return domain.File{}, fileUnchanged, fmt.Errorf("computing content hash: %w", err)
 	}
 
 	file, observation, err := p.Store.ObserveFileHash(ctx, lib.Name, videoPath, string(hash))
 	if err != nil {
-		return domain.File{}, fmt.Errorf("observing file hash: %w", err)
+		return domain.File{}, fileUnchanged, fmt.Errorf("observing file hash: %w", err)
 	}
 
+	classification := fileUnchanged
 	switch {
 	case observation == store.FileHashNew:
+		classification = fileFound
 		p.logger().Info("file found", "library", lib.Name, "path", videoPath)
 	case observation == store.FileHashChanged:
+		classification = fileChanged
 		p.logger().Info("file changed", "library", lib.Name, "path", videoPath)
 	case force:
+		classification = fileChanged
 		p.logger().Info("file changed", "library", lib.Name, "path", videoPath)
-		if err := p.Store.ResetToPending(ctx, file.ID); err != nil {
-			return domain.File{}, fmt.Errorf("resetting file to pending: %w", err)
+		if err := p.Store.ResetToPendingForced(ctx, file.ID); err != nil {
+			return domain.File{}, fileUnchanged, fmt.Errorf("resetting file to pending: %w", err)
 		}
 	}
 
 	for _, lang := range lib.Languages {
 		if err := p.Store.EnsureLanguage(ctx, file.ID, lang); err != nil {
-			return domain.File{}, fmt.Errorf("ensuring language state: %w", err)
+			return domain.File{}, fileUnchanged, fmt.Errorf("ensuring language state: %w", err)
 		}
 	}
 
-	return file, nil
+	return file, classification, nil
+}
+
+// ProcessPending performs the actual claim-and-fetch work for a single
+// Pending (file, language) pair that a Dispatcher has selected from
+// store.Store.PendingPairs: the Marker+Content-Hash gate check, the atomic
+// claim (Pending -> In Progress), Search/Score/Download/Sync/Strip, and
+// outcome recording — unchanged from what Run/RunFile used to do inline,
+// just called from the Dispatcher's own loop instead. fileID, contentHash,
+// and videoPath identify an already-registered file (see registerFile);
+// force bypasses the gate, matching store.PendingPair.Force. See
+// docs/adr/0004-decouple-trigger-and-dispatcher.md.
+func (p *Pipeline) ProcessPending(ctx context.Context, lib domain.Library, fileID int64, contentHash, videoPath string, lang language.Tag, force bool) error {
+	file := domain.File{ID: fileID, LibraryName: lib.Name, Path: videoPath, ContentHash: contentHash}
+	_, err := p.processFile(ctx, lib, file, videoPath, lang, force)
+	return err
 }
 
 // processFile handles a single (video, language) pair: gate check, search,

@@ -2,7 +2,6 @@ package trigger_test
 
 import (
 	"context"
-	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -13,27 +12,35 @@ import (
 	"github.com/aaronkyriesenbach/sublime/internal/trigger"
 )
 
-// waitForFile polls for path to exist, failing the test if it doesn't show
-// up within timeout. Watch/scan side effects land asynchronously relative to
-// the test goroutine, so a fixed sleep would be both slow and flaky.
-func waitForFile(t *testing.T, path string, timeout time.Duration) {
+// waitForPending polls st for videoPath's Sync Status to show up as
+// Pending, failing the test if it doesn't within timeout. Watch/scan side
+// effects land asynchronously relative to the test goroutine, so a fixed
+// sleep would be both slow and flaky.
+func waitForPending(t *testing.T, ctx context.Context, st interface {
+	GetFile(ctx context.Context, libraryName, path string) (domain.File, bool, error)
+}, libraryName, path string, timeout time.Duration) domain.File {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		if _, err := os.Stat(path); err == nil {
-			return
+		file, found, err := st.GetFile(ctx, libraryName, path)
+		if err != nil {
+			t.Fatalf("GetFile: %v", err)
+		}
+		if found && len(file.Languages) > 0 {
+			return file
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatalf("timed out waiting for %q to appear", path)
+	t.Fatalf("timed out waiting for %q to be registered", path)
+	return domain.File{}
 }
 
-func TestWatcher_InitialScanProcessesPreExistingFiles(t *testing.T) {
+func TestWatcher_InitialScanRegistersPreExistingFiles(t *testing.T) {
 	libDir := t.TempDir()
 	videoPath := filepath.Join(libDir, "Test.Movie.2024.HDTV.x264-FAKEGROUP.mp4")
 	writeSampleVideo(t, videoPath)
 
-	p := newTestPipeline(t, nil)
+	p, st := newTestPipeline(t, nil)
 	lib := domain.Library{
 		Name:       "test-library",
 		Path:       libDir,
@@ -55,14 +62,16 @@ func TestWatcher_InitialScanProcessesPreExistingFiles(t *testing.T) {
 		<-done
 	}()
 
-	sidecarPath := filepath.Join(libDir, "Test.Movie.2024.HDTV.x264-FAKEGROUP.en.srt")
-	waitForFile(t, sidecarPath, 2*time.Second)
+	file := waitForPending(t, ctx, st, lib.Name, videoPath, 2*time.Second)
+	if file.Languages[0].Status != domain.StatusPending {
+		t.Errorf("status = %q, want %q (Watcher only registers, never dispatches)", file.Languages[0].Status, domain.StatusPending)
+	}
 }
 
-func TestWatcher_LiveFileCreationEventIsProcessed(t *testing.T) {
+func TestWatcher_LiveFileCreationEventIsRegistered(t *testing.T) {
 	libDir := t.TempDir()
 
-	p := newTestPipeline(t, nil)
+	p, st := newTestPipeline(t, nil)
 	lib := domain.Library{
 		Name:       "test-library",
 		Path:       libDir,
@@ -95,13 +104,15 @@ func TestWatcher_LiveFileCreationEventIsProcessed(t *testing.T) {
 	videoPath := filepath.Join(libDir, "Test.Movie.2024.HDTV.x264-FAKEGROUP.mp4")
 	writeSampleVideo(t, videoPath)
 
-	sidecarPath := filepath.Join(libDir, "Test.Movie.2024.HDTV.x264-FAKEGROUP.en.srt")
-	waitForFile(t, sidecarPath, 2*time.Second)
+	file := waitForPending(t, ctx, st, lib.Name, videoPath, 2*time.Second)
+	if file.Languages[0].Status != domain.StatusPending {
+		t.Errorf("status = %q, want %q (Watcher only registers, never dispatches)", file.Languages[0].Status, domain.StatusPending)
+	}
 }
 
 func TestWatcher_StartReturnsWhenContextCancelled(t *testing.T) {
 	libDir := t.TempDir()
-	p := newTestPipeline(t, nil)
+	p, _ := newTestPipeline(t, nil)
 	lib := domain.Library{
 		Name:      "test-library",
 		Path:      libDir,

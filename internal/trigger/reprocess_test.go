@@ -8,6 +8,7 @@ import (
 
 	"golang.org/x/text/language"
 
+	"github.com/aaronkyriesenbach/sublime/internal/dispatcher"
 	"github.com/aaronkyriesenbach/sublime/internal/domain"
 	"github.com/aaronkyriesenbach/sublime/internal/pipeline"
 	"github.com/aaronkyriesenbach/sublime/internal/provider"
@@ -28,7 +29,7 @@ func writeSampleVideo(t *testing.T, dst string) {
 	}
 }
 
-func newTestPipeline(t *testing.T, searched map[string]int) *pipeline.Pipeline {
+func newTestPipeline(t *testing.T, searched map[string]int) (*pipeline.Pipeline, *store.Store) {
 	t.Helper()
 
 	dbPath := filepath.Join(t.TempDir(), "sublime.db")
@@ -57,6 +58,20 @@ func newTestPipeline(t *testing.T, searched map[string]int) *pipeline.Pipeline {
 		SyncEngine:  &syncengine.FakeSyncEngine{},
 		Stripper:    &pipeline.FakeStripper{},
 		WorkerCount: 1,
+	}, st
+}
+
+// dispatchOnce runs a single Dispatcher pass over every Pending pair
+// currently in st for lib, standing in for the production Dispatcher
+// goroutine (internal/dispatcher) these tests need to actually observe a
+// Sync Status transition beyond Pending \u2014 Trigger's Run/RunFile/Reprocess
+// no longer do that work themselves (see
+// docs/adr/0004-decouple-trigger-and-dispatcher.md).
+func dispatchOnce(t *testing.T, ctx context.Context, p *pipeline.Pipeline, st *store.Store, lib domain.Library) {
+	t.Helper()
+	d := &dispatcher.Dispatcher{Pipeline: p, Store: st, Libraries: []domain.Library{lib}}
+	if err := d.RunOnce(ctx); err != nil {
+		t.Fatalf("dispatcher.RunOnce: %v", err)
 	}
 }
 
@@ -66,7 +81,7 @@ func TestReprocess_SingleFileForcesResyncDespiteValidMarker(t *testing.T) {
 	writeSampleVideo(t, videoPath)
 
 	searched := map[string]int{}
-	p := newTestPipeline(t, searched)
+	p, st := newTestPipeline(t, searched)
 
 	lib := domain.Library{
 		Name:       "test-library",
@@ -79,19 +94,47 @@ func TestReprocess_SingleFileForcesResyncDespiteValidMarker(t *testing.T) {
 	if _, err := p.Run(ctx, lib); err != nil {
 		t.Fatalf("initial run: %v", err)
 	}
+	dispatchOnce(t, ctx, p, st, lib)
 	if searched[videoPath] != 1 {
 		t.Fatalf("searches after initial run = %d, want 1", searched[videoPath])
 	}
 
-	result, err := trigger.Reprocess(ctx, p, lib, videoPath)
+	file, found, err := st.GetFile(ctx, lib.Name, videoPath)
 	if err != nil {
+		t.Fatalf("GetFile: %v", err)
+	}
+	if !found || file.Languages[0].Status != domain.StatusSynced {
+		t.Fatalf("expected file to be Synced before reprocessing, got %+v", file)
+	}
+
+	if err := trigger.Reprocess(ctx, p, lib, videoPath); err != nil {
 		t.Fatalf("Reprocess: %v", err)
 	}
-	if result.Synced != 1 {
-		t.Errorf("Synced = %d, want 1", result.Synced)
+
+	// Reprocess is now a pure registration/reset operation: it must not
+	// have searched again itself, only reset the pair to Pending (forced).
+	if searched[videoPath] != 1 {
+		t.Fatalf("searches immediately after Reprocess = %d, want still 1 (Reprocess doesn't dispatch)", searched[videoPath])
 	}
+	pairs, err := st.PendingPairs(ctx)
+	if err != nil {
+		t.Fatalf("PendingPairs: %v", err)
+	}
+	if len(pairs) != 1 || pairs[0].Path != videoPath || !pairs[0].Force {
+		t.Fatalf("PendingPairs = %+v, want a single forced pending pair for %q", pairs, videoPath)
+	}
+
+	dispatchOnce(t, ctx, p, st, lib)
 	if searched[videoPath] != 2 {
-		t.Errorf("searches after Reprocess = %d, want 2 (gate must be bypassed)", searched[videoPath])
+		t.Errorf("searches after Dispatcher claims the forced pair = %d, want 2 (gate must be bypassed)", searched[videoPath])
+	}
+
+	file, found, err = st.GetFile(ctx, lib.Name, videoPath)
+	if err != nil {
+		t.Fatalf("GetFile: %v", err)
+	}
+	if !found || file.Languages[0].Status != domain.StatusSynced {
+		t.Fatalf("expected file to be Synced again after the forced dispatch, got %+v", file)
 	}
 }
 
@@ -108,7 +151,7 @@ func TestReprocess_DirectoryForcesOnlyFilesUnderIt(t *testing.T) {
 	writeSampleVideo(t, subVideo)
 
 	searched := map[string]int{}
-	p := newTestPipeline(t, searched)
+	p, st := newTestPipeline(t, searched)
 
 	lib := domain.Library{
 		Name:       "test-library",
@@ -121,16 +164,23 @@ func TestReprocess_DirectoryForcesOnlyFilesUnderIt(t *testing.T) {
 	if _, err := p.Run(ctx, lib); err != nil {
 		t.Fatalf("initial run: %v", err)
 	}
+	dispatchOnce(t, ctx, p, st, lib)
 	searched[rootVideo] = 0
 	searched[subVideo] = 0
 
-	result, err := trigger.Reprocess(ctx, p, lib, subDir)
-	if err != nil {
+	if err := trigger.Reprocess(ctx, p, lib, subDir); err != nil {
 		t.Fatalf("Reprocess: %v", err)
 	}
-	if result.FilesScanned != 1 {
-		t.Errorf("FilesScanned = %d, want 1", result.FilesScanned)
+
+	pairs, err := st.PendingPairs(ctx)
+	if err != nil {
+		t.Fatalf("PendingPairs: %v", err)
 	}
+	if len(pairs) != 1 || pairs[0].Path != subVideo || !pairs[0].Force {
+		t.Fatalf("PendingPairs = %+v, want a single forced pending pair for %q", pairs, subVideo)
+	}
+
+	dispatchOnce(t, ctx, p, st, lib)
 	if searched[subVideo] != 1 {
 		t.Errorf("searches for subVideo = %d, want 1", searched[subVideo])
 	}
@@ -147,7 +197,7 @@ func TestReprocess_EntireLibraryForcesEveryFile(t *testing.T) {
 	writeSampleVideo(t, video2)
 
 	searched := map[string]int{}
-	p := newTestPipeline(t, searched)
+	p, st := newTestPipeline(t, searched)
 
 	lib := domain.Library{
 		Name:       "test-library",
@@ -160,16 +210,28 @@ func TestReprocess_EntireLibraryForcesEveryFile(t *testing.T) {
 	if _, err := p.Run(ctx, lib); err != nil {
 		t.Fatalf("initial run: %v", err)
 	}
+	dispatchOnce(t, ctx, p, st, lib)
 	searched[video1] = 0
 	searched[video2] = 0
 
-	result, err := trigger.Reprocess(ctx, p, lib, "")
-	if err != nil {
+	if err := trigger.Reprocess(ctx, p, lib, ""); err != nil {
 		t.Fatalf("Reprocess: %v", err)
 	}
-	if result.FilesScanned != 2 {
-		t.Errorf("FilesScanned = %d, want 2", result.FilesScanned)
+
+	pairs, err := st.PendingPairs(ctx)
+	if err != nil {
+		t.Fatalf("PendingPairs: %v", err)
 	}
+	if len(pairs) != 2 {
+		t.Fatalf("PendingPairs = %+v, want 2 forced pending pairs", pairs)
+	}
+	for _, pair := range pairs {
+		if !pair.Force {
+			t.Errorf("pair %+v not marked Force", pair)
+		}
+	}
+
+	dispatchOnce(t, ctx, p, st, lib)
 	if searched[video1] != 1 || searched[video2] != 1 {
 		t.Errorf("searches = %d,%d, want 1,1 (whole library reprocessed)", searched[video1], searched[video2])
 	}
@@ -182,14 +244,14 @@ func TestReprocess_NonVideoFileTargetErrors(t *testing.T) {
 		t.Fatalf("writing txt file: %v", err)
 	}
 
-	p := newTestPipeline(t, nil)
+	p, _ := newTestPipeline(t, nil)
 	lib := domain.Library{
 		Name:      "test-library",
 		Path:      libDir,
 		Languages: []language.Tag{language.English},
 	}
 
-	if _, err := trigger.Reprocess(context.Background(), p, lib, txtPath); err == nil {
+	if err := trigger.Reprocess(context.Background(), p, lib, txtPath); err == nil {
 		t.Error("Reprocess with non-video file target: want error, got nil")
 	}
 }

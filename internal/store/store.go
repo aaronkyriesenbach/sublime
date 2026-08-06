@@ -66,6 +66,13 @@ CREATE TABLE IF NOT EXISTS file_language_states (
 		(status = 'failed' AND failure_reason IN ('no_candidate', 'retrieval_failed', 'sync_failed', 'internal_error'))
 		OR (status != 'failed' AND failure_reason IS NULL)
 	),
+	-- force records that this Pending pair was reset by a manual reprocess
+	-- request (see docs/adr/0004-decouple-trigger-and-dispatcher.md) rather
+	-- than an ordinary Found/Changed event, so the Dispatcher — which now
+	-- claims and processes this row on its own, asynchronously from the
+	-- Trigger call that reset it — knows to bypass the Marker+Content-Hash
+	-- gate for it. Cleared once the Dispatcher claims the row (MarkInProgress).
+	force INTEGER NOT NULL DEFAULT 0,
 	updated_at TEXT NOT NULL,
 	UNIQUE (file_id, language)
 );

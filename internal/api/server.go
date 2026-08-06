@@ -8,15 +8,17 @@ import (
 	"time"
 
 	"github.com/aaronkyriesenbach/sublime/internal/domain"
-	"github.com/aaronkyriesenbach/sublime/internal/pipeline"
 	"github.com/aaronkyriesenbach/sublime/internal/store"
 )
 
 // ReprocessFunc forces target (a file, directory, or Library path) through
 // lib's pipeline, bypassing the Marker+Content-Hash gate. It matches
 // internal/trigger.Reprocess's signature so the production serve command
-// can pass that function directly; tests can inject a fake.
-type ReprocessFunc func(ctx context.Context, lib domain.Library, target string) (pipeline.Result, error)
+// can pass that function directly; tests can inject a fake. It's a pure
+// registration/reset operation — it returns once target's (file, language)
+// pairs are reset to Pending, before the Dispatcher has necessarily
+// claimed or processed any of them.
+type ReprocessFunc func(ctx context.Context, lib domain.Library, target string) error
 
 // ProviderStatusFunc reports one configured Provider's identity and live
 // suspension status for GET /status' providers array. Status may be nil —
