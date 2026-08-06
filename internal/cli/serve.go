@@ -128,17 +128,20 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 
 	secrets := config.LoadProviderSecrets()
 	p, providerStatuses, err := pipeline.NewProduction(pipeline.ProductionConfig{
-		Store:   st,
-		Secrets: secrets.OpenSubtitles,
-		Logger:  logger,
+		Store:         st,
+		Secrets:       secrets,
+		ProviderChain: cfg.ProviderChain,
+		Logger:        logger,
 	})
 	if err != nil {
 		return fmt.Errorf("constructing pipeline: %w", err)
 	}
 
 	apiProviders := make([]api.ProviderStatusFunc, 0, len(providerStatuses))
+	providerEntries := make([]dispatcher.ProviderEntry, 0, len(providerStatuses))
 	for _, ps := range providerStatuses {
 		apiProviders = append(apiProviders, api.ProviderStatusFunc{Name: ps.Name, Status: ps.Suspension})
+		providerEntries = append(providerEntries, dispatcher.ProviderEntry{Pipeline: ps.Pipeline, WorkerCount: ps.WorkerCount})
 	}
 
 	apiServer := api.NewServer(api.Deps{
@@ -181,7 +184,7 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 	}
 
 	d := &dispatcher.Dispatcher{
-		Pipeline:     p,
+		Providers:    providerEntries,
 		Store:        st,
 		Libraries:    cfg.Libraries,
 		PollInterval: opts.DispatchPollInterval,

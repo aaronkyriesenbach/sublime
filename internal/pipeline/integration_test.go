@@ -356,10 +356,12 @@ func TestIntegration_NewProduction_Success(t *testing.T) {
 
 	p, providerStatuses, err := pipeline.NewProduction(pipeline.ProductionConfig{
 		Store: st,
-		Secrets: config.OpenSubtitlesSecrets{
-			APIKey:   "test-api-key",
-			Username: "testuser",
-			Password: "testpass",
+		Secrets: config.ProviderSecrets{
+			OpenSubtitles: config.OpenSubtitlesSecrets{
+				APIKey:   "test-api-key",
+				Username: "testuser",
+				Password: "testpass",
+			},
 		},
 		WorkerCount: 1,
 	})
@@ -385,6 +387,102 @@ func TestIntegration_NewProduction_Success(t *testing.T) {
 	if providerStatuses[0].Suspension == nil {
 		t.Error("providerStatuses[0].Suspension is nil, want the opensubtitles Provider's suspension reporter")
 	}
+	if providerStatuses[0].Pipeline != p {
+		t.Error("providerStatuses[0].Pipeline should be the same instance returned as the primary Pipeline")
+	}
+}
+
+// TestIntegration_NewProduction_MultiProviderChain validates that
+// NewProduction constructs a real Provider per providers.chain entry (#71):
+// opensubtitles and subdl, in chain order, each with its own Pipeline and
+// configured worker_count, and that subdl's Suspension is reported exactly
+// like opensubtitles' is.
+func TestIntegration_NewProduction_MultiProviderChain(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "sublime.db")
+	st, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("opening store: %v", err)
+	}
+	defer func() { _ = st.Close() }()
+
+	p, providerStatuses, err := pipeline.NewProduction(pipeline.ProductionConfig{
+		Store: st,
+		Secrets: config.ProviderSecrets{
+			OpenSubtitles: config.OpenSubtitlesSecrets{
+				APIKey:   "test-api-key",
+				Username: "testuser",
+				Password: "testpass",
+			},
+			SubDL: config.SubDLSecrets{APIKey: "test-subdl-key"},
+		},
+		ProviderChain: []config.ProviderConfig{
+			{Name: "opensubtitles", WorkerCount: 2},
+			{Name: "subdl", WorkerCount: 3, Paid: true},
+		},
+		WorkerCount: 1,
+	})
+	if err != nil {
+		t.Fatalf("NewProduction() error = %v", err)
+	}
+
+	if len(providerStatuses) != 2 {
+		t.Fatalf("providerStatuses = %+v, want 2 entries", providerStatuses)
+	}
+
+	os := providerStatuses[0]
+	if os.Name != "opensubtitles" {
+		t.Errorf("providerStatuses[0].Name = %q, want %q", os.Name, "opensubtitles")
+	}
+	if os.WorkerCount != 2 {
+		t.Errorf("providerStatuses[0].WorkerCount = %d, want 2", os.WorkerCount)
+	}
+	if os.Suspension == nil {
+		t.Error("providerStatuses[0].Suspension is nil, want the opensubtitles Provider's suspension reporter")
+	}
+	if os.Pipeline == nil || os.Pipeline.Provider == nil {
+		t.Error("providerStatuses[0].Pipeline is not wired with a Provider")
+	}
+	if os.Pipeline != p {
+		t.Error("the first chain entry's Pipeline should be returned as the primary Pipeline")
+	}
+
+	sd := providerStatuses[1]
+	if sd.Name != "subdl" {
+		t.Errorf("providerStatuses[1].Name = %q, want %q", sd.Name, "subdl")
+	}
+	if sd.WorkerCount != 3 {
+		t.Errorf("providerStatuses[1].WorkerCount = %d, want 3", sd.WorkerCount)
+	}
+	if sd.Suspension == nil {
+		t.Error("providerStatuses[1].Suspension is nil, want the subdl Provider's suspension reporter")
+	}
+	if sd.Pipeline == nil || sd.Pipeline.Provider == nil {
+		t.Error("providerStatuses[1].Pipeline is not wired with a Provider")
+	}
+	if sd.Pipeline == os.Pipeline {
+		t.Error("each chain entry should get its own distinct Pipeline")
+	}
+
+	if resumeAt, suspended := sd.Suspension(); suspended {
+		t.Errorf("subdl Suspension() = (%v, %v), want not suspended for a freshly constructed Provider", resumeAt, suspended)
+	}
+}
+
+func TestIntegration_NewProduction_UnknownProviderInChain(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "sublime.db")
+	st, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("opening store: %v", err)
+	}
+	defer func() { _ = st.Close() }()
+
+	_, _, err = pipeline.NewProduction(pipeline.ProductionConfig{
+		Store:         st,
+		ProviderChain: []config.ProviderConfig{{Name: "not-a-real-provider"}},
+	})
+	if err == nil {
+		t.Fatal("expected an error for an unrecognized provider name in the chain")
+	}
 }
 
 func TestIntegration_NewProduction_MissingSecrets(t *testing.T) {
@@ -397,7 +495,7 @@ func TestIntegration_NewProduction_MissingSecrets(t *testing.T) {
 
 	_, _, err = pipeline.NewProduction(pipeline.ProductionConfig{
 		Store:   st,
-		Secrets: config.OpenSubtitlesSecrets{},
+		Secrets: config.ProviderSecrets{},
 	})
 	if err == nil {
 		t.Fatal("expected an error when secrets are missing")

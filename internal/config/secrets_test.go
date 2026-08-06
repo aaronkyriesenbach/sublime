@@ -35,3 +35,23 @@ func TestLoadProviderSecrets_Unset(t *testing.T) {
 		t.Errorf("expected empty secrets, got %+v", secrets.OpenSubtitles)
 	}
 }
+
+func TestLoadProviderSecrets_SubDLFromEnv(t *testing.T) {
+	t.Setenv("SUBLIME_SUBDL_API_KEY", "test-subdl-key")
+
+	secrets := config.LoadProviderSecrets()
+
+	if secrets.SubDL.APIKey != "test-subdl-key" {
+		t.Errorf("SubDL.APIKey = %q, want %q", secrets.SubDL.APIKey, "test-subdl-key")
+	}
+}
+
+func TestLoadProviderSecrets_SubDLUnset(t *testing.T) {
+	t.Setenv("SUBLIME_SUBDL_API_KEY", "")
+
+	secrets := config.LoadProviderSecrets()
+
+	if secrets.SubDL.APIKey != "" {
+		t.Errorf("expected empty SubDL.APIKey, got %q", secrets.SubDL.APIKey)
+	}
+}
