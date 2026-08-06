@@ -746,3 +746,343 @@ func TestDispatcher_ProviderChainPerProviderWorkerPoolBudget(t *testing.T) {
 		t.Fatal("RunOnce did not finish after unblocking Provider #1")
 	}
 }
+
+// TestDispatcher_TierScopedSuspension_SkipsToTierMate guards that when a
+// Provider in a Tier is Suspended, the Dispatcher skips to a non-Suspended
+// Tier-mate within the same Tier, rather than leaving the pair Pending.
+func TestDispatcher_TierScopedSuspension_SkipsToTierMate(t *testing.T) {
+	libDir := t.TempDir()
+	videoPath := filepath.Join(libDir, "Test.Movie.2024.HDTV.x264-FAKEGROUP.mp4")
+	writeVideoFixture(t, videoPath)
+
+	st := openTestStore(t)
+	candidateContent := "1\n00:00:00,500 --> 00:00:01,900\nOne two three\n"
+
+	// Provider #1: Suspended, should be skipped
+	provider1 := &provider.Fake{
+		SearchFunc: func(ctx context.Context, q provider.Query) ([]domain.Candidate, error) {
+			t.Fatal("Provider #1 Search should not be called while Suspended")
+			return nil, nil
+		},
+		SuspendedFunc: func() (time.Time, bool) {
+			return time.Now().Add(time.Hour), true
+		},
+	}
+
+	// Provider #2: available Tier-mate, should handle the dispatch
+	provider2 := &provider.Fake{
+		SearchFunc: func(ctx context.Context, q provider.Query) ([]domain.Candidate, error) {
+			return []domain.Candidate{{ID: "candidate", Title: "Test Movie", Year: 2024}}, nil
+		},
+		DownloadFunc: func(ctx context.Context, c domain.Candidate) ([]byte, error) {
+			return []byte(candidateContent), nil
+		},
+		SuspendedFunc: func() (time.Time, bool) {
+			return time.Time{}, false
+		},
+	}
+
+	lib := domain.Library{
+		Name:       "test-library",
+		Path:       libDir,
+		Languages:  []language.Tag{language.English},
+		StripScope: domain.StripScopeAll,
+	}
+
+	pipeline1 := &pipeline.Pipeline{
+		Store:      st,
+		Provider:   provider1,
+		SyncEngine: &syncengine.FakeSyncEngine{},
+		Stripper:   &pipeline.FakeStripper{},
+	}
+	pipeline2 := &pipeline.Pipeline{
+		Store:      st,
+		Provider:   provider2,
+		SyncEngine: &syncengine.FakeSyncEngine{},
+		Stripper:   &pipeline.FakeStripper{},
+	}
+
+	ctx := context.Background()
+	if _, err := pipeline1.Run(ctx, lib); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	// Both providers in the SAME Tier — Tier-mate skip should work
+	d := &dispatcher.Dispatcher{
+		ProviderTiers: []dispatcher.ProviderTier{{
+			Providers: []dispatcher.ProviderEntry{
+				{Name: "provider1", Pipeline: pipeline1, WorkerCount: 2},
+				{Name: "provider2", Pipeline: pipeline2, WorkerCount: 2},
+			},
+		}},
+		Store:     st,
+		Libraries: []domain.Library{lib},
+	}
+	if err := d.RunOnce(ctx); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+
+	file, found, err := st.GetFile(ctx, lib.Name, videoPath)
+	if err != nil {
+		t.Fatalf("GetFile: %v", err)
+	}
+	if !found || file.Languages[0].Status != domain.StatusSynced {
+		t.Fatalf("expected Synced via Tier-mate, got %+v", file)
+	}
+}
+
+// TestDispatcher_TierScopedSuspension_PrefersFirstHealthyProvider guards that
+// within a Tier, the first non-Suspended Provider is always preferred, even
+// when a later Tier-mate also has spare capacity.
+func TestDispatcher_TierScopedSuspension_PrefersFirstHealthyProvider(t *testing.T) {
+	libDir := t.TempDir()
+	videoPath := filepath.Join(libDir, "Test.Movie.2024.HDTV.x264-FAKEGROUP.mp4")
+	writeVideoFixture(t, videoPath)
+
+	st := openTestStore(t)
+	candidateContent := "1\n00:00:00,500 --> 00:00:01,900\nOne two three\n"
+
+	// Track which provider actually handled the dispatch
+	var handledBy string
+	var mu sync.Mutex
+
+	// Provider #1: healthy, should be preferred
+	provider1 := &provider.Fake{
+		SearchFunc: func(ctx context.Context, q provider.Query) ([]domain.Candidate, error) {
+			mu.Lock()
+			handledBy = "provider1"
+			mu.Unlock()
+			return []domain.Candidate{{ID: "candidate", Title: "Test Movie", Year: 2024}}, nil
+		},
+		DownloadFunc: func(ctx context.Context, c domain.Candidate) ([]byte, error) {
+			return []byte(candidateContent), nil
+		},
+		SuspendedFunc: func() (time.Time, bool) {
+			return time.Time{}, false
+		},
+	}
+
+	// Provider #2: also healthy with spare capacity, but should NOT be used
+	provider2 := &provider.Fake{
+		SearchFunc: func(ctx context.Context, q provider.Query) ([]domain.Candidate, error) {
+			mu.Lock()
+			handledBy = "provider2"
+			mu.Unlock()
+			return []domain.Candidate{{ID: "candidate", Title: "Test Movie", Year: 2024}}, nil
+		},
+		DownloadFunc: func(ctx context.Context, c domain.Candidate) ([]byte, error) {
+			return []byte(candidateContent), nil
+		},
+		SuspendedFunc: func() (time.Time, bool) {
+			return time.Time{}, false
+		},
+	}
+
+	lib := domain.Library{
+		Name:       "test-library",
+		Path:       libDir,
+		Languages:  []language.Tag{language.English},
+		StripScope: domain.StripScopeAll,
+	}
+
+	pipeline1 := &pipeline.Pipeline{
+		Store:      st,
+		Provider:   provider1,
+		SyncEngine: &syncengine.FakeSyncEngine{},
+		Stripper:   &pipeline.FakeStripper{},
+	}
+	pipeline2 := &pipeline.Pipeline{
+		Store:      st,
+		Provider:   provider2,
+		SyncEngine: &syncengine.FakeSyncEngine{},
+		Stripper:   &pipeline.FakeStripper{},
+	}
+
+	ctx := context.Background()
+	if _, err := pipeline1.Run(ctx, lib); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	// Both providers in the SAME Tier, both healthy with spare capacity
+	d := &dispatcher.Dispatcher{
+		ProviderTiers: []dispatcher.ProviderTier{{
+			Providers: []dispatcher.ProviderEntry{
+				{Name: "provider1", Pipeline: pipeline1, WorkerCount: 2},
+				{Name: "provider2", Pipeline: pipeline2, WorkerCount: 2},
+			},
+		}},
+		Store:     st,
+		Libraries: []domain.Library{lib},
+	}
+	if err := d.RunOnce(ctx); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+
+	mu.Lock()
+	result := handledBy
+	mu.Unlock()
+
+	if result != "provider1" {
+		t.Fatalf("expected dispatch via provider1 (first healthy), got %q", result)
+	}
+
+	file, found, err := st.GetFile(ctx, lib.Name, videoPath)
+	if err != nil {
+		t.Fatalf("GetFile: %v", err)
+	}
+	if !found || file.Languages[0].Status != domain.StatusSynced {
+		t.Fatalf("expected Synced, got %+v", file)
+	}
+}
+
+// TestDispatcher_TierScopedSuspension_AllTier1SuspendedWaitsOnTier1 guards
+// that when every Provider in Tier 1 is Suspended, a Pending pair stays
+// Pending waiting on Tier 1 — it does NOT fall through to an available
+// Tier 2.
+func TestDispatcher_TierScopedSuspension_AllTier1SuspendedWaitsOnTier1(t *testing.T) {
+	libDir := t.TempDir()
+	videoPath := filepath.Join(libDir, "Test.Movie.2024.HDTV.x264-FAKEGROUP.mp4")
+	writeVideoFixture(t, videoPath)
+
+	st := openTestStore(t)
+	candidateContent := "1\n00:00:00,500 --> 00:00:01,900\nOne two three\n"
+
+	// Tier 1 Provider: Suspended
+	tier1Provider := &provider.Fake{
+		SearchFunc: func(ctx context.Context, q provider.Query) ([]domain.Candidate, error) {
+			t.Fatal("Tier 1 Provider Search should not be called while Suspended")
+			return nil, nil
+		},
+		SuspendedFunc: func() (time.Time, bool) {
+			return time.Now().Add(time.Hour), true
+		},
+	}
+
+	// Tier 2 Provider: available, but should NOT be used
+	tier2Provider := &provider.Fake{
+		SearchFunc: func(ctx context.Context, q provider.Query) ([]domain.Candidate, error) {
+			t.Fatal("Tier 2 Provider Search should not be called when Tier 1 is Suspended")
+			return []domain.Candidate{{ID: "candidate", Title: "Test Movie", Year: 2024}}, nil
+		},
+		DownloadFunc: func(ctx context.Context, c domain.Candidate) ([]byte, error) {
+			return []byte(candidateContent), nil
+		},
+		SuspendedFunc: func() (time.Time, bool) {
+			return time.Time{}, false
+		},
+	}
+
+	lib := domain.Library{
+		Name:       "test-library",
+		Path:       libDir,
+		Languages:  []language.Tag{language.English},
+		StripScope: domain.StripScopeAll,
+	}
+
+	tier1Pipeline := &pipeline.Pipeline{
+		Store:      st,
+		Provider:   tier1Provider,
+		SyncEngine: &syncengine.FakeSyncEngine{},
+		Stripper:   &pipeline.FakeStripper{},
+	}
+	tier2Pipeline := &pipeline.Pipeline{
+		Store:      st,
+		Provider:   tier2Provider,
+		SyncEngine: &syncengine.FakeSyncEngine{},
+		Stripper:   &pipeline.FakeStripper{},
+	}
+
+	ctx := context.Background()
+	if _, err := tier1Pipeline.Run(ctx, lib); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	// Two separate Tiers: Tier 1 (Suspended), Tier 2 (available)
+	d := &dispatcher.Dispatcher{
+		ProviderTiers: []dispatcher.ProviderTier{
+			{Providers: []dispatcher.ProviderEntry{
+				{Name: "tier1-provider", Pipeline: tier1Pipeline, WorkerCount: 2},
+			}},
+			{Providers: []dispatcher.ProviderEntry{
+				{Name: "tier2-provider", Pipeline: tier2Pipeline, WorkerCount: 2},
+			}},
+		},
+		Store:     st,
+		Libraries: []domain.Library{lib},
+	}
+	if err := d.RunOnce(ctx); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+
+	// Pair should stay Pending, waiting on Tier 1
+	file, found, err := st.GetFile(ctx, lib.Name, videoPath)
+	if err != nil {
+		t.Fatalf("GetFile: %v", err)
+	}
+	if !found || file.Languages[0].Status != domain.StatusPending {
+		t.Fatalf("expected pair to stay Pending (waiting on Tier 1), got %+v", file)
+	}
+}
+
+// TestDispatcher_TierScopedSuspension_SingleProviderTierBehavesLikeLegacy
+// guards that a single-Provider Tier behaves exactly like the legacy
+// single-entry-chain: a Suspended Provider leaves the pair waiting.
+func TestDispatcher_TierScopedSuspension_SingleProviderTierBehavesLikeLegacy(t *testing.T) {
+	libDir := t.TempDir()
+	videoPath := filepath.Join(libDir, "Test.Movie.2024.HDTV.x264-FAKEGROUP.mp4")
+	writeVideoFixture(t, videoPath)
+
+	st := openTestStore(t)
+
+	// Single provider: Suspended
+	prov := &provider.Fake{
+		SearchFunc: func(ctx context.Context, q provider.Query) ([]domain.Candidate, error) {
+			t.Fatal("Search should not be called while Suspended")
+			return nil, nil
+		},
+		SuspendedFunc: func() (time.Time, bool) {
+			return time.Now().Add(time.Hour), true
+		},
+	}
+
+	lib := domain.Library{
+		Name:       "test-library",
+		Path:       libDir,
+		Languages:  []language.Tag{language.English},
+		StripScope: domain.StripScopeAll,
+	}
+
+	p := &pipeline.Pipeline{
+		Store:      st,
+		Provider:   prov,
+		SyncEngine: &syncengine.FakeSyncEngine{},
+		Stripper:   &pipeline.FakeStripper{},
+	}
+
+	ctx := context.Background()
+	if _, err := p.Run(ctx, lib); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	// Single-Provider Tier
+	d := &dispatcher.Dispatcher{
+		ProviderTiers: []dispatcher.ProviderTier{{
+			Providers: []dispatcher.ProviderEntry{
+				{Name: "provider", Pipeline: p, WorkerCount: 2},
+			},
+		}},
+		Store:     st,
+		Libraries: []domain.Library{lib},
+	}
+	if err := d.RunOnce(ctx); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+
+	file, found, err := st.GetFile(ctx, lib.Name, videoPath)
+	if err != nil {
+		t.Fatalf("GetFile: %v", err)
+	}
+	if !found || file.Languages[0].Status != domain.StatusPending {
+		t.Fatalf("expected pair to stay Pending, got %+v", file)
+	}
+}

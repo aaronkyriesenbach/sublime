@@ -127,10 +127,10 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 	defer func() { _ = st.Close() }()
 
 	secrets := config.LoadProviderSecrets()
-	p, providerStatuses, err := pipeline.NewProduction(pipeline.ProductionConfig{
+	p, providerStatuses, tierStatuses, err := pipeline.NewProduction(pipeline.ProductionConfig{
 		Store:         st,
 		Secrets:       secrets,
-		ProviderChain: cfg.ProviderChain,
+		ProviderTiers: cfg.ProviderTiers,
 		Logger:        logger,
 	})
 	if err != nil {
@@ -138,10 +138,21 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 	}
 
 	apiProviders := make([]api.ProviderStatusFunc, 0, len(providerStatuses))
-	providerEntries := make([]dispatcher.ProviderEntry, 0, len(providerStatuses))
 	for _, ps := range providerStatuses {
 		apiProviders = append(apiProviders, api.ProviderStatusFunc{Name: ps.Name, Status: ps.Suspension})
-		providerEntries = append(providerEntries, dispatcher.ProviderEntry{Pipeline: ps.Pipeline, WorkerCount: ps.WorkerCount})
+	}
+
+	providerTiers := make([]dispatcher.ProviderTier, 0, len(tierStatuses))
+	for _, ts := range tierStatuses {
+		entries := make([]dispatcher.ProviderEntry, 0, len(ts.Providers))
+		for _, ps := range ts.Providers {
+			entries = append(entries, dispatcher.ProviderEntry{
+				Name:        ps.Name,
+				Pipeline:    ps.Pipeline,
+				WorkerCount: ps.WorkerCount,
+			})
+		}
+		providerTiers = append(providerTiers, dispatcher.ProviderTier{Providers: entries})
 	}
 
 	apiServer := api.NewServer(api.Deps{
@@ -184,11 +195,11 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 	}
 
 	d := &dispatcher.Dispatcher{
-		Providers:    providerEntries,
-		Store:        st,
-		Libraries:    cfg.Libraries,
-		PollInterval: opts.DispatchPollInterval,
-		Logger:       logger,
+		ProviderTiers: providerTiers,
+		Store:         st,
+		Libraries:     cfg.Libraries,
+		PollInterval:  opts.DispatchPollInterval,
+		Logger:        logger,
 	}
 	wg.Add(1)
 	go func() {

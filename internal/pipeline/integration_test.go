@@ -354,7 +354,7 @@ func TestIntegration_NewProduction_Success(t *testing.T) {
 	}
 	defer func() { _ = st.Close() }()
 
-	p, providerStatuses, err := pipeline.NewProduction(pipeline.ProductionConfig{
+	p, providerStatuses, _, err := pipeline.NewProduction(pipeline.ProductionConfig{
 		Store: st,
 		Secrets: config.ProviderSecrets{
 			OpenSubtitles: config.OpenSubtitlesSecrets{
@@ -405,7 +405,7 @@ func TestIntegration_NewProduction_MultiProviderChain(t *testing.T) {
 	}
 	defer func() { _ = st.Close() }()
 
-	p, providerStatuses, err := pipeline.NewProduction(pipeline.ProductionConfig{
+	p, providerStatuses, _, err := pipeline.NewProduction(pipeline.ProductionConfig{
 		Store: st,
 		Secrets: config.ProviderSecrets{
 			OpenSubtitles: config.OpenSubtitlesSecrets{
@@ -476,7 +476,7 @@ func TestIntegration_NewProduction_UnknownProviderInChain(t *testing.T) {
 	}
 	defer func() { _ = st.Close() }()
 
-	_, _, err = pipeline.NewProduction(pipeline.ProductionConfig{
+	_, _, _, err = pipeline.NewProduction(pipeline.ProductionConfig{
 		Store:         st,
 		ProviderChain: []config.ProviderConfig{{Name: "not-a-real-provider"}},
 	})
@@ -493,7 +493,7 @@ func TestIntegration_NewProduction_MissingSecrets(t *testing.T) {
 	}
 	defer func() { _ = st.Close() }()
 
-	_, _, err = pipeline.NewProduction(pipeline.ProductionConfig{
+	_, _, _, err = pipeline.NewProduction(pipeline.ProductionConfig{
 		Store:   st,
 		Secrets: config.ProviderSecrets{},
 	})
