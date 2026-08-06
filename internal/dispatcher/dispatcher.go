@@ -9,6 +9,8 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/text/language"
+
 	"github.com/aaronkyriesenbach/sublime/internal/domain"
 	"github.com/aaronkyriesenbach/sublime/internal/pipeline"
 	"github.com/aaronkyriesenbach/sublime/internal/store"
@@ -139,6 +141,43 @@ func (d *Dispatcher) pipelineSuspended(p *pipeline.Pipeline) bool {
 	return suspended
 }
 
+// allProvidersAttempted checks whether every configured Provider (across
+// all Tiers, or the single Provider in legacy mode, or the chain in flat
+// chain mode) is in the pair's attempted-set — i.e., has already searched
+// and missed for this (file, language) pair's current cycle.
+func (d *Dispatcher) allProvidersAttempted(ctx context.Context, fileID int64, lang language.Tag) bool {
+	attempted, err := d.Store.AttemptedProviders(ctx, fileID, lang)
+	if err != nil {
+		return false
+	}
+	attemptedSet := make(map[string]bool, len(attempted))
+	for _, name := range attempted {
+		attemptedSet[name] = true
+	}
+
+	if len(d.ProviderTiers) > 0 {
+		for _, tier := range d.ProviderTiers {
+			for _, entry := range tier.Providers {
+				if !attemptedSet[entry.Name] {
+					return false
+				}
+			}
+		}
+		return true
+	}
+
+	if len(d.Providers) > 0 {
+		for _, entry := range d.Providers {
+			if !attemptedSet[entry.Name] {
+				return false
+			}
+		}
+		return true
+	}
+
+	return attemptedSet["default"]
+}
+
 // RunOnce performs one deterministic dispatch pass: it snapshots every
 // (file, language) pair currently in StatusPending across every configured
 // Library (store.Store.PendingPairs), then processes that snapshot
@@ -214,9 +253,17 @@ func (d *Dispatcher) runOnceLegacyMode(ctx context.Context, pairs []store.Pendin
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			if err := d.Pipeline.ProcessPending(ctx, lib, pair.FileID, pair.ContentHash, pair.Path, pair.Language, pair.Force); err != nil {
+			// Legacy mode: single provider, use "default" as provider name.
+			// A no-candidate miss here is terminal (single provider = exhausted).
+			result := d.Pipeline.ProcessPending(ctx, lib, pair.FileID, pair.ContentHash, pair.Path, pair.Language, pair.Force, "default")
+			if result.Outcome == pipeline.OutcomeNoCandidateMiss {
+				if err := d.Store.MarkFailed(ctx, pair.FileID, pair.Language, domain.FailureNoCandidate); err != nil {
+					d.logger().Error("dispatcher: marking failed after provider exhaustion",
+						"library", lib.Name, "path", pair.Path, "language", pair.Language.String(), "error", err)
+				}
+			} else if result.Err != nil {
 				d.logger().Error("dispatcher: processing pending pair failed",
-					"library", lib.Name, "path", pair.Path, "language", pair.Language.String(), "error", err)
+					"library", lib.Name, "path", pair.Path, "language", pair.Language.String(), "error", result.Err)
 			}
 		}(pair, lib)
 	}
@@ -229,7 +276,6 @@ func (d *Dispatcher) runOnceLegacyMode(ctx context.Context, pairs []store.Pendin
 // Each Provider gets its own semaphore, and for each pair we walk the chain
 // to find the first Provider that isn't Suspended and has spare capacity.
 func (d *Dispatcher) runOnceChainMode(ctx context.Context, pairs []store.PendingPair, librariesByName map[string]domain.Library) error {
-	// Build per-provider semaphores
 	type providerPool struct {
 		entry ProviderEntry
 		sem   chan struct{}
@@ -259,30 +305,35 @@ func (d *Dispatcher) runOnceChainMode(ctx context.Context, pairs []store.Pending
 			continue
 		}
 
-		// Walk the chain to find the first available provider
 		var claimed bool
 		for i := range pools {
 			pool := &pools[i]
 
-			// Skip if this provider is Suspended
 			if d.pipelineSuspended(pool.entry.Pipeline) {
 				continue
 			}
 
-			// Try to acquire a worker slot (non-blocking)
 			select {
 			case pool.sem <- struct{}{}:
 				claimed = true
 				wg.Add(1)
-				go func(p *pipeline.Pipeline, sem chan struct{}, pair store.PendingPair, lib domain.Library) {
+				go func(p *pipeline.Pipeline, name string, sem chan struct{}, pair store.PendingPair, lib domain.Library) {
 					defer wg.Done()
 					defer func() { <-sem }()
 
-					if err := p.ProcessPending(ctx, lib, pair.FileID, pair.ContentHash, pair.Path, pair.Language, pair.Force); err != nil {
+					result := p.ProcessPending(ctx, lib, pair.FileID, pair.ContentHash, pair.Path, pair.Language, pair.Force, name)
+					if result.Outcome == pipeline.OutcomeNoCandidateMiss {
+						if d.allProvidersAttempted(ctx, pair.FileID, pair.Language) {
+							if err := d.Store.MarkFailed(ctx, pair.FileID, pair.Language, domain.FailureNoCandidate); err != nil {
+								d.logger().Error("dispatcher: marking failed after provider exhaustion",
+									"library", lib.Name, "path", pair.Path, "language", pair.Language.String(), "error", err)
+							}
+						}
+					} else if result.Err != nil {
 						d.logger().Error("dispatcher: processing pending pair failed",
-							"library", lib.Name, "path", pair.Path, "language", pair.Language.String(), "error", err)
+							"provider", name, "library", lib.Name, "path", pair.Path, "language", pair.Language.String(), "error", result.Err)
 					}
-				}(pool.entry.Pipeline, pool.sem, pair, lib)
+				}(pool.entry.Pipeline, pool.entry.Name, pool.sem, pair, lib)
 			default:
 				continue
 			}
@@ -313,8 +364,15 @@ type tierPool struct {
 // healthy (non-Suspended) Provider with spare capacity is used. Suspension
 // may skip to a Tier-mate but never crosses a Tier boundary: if every
 // Provider in the current Tier is Suspended, the pair stays Pending.
+// runOnceTierMode handles the Tier-grouped Provider Chain dispatch mode
+// (ProviderTiers non-empty). Each Provider gets its own semaphore, and for
+// each pair we walk Tiers in priority order. Within a Tier, the first
+// healthy (non-Suspended, non-already-attempted) Provider with spare
+// capacity is used. Suspension may skip to a Tier-mate but never crosses a
+// Tier boundary: if every Provider in the current Tier is Suspended, the
+// pair stays Pending. When all Providers across all Tiers have been
+// attempted, the Dispatcher marks the pair Failed(no_candidate).
 func (d *Dispatcher) runOnceTierMode(ctx context.Context, pairs []store.PendingPair, librariesByName map[string]domain.Library) error {
-	// Build per-provider semaphores, grouped by tier
 	tierPools := make([][]tierPool, len(d.ProviderTiers))
 	totalProviders := 0
 	for _, tier := range d.ProviderTiers {
@@ -352,9 +410,18 @@ pairLoop:
 			continue
 		}
 
-		// Walk tiers in priority order
+		attempted, err := d.Store.AttemptedProviders(ctx, pair.FileID, pair.Language)
+		if err != nil {
+			d.logger().Error("dispatcher: reading attempted providers",
+				"library", lib.Name, "path", pair.Path, "language", pair.Language.String(), "error", err)
+			continue
+		}
+		attemptedSet := make(map[string]bool, len(attempted))
+		for _, name := range attempted {
+			attemptedSet[name] = true
+		}
+
 		for tierIdx, pools := range tierPools {
-			// Check if ALL providers in this tier are Suspended
 			allSuspended := true
 			for j := range pools {
 				if !d.pipelineSuspended(pools[j].entry.Pipeline) {
@@ -363,23 +430,22 @@ pairLoop:
 				}
 			}
 			if allSuspended {
-				// Every provider in this tier is Suspended; leave pair
-				// Pending waiting on this tier (don't descend to next tier)
 				d.logger().Debug("dispatcher: tier fully suspended, waiting",
 					"tier", tierIdx, "path", pair.Path, "language", pair.Language.String())
 				continue pairLoop
 			}
 
-			// Walk providers within this tier in list order (soft preference)
 			for j := range pools {
 				pool := &pools[j]
 
-				// Skip Suspended providers (may skip to Tier-mate)
 				if d.pipelineSuspended(pool.entry.Pipeline) {
 					continue
 				}
 
-				// Try to acquire a worker slot (non-blocking)
+				if attemptedSet[pool.entry.Name] {
+					continue
+				}
+
 				select {
 				case pool.sem <- struct{}{}:
 					wg.Add(1)
@@ -387,9 +453,17 @@ pairLoop:
 						defer wg.Done()
 						defer func() { <-sem }()
 
-						if err := p.ProcessPending(ctx, lib, pair.FileID, pair.ContentHash, pair.Path, pair.Language, pair.Force); err != nil {
+						result := p.ProcessPending(ctx, lib, pair.FileID, pair.ContentHash, pair.Path, pair.Language, pair.Force, name)
+						if result.Outcome == pipeline.OutcomeNoCandidateMiss {
+							if d.allProvidersAttempted(ctx, pair.FileID, pair.Language) {
+								if err := d.Store.MarkFailed(ctx, pair.FileID, pair.Language, domain.FailureNoCandidate); err != nil {
+									d.logger().Error("dispatcher: marking failed after provider exhaustion",
+										"library", lib.Name, "path", pair.Path, "language", pair.Language.String(), "error", err)
+								}
+							}
+						} else if result.Err != nil {
 							d.logger().Error("dispatcher: processing pending pair failed",
-								"provider", name, "library", lib.Name, "path", pair.Path, "language", pair.Language.String(), "error", err)
+								"provider", name, "library", lib.Name, "path", pair.Path, "language", pair.Language.String(), "error", result.Err)
 						}
 					}(pool.entry.Pipeline, pool.entry.Name, pool.sem, pair, lib)
 					continue pairLoop
@@ -397,7 +471,6 @@ pairLoop:
 					continue
 				}
 			}
-			// Tier has healthy providers but no capacity; continue to next tier
 		}
 
 		if ctx.Err() != nil {
