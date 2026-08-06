@@ -47,13 +47,13 @@ func (e *AuthenticationError) Error() string {
 
 // client is the low-level HTTP transport for the OpenSubtitles API: request
 // building, response classification, and wire-format JSON, with every
-// outgoing request routed through pacer.
+// outgoing request routed through retry.Pacer.
 type client struct {
 	baseURL    string
 	apiKey     string
 	userAgent  string
 	httpClient *http.Client
-	pacer      *pacer
+	pacer      *retry.Pacer
 	now        func() time.Time
 }
 
@@ -84,43 +84,43 @@ func (c *client) newRequest(ctx context.Context, method, path string, body any, 
 	return req, nil
 }
 
-// do sends a single JSON request through the pacer and decodes a
-// successful response into out (ignored if nil). It is an internal
-// plumbing helper: doJSON is the typed entry point every caller outside
-// this file actually uses. body and out are any here only because that is
-// encoding/json's own Marshal/Unmarshal contract (as in the standard
-// library, there is no way to call them without it) — doJSON's type
-// parameters are what keep every real call site fully typed.
-func (c *client) do(ctx context.Context, method, path string, body any, bearer string, out any) error {
-	return c.pacer.do(ctx, func(ctx context.Context) (outcome, error) {
-		req, err := c.newRequest(ctx, method, path, body, bearer)
-		if err != nil {
-			return outcome{}, err
-		}
-
-		resp, err := c.httpClient.Do(req)
-		if err != nil {
-			return outcome{}, err
-		}
-		defer func() { _ = resp.Body.Close() }()
-
-		data, err := io.ReadAll(resp.Body)
-		if err != nil {
-			return outcome{responded: true}, fmt.Errorf("opensubtitles: reading response from %s: %w", path, err)
-		}
-
-		oc, classifyErr := classifyResponse(resp.StatusCode, data, resp.Header, c.now())
-		if classifyErr != nil {
-			return oc, classifyErr
-		}
-		if out != nil && len(data) > 0 {
-			if err := json.Unmarshal(data, out); err != nil {
-				return oc, fmt.Errorf("opensubtitles: decoding response from %s: %w", path, err)
+	// do sends a single JSON request through the retry.Pacer and decodes a
+	// successful response into out (ignored if nil). It is an internal
+	// plumbing helper: doJSON is the typed entry point every caller outside
+	// this file actually uses. body and out are any here only because that is
+	// encoding/json's own Marshal/Unmarshal contract (as in the standard
+	// library, there is no way to call them without it) — doJSON's type
+	// parameters are what keep every real call site fully typed.
+	func (c *client) do(ctx context.Context, method, path string, body any, bearer string, out any) error {
+		return c.pacer.Do(ctx, func(ctx context.Context) (retry.Outcome, error) {
+			req, err := c.newRequest(ctx, method, path, body, bearer)
+			if err != nil {
+				return retry.Outcome{}, err
 			}
-		}
-		return oc, nil
-	})
-}
+
+			resp, err := c.httpClient.Do(req)
+			if err != nil {
+				return retry.Outcome{}, err
+			}
+			defer func() { _ = resp.Body.Close() }()
+
+			data, err := io.ReadAll(resp.Body)
+			if err != nil {
+				return retry.Outcome{Responded: true}, fmt.Errorf("opensubtitles: reading response from %s: %w", path, err)
+			}
+
+			oc, classifyErr := classifyResponse(resp.StatusCode, data, resp.Header, c.now())
+			if classifyErr != nil {
+				return oc, classifyErr
+			}
+			if out != nil && len(data) > 0 {
+				if err := json.Unmarshal(data, out); err != nil {
+					return oc, fmt.Errorf("opensubtitles: decoding response from %s: %w", path, err)
+				}
+			}
+			return oc, nil
+		})
+	}
 
 // doJSON is the typed entry point for a single JSON request: body is a
 // pointer to the request's own wire-format type (nil for a bodyless
@@ -143,57 +143,57 @@ func doJSON[Req any, Resp any](ctx context.Context, c *client, method, path stri
 	return out, err
 }
 
-// getRaw fetches path (an absolute URL, e.g. a signed download link)
-// through the pacer and returns its raw response body.
-func (c *client) getRaw(ctx context.Context, absoluteURL string) ([]byte, error) {
-	var data []byte
-	err := c.pacer.do(ctx, func(ctx context.Context) (outcome, error) {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, absoluteURL, nil)
-		if err != nil {
-			return outcome{}, err
-		}
-		req.Header.Set("User-Agent", c.userAgent)
+	// getRaw fetches path (an absolute URL, e.g. a signed download link)
+	// through the retry.Pacer and returns its raw response body.
+	func (c *client) getRaw(ctx context.Context, absoluteURL string) ([]byte, error) {
+		var data []byte
+		err := c.pacer.Do(ctx, func(ctx context.Context) (retry.Outcome, error) {
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, absoluteURL, nil)
+			if err != nil {
+				return retry.Outcome{}, err
+			}
+			req.Header.Set("User-Agent", c.userAgent)
 
-		resp, err := c.httpClient.Do(req)
-		if err != nil {
-			return outcome{}, err
-		}
-		defer func() { _ = resp.Body.Close() }()
+			resp, err := c.httpClient.Do(req)
+			if err != nil {
+				return retry.Outcome{}, err
+			}
+			defer func() { _ = resp.Body.Close() }()
 
-		body, err := io.ReadAll(resp.Body)
-		if err != nil {
-			return outcome{responded: true}, fmt.Errorf("opensubtitles: reading downloaded subtitle: %w", err)
-		}
+			body, err := io.ReadAll(resp.Body)
+			if err != nil {
+				return retry.Outcome{Responded: true}, fmt.Errorf("opensubtitles: reading downloaded subtitle: %w", err)
+			}
 
-		oc, classifyErr := classifyResponse(resp.StatusCode, body, resp.Header, c.now())
-		if classifyErr != nil {
-			return oc, classifyErr
-		}
-		data = body
-		return oc, nil
-	})
-	return data, err
-}
+			oc, classifyErr := classifyResponse(resp.StatusCode, body, resp.Header, c.now())
+			if classifyErr != nil {
+				return oc, classifyErr
+			}
+			data = body
+			return oc, nil
+		})
+		return data, err
+	}
 
-// classifyResponse turns a completed HTTP response into the pacer outcome
+// classifyResponse turns a completed HTTP response into the retry.Pacer outcome
 // to record and the error the caller should see: nil on 2xx, a
 // retry.TransientError on 429/5xx (adopting a Retry-After delay hint when
 // present, per retry.TransientAfter's contract), or a plain terminal
 // *apiError otherwise.
-func classifyResponse(statusCode int, body []byte, header http.Header, now time.Time) (outcome, error) {
+func classifyResponse(statusCode int, body []byte, header http.Header, now time.Time) (retry.Outcome, error) {
 	if statusCode >= 200 && statusCode < 300 {
-		return outcome{responded: true}, nil
+		return retry.Outcome{Responded: true}, nil
 	}
 
 	retryable := isRetryableStatus(statusCode)
-	oc := outcome{responded: true, retryable: retryable}
+	oc := retry.Outcome{Responded: true, Retryable: retryable}
 	apiErr := decodeAPIError(statusCode, body, now)
 
 	if !retryable {
 		return oc, apiErr
 	}
 	if hint, ok := parseRetryAfter(header.Get("Retry-After"), now); ok {
-		oc.delayHint = hint
+		oc.DelayHint = hint
 		return oc, retry.TransientAfter(apiErr, hint)
 	}
 	return oc, retry.Transient(apiErr)

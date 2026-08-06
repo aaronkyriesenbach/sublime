@@ -5,8 +5,8 @@
 // header plus a cached 24h Bearer JWT (auth.go), a `moviehash` search
 // parameter computed independently from Sublime's Content Hash
 // (moviehash.go), a two-step signed-URL download that consumes the daily
-// quota (client.go), and a serial, adaptively-paced outgoing queue
-// (pacer.go) layered on top of internal/retry's per-task retry engine.
+// quota (client.go), and a serial, adaptively-paced outgoing queue via
+// internal/retry's Pacer layered on top of per-task retry engine.
 package opensubtitles
 
 import (
@@ -16,7 +16,6 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
-	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -125,13 +124,13 @@ func New(cfg Config) (*Provider, error) {
 		now = time.Now
 	}
 
-	pacerCfg := pacerConfig{Pace: pace, MaxDelay: defaultMaxDelay, DecayThreshold: defaultDecayThreshold}
+	pacerCfg := retry.PacerConfig{Pace: pace, MaxDelay: defaultMaxDelay, DecayThreshold: defaultDecayThreshold}
 	c := &client{
 		baseURL:    baseURL,
 		apiKey:     cfg.Secrets.APIKey,
 		userAgent:  userAgent,
 		httpClient: httpClient,
-		pacer:      newPacer(pacerCfg, clock),
+		pacer:      retry.NewPacer(pacerCfg, clock),
 		now:        now,
 	}
 	executor := retry.NewExecutor(clock)
@@ -377,7 +376,7 @@ func candidatesFromResponse(resp searchResponseBody, hashMatch bool) []domain.Ca
 	var candidates []domain.Candidate
 	for _, item := range resp.Data {
 		fd := item.Attributes.FeatureDetails
-		source, releaseGroup, resolution, codec := parseCosmetics(item.Attributes.Release)
+		source, releaseGroup, resolution, codec := provider.ParseCosmetics(item.Attributes.Release)
 
 		title := fd.Title
 		if fd.ParentTitle != "" {
@@ -405,70 +404,4 @@ func candidatesFromResponse(resp searchResponseBody, hashMatch bool) []domain.Ca
 	return candidates
 }
 
-// Source, resolution, and codec token vocabulary mirrors the filename
-// attribute extraction decision (#29): the same subliminal/Bazarr scene-
-// release prior art, applied here to OpenSubtitles' own `release` string
-// instead of Sublime's video filename. Kept as a small local parser rather
-// than reusing scoring.Parse: that parser's contract requires a full
-// identity match (title+year) to succeed at all, which OpenSubtitles'
-// release string can't always guarantee (e.g. many episode releases omit a
-// year) — reusing it here would silently discard cosmetic tags whenever
-// that unrelated check fails.
-var (
-	cosmeticSourceToken     = regexp.MustCompile(`(?i)^(bluray|web-dl|webrip|hdtv|dvdrip)$`)
-	cosmeticResolutionToken = regexp.MustCompile(`(?i)^(2160p|1080p|720p|480p)$`)
-	cosmeticCodecToken      = regexp.MustCompile(`(?i)^(x264|x265|hevc|av1)$`)
-)
 
-// parseCosmetics extracts a Candidate's cosmetic attributes from
-// OpenSubtitles' scene-release-style `release` string (e.g.
-// "Arrival.2016.1080p.BluRay.x264-GROUP"). Any dimension without a
-// recognized token is left empty, matching Sublime's "missing cosmetic
-// attribute scores 0" convention (internal/scoring) rather than erroring.
-func parseCosmetics(release string) (source, releaseGroup, resolution, codec string) {
-	releaseGroup, remaining := extractCosmeticReleaseGroup(release)
-
-	replacer := strings.NewReplacer(".", " ", "_", " ")
-	for _, tok := range strings.Fields(replacer.Replace(remaining)) {
-		tok = strings.Trim(tok, "()[]{}")
-		switch {
-		case source == "" && cosmeticSourceToken.MatchString(tok):
-			source = tok
-		case resolution == "" && cosmeticResolutionToken.MatchString(tok):
-			resolution = tok
-		case codec == "" && cosmeticCodecToken.MatchString(tok):
-			codec = tok
-		}
-	}
-	return source, releaseGroup, resolution, codec
-}
-
-func isRecognizedCosmeticTag(token string) bool {
-	return cosmeticSourceToken.MatchString(token) || cosmeticResolutionToken.MatchString(token) || cosmeticCodecToken.MatchString(token)
-}
-
-// extractCosmeticReleaseGroup splits the last hyphen-delimited token off
-// release's final dot-segment as the release group, per scene-release
-// convention (e.g. "x264-GROUP") — the same heuristic as scoring's filename
-// parser (#29), applied to OpenSubtitles' release string instead of a
-// filename.
-func extractCosmeticReleaseGroup(release string) (group string, remaining string) {
-	prefix := ""
-	lastSeg := release
-	if i := strings.LastIndex(release, "."); i != -1 {
-		prefix = release[:i+1]
-		lastSeg = release[i+1:]
-	}
-
-	if !strings.Contains(lastSeg, "-") || strings.Contains(lastSeg, " ") || isRecognizedCosmeticTag(lastSeg) {
-		return "", release
-	}
-
-	i := strings.LastIndex(lastSeg, "-")
-	segPrefix, segSuffix := lastSeg[:i], lastSeg[i+1:]
-	if isRecognizedCosmeticTag(segSuffix) {
-		return "", release
-	}
-
-	return segSuffix, prefix + segPrefix
-}

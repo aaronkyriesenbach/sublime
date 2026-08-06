@@ -1,4 +1,4 @@
-package opensubtitles
+package retry
 
 import (
 	"context"
@@ -7,35 +7,22 @@ import (
 	"time"
 )
 
-// fakeClock is a test double for retry.Clock: it never actually sleeps,
-// just records the delay it was asked to wait for, mirroring the
-// internal/retry package's own test convention.
-type fakeClock struct {
-	delays []time.Duration
-	err    error
+func testPacerConfig() PacerConfig {
+	return PacerConfig{Pace: time.Second, MaxDelay: 60 * time.Second, DecayThreshold: 10}
 }
 
-func (f *fakeClock) Sleep(_ context.Context, d time.Duration) error {
-	f.delays = append(f.delays, d)
-	return f.err
-}
-
-func testPacerConfig() pacerConfig {
-	return pacerConfig{Pace: time.Second, MaxDelay: 60 * time.Second, DecayThreshold: 10}
-}
-
-func cleanOutcome() outcome     { return outcome{responded: true} }
-func retryableOutcome() outcome { return outcome{responded: true, retryable: true} }
+func cleanOutcome() Outcome     { return Outcome{Responded: true} }
+func retryableOutcome() Outcome { return Outcome{Responded: true, Retryable: true} }
 
 func TestPacer_FirstDispatchDoesNotWait(t *testing.T) {
 	clock := &fakeClock{}
-	p := newPacer(testPacerConfig(), clock)
+	p := NewPacer(testPacerConfig(), clock)
 
-	err := p.do(context.Background(), func(_ context.Context) (outcome, error) {
+	err := p.Do(context.Background(), func(_ context.Context) (Outcome, error) {
 		return cleanOutcome(), nil
 	})
 	if err != nil {
-		t.Fatalf("do() error = %v", err)
+		t.Fatalf("Do() error = %v", err)
 	}
 	if len(clock.delays) != 0 {
 		t.Errorf("delays = %v, want none before the first dispatch", clock.delays)
@@ -44,18 +31,18 @@ func TestPacer_FirstDispatchDoesNotWait(t *testing.T) {
 
 func TestPacer_SubsequentDispatchWaitsThePace(t *testing.T) {
 	clock := &fakeClock{}
-	p := newPacer(testPacerConfig(), clock)
+	p := NewPacer(testPacerConfig(), clock)
 
 	call := func() error {
-		return p.do(context.Background(), func(_ context.Context) (outcome, error) {
+		return p.Do(context.Background(), func(_ context.Context) (Outcome, error) {
 			return cleanOutcome(), nil
 		})
 	}
 	if err := call(); err != nil {
-		t.Fatalf("first do() error = %v", err)
+		t.Fatalf("first Do() error = %v", err)
 	}
 	if err := call(); err != nil {
-		t.Fatalf("second do() error = %v", err)
+		t.Fatalf("second Do() error = %v", err)
 	}
 
 	if len(clock.delays) != 1 || clock.delays[0] != time.Second {
@@ -65,14 +52,14 @@ func TestPacer_SubsequentDispatchWaitsThePace(t *testing.T) {
 
 func TestPacer_WidensOnRetryableResponse(t *testing.T) {
 	clock := &fakeClock{}
-	p := newPacer(testPacerConfig(), clock)
+	p := NewPacer(testPacerConfig(), clock)
 
 	// First dispatch: a 429/5xx, which should double the delay applied
 	// before the next one.
-	_ = p.do(context.Background(), func(_ context.Context) (outcome, error) {
+	_ = p.Do(context.Background(), func(_ context.Context) (Outcome, error) {
 		return retryableOutcome(), errors.New("429")
 	})
-	_ = p.do(context.Background(), func(_ context.Context) (outcome, error) {
+	_ = p.Do(context.Background(), func(_ context.Context) (Outcome, error) {
 		return cleanOutcome(), nil
 	})
 
@@ -83,10 +70,10 @@ func TestPacer_WidensOnRetryableResponse(t *testing.T) {
 
 func TestPacer_WidenDoublesRepeatedlyAndCapsAtMaxDelay(t *testing.T) {
 	clock := &fakeClock{}
-	p := newPacer(testPacerConfig(), clock)
+	p := NewPacer(testPacerConfig(), clock)
 
-	dispatch := func(oc outcome) {
-		_ = p.do(context.Background(), func(_ context.Context) (outcome, error) {
+	dispatch := func(oc Outcome) {
+		_ = p.Do(context.Background(), func(_ context.Context) (Outcome, error) {
 			return oc, nil
 		})
 	}
@@ -112,15 +99,15 @@ func TestPacer_WidenDoublesRepeatedlyAndCapsAtMaxDelay(t *testing.T) {
 
 func TestPacer_AdoptsProviderDelayHintDirectlyInsteadOfDoubling(t *testing.T) {
 	clock := &fakeClock{}
-	p := newPacer(testPacerConfig(), clock)
+	p := NewPacer(testPacerConfig(), clock)
 
-	_ = p.do(context.Background(), func(_ context.Context) (outcome, error) {
+	_ = p.Do(context.Background(), func(_ context.Context) (Outcome, error) {
 		return cleanOutcome(), nil
 	})
-	_ = p.do(context.Background(), func(_ context.Context) (outcome, error) {
-		return outcome{responded: true, retryable: true, delayHint: 45 * time.Second}, nil
+	_ = p.Do(context.Background(), func(_ context.Context) (Outcome, error) {
+		return Outcome{Responded: true, Retryable: true, DelayHint: 45 * time.Second}, nil
 	})
-	_ = p.do(context.Background(), func(_ context.Context) (outcome, error) {
+	_ = p.Do(context.Background(), func(_ context.Context) (Outcome, error) {
 		return cleanOutcome(), nil
 	})
 
@@ -137,15 +124,15 @@ func TestPacer_AdoptsProviderDelayHintDirectlyInsteadOfDoubling(t *testing.T) {
 
 func TestPacer_DelayHintIsCappedAtMaxDelay(t *testing.T) {
 	clock := &fakeClock{}
-	p := newPacer(testPacerConfig(), clock)
+	p := NewPacer(testPacerConfig(), clock)
 
-	_ = p.do(context.Background(), func(_ context.Context) (outcome, error) {
+	_ = p.Do(context.Background(), func(_ context.Context) (Outcome, error) {
 		return cleanOutcome(), nil
 	})
-	_ = p.do(context.Background(), func(_ context.Context) (outcome, error) {
-		return outcome{responded: true, retryable: true, delayHint: 5 * time.Minute}, nil
+	_ = p.Do(context.Background(), func(_ context.Context) (Outcome, error) {
+		return Outcome{Responded: true, Retryable: true, DelayHint: 5 * time.Minute}, nil
 	})
-	_ = p.do(context.Background(), func(_ context.Context) (outcome, error) {
+	_ = p.Do(context.Background(), func(_ context.Context) (Outcome, error) {
 		return cleanOutcome(), nil
 	})
 
@@ -162,10 +149,10 @@ func TestPacer_DelayHintIsCappedAtMaxDelay(t *testing.T) {
 
 func TestPacer_DecaysAfterTenConsecutiveCleanResponses(t *testing.T) {
 	clock := &fakeClock{}
-	p := newPacer(testPacerConfig(), clock)
+	p := NewPacer(testPacerConfig(), clock)
 
-	dispatch := func(oc outcome) {
-		_ = p.do(context.Background(), func(_ context.Context) (outcome, error) {
+	dispatch := func(oc Outcome) {
+		_ = p.Do(context.Background(), func(_ context.Context) (Outcome, error) {
 			return oc, nil
 		})
 	}
@@ -203,22 +190,22 @@ func TestPacer_DecaysAfterTenConsecutiveCleanResponses(t *testing.T) {
 
 func TestPacer_DoesNotUpdateStateWhenNoResponseWasReceived(t *testing.T) {
 	clock := &fakeClock{}
-	p := newPacer(testPacerConfig(), clock)
+	p := NewPacer(testPacerConfig(), clock)
 
-	dispatch := func(oc outcome, err error) error {
-		return p.do(context.Background(), func(_ context.Context) (outcome, error) {
+	dispatch := func(oc Outcome, err error) error {
+		return p.Do(context.Background(), func(_ context.Context) (Outcome, error) {
 			return oc, err
 		})
 	}
 
 	_ = dispatch(cleanOutcome(), nil)
 	transportErr := errors.New("connection refused")
-	if err := dispatch(outcome{}, transportErr); !errors.Is(err, transportErr) {
-		t.Fatalf("do() error = %v, want %v", err, transportErr)
+	if err := dispatch(Outcome{}, transportErr); !errors.Is(err, transportErr) {
+		t.Fatalf("Do() error = %v, want %v", err, transportErr)
 	}
 	_ = dispatch(cleanOutcome(), nil)
 
-	// The transport failure carried outcome{} (responded: false) and must
+	// The transport failure carried Outcome{} (Responded: false) and must
 	// not have nudged the clean streak or delay: the pace stays at 1s.
 	want := []time.Duration{1 * time.Second, 1 * time.Second}
 	if len(clock.delays) != len(want) {
@@ -228,33 +215,33 @@ func TestPacer_DoesNotUpdateStateWhenNoResponseWasReceived(t *testing.T) {
 
 func TestPacer_PropagatesErrorFromCallback(t *testing.T) {
 	clock := &fakeClock{}
-	p := newPacer(testPacerConfig(), clock)
+	p := NewPacer(testPacerConfig(), clock)
 
 	sentinel := errors.New("boom")
-	err := p.do(context.Background(), func(_ context.Context) (outcome, error) {
+	err := p.Do(context.Background(), func(_ context.Context) (Outcome, error) {
 		return retryableOutcome(), sentinel
 	})
 	if !errors.Is(err, sentinel) {
-		t.Fatalf("do() error = %v, want %v", err, sentinel)
+		t.Fatalf("Do() error = %v, want %v", err, sentinel)
 	}
 }
 
 func TestPacer_StopsWaitingWhenClockErrors(t *testing.T) {
 	clock := &fakeClock{err: context.Canceled}
-	p := newPacer(testPacerConfig(), clock)
+	p := NewPacer(testPacerConfig(), clock)
 
 	calls := 0
 	dispatch := func() error {
-		return p.do(context.Background(), func(_ context.Context) (outcome, error) {
+		return p.Do(context.Background(), func(_ context.Context) (Outcome, error) {
 			calls++
 			return cleanOutcome(), nil
 		})
 	}
 	if err := dispatch(); err != nil {
-		t.Fatalf("first do() error = %v", err)
+		t.Fatalf("first Do() error = %v", err)
 	}
 	if err := dispatch(); !errors.Is(err, context.Canceled) {
-		t.Fatalf("second do() error = %v, want %v", err, context.Canceled)
+		t.Fatalf("second Do() error = %v, want %v", err, context.Canceled)
 	}
 	if calls != 1 {
 		t.Errorf("callback invoked %d times, want 1 (second call should stop at the cancelled sleep)", calls)
