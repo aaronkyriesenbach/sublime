@@ -44,8 +44,12 @@ _Avoid_: Scanner, Watcher (the Go type implementing the live-watch Trigger speci
 The component that claims Pending (file, language) pairs and hands them to a Provider for real work (Search through Sync) — one dispatch loop shared across every Library, independent of any single Trigger. Honors each pair's Provider Chain and each Provider's Suspended state: a pair whose next Provider is Suspended is left Pending rather than dispatched, until that Provider resumes.
 _Avoid_: Scheduler, Worker (a Dispatcher's execution unit, not the Dispatcher itself)
 
+**Tier**:
+A named rank within a Provider Chain holding one or more Providers the operator trusts equally at that priority level. List order inside a Tier is still a soft preference — the first healthy, non-Suspended Provider is tried first — but any Provider in a Tier is an acceptable substitute for another: a pair's dispatch is only ever gated by Suspension at the Tier boundary, never within a lower-vs-higher Tier comparison across the whole chain.
+_Avoid_: Rank, Priority group
+
 **Provider Chain**:
-The ordered sequence of Providers a single (file, language) pair may be attempted against, in priority order (e.g., highest subtitle quality first). A pair advances to the next Provider in its chain only when the current Provider completes a Search and finds no Candidate clearing the scoring cutoff — never because the current Provider is Suspended, which instead leaves the pair waiting on that same Provider. Failed's `no_candidate` reason is reached only once every Provider in the chain has been tried and found nothing.
+The ordered sequence of Tiers a single (file, language) pair may be attempted against, highest Tier first. A pair advances to the next Provider — first to the next Provider within its current Tier, then into the next Tier — only once every Provider it has tried has completed a real Search and found no Candidate clearing the scoring cutoff; Sublime remembers which Providers a pair has already tried and missed, so this walk can span many dispatch passes rather than needing to finish in one. Suspension gates dispatch differently from a no-candidate miss: a Suspended Provider is skipped in favor of a Tier-mate, but never in favor of a lower Tier — every Provider in the current Tier being Suspended leaves the pair waiting on that Tier rather than descending. Failed's `no_candidate` reason is reached only once every Provider in every Tier of the chain has been tried and found nothing.
 _Avoid_: Fallback (describes the mechanism informally; Provider Chain is the noun for the ordered list itself), Priority list
 
 **Sync Engine**:
