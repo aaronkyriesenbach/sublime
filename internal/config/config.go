@@ -28,15 +28,19 @@ type ProviderConfig struct {
 	// WorkerCount is the number of concurrent workers allocated to this
 	// Provider's pool. Zero means split evenly among all Providers.
 	WorkerCount int
+
+	// Paid is SubDL-specific: whether to use SubDL's paid tier. It is
+	// meaningless for other Providers.
+	Paid bool
 }
 
 // rawConfig mirrors config.yaml's on-disk shape before validation and
 // conversion into domain types. KnownFields decoding on this struct is what
-// rejects a stray `providers:` section: Provider secrets come from env vars
-// only (see ProviderSecrets), never the config file.
+// rejects a stray key under `providers:`: Provider secrets come from env
+// vars only (see ProviderSecrets), never the config file.
 type rawConfig struct {
-	Libraries     []rawLibrary      `yaml:"libraries"`
-	ProviderChain []rawProviderConf `yaml:"provider_chain"`
+	Libraries []rawLibrary  `yaml:"libraries"`
+	Providers *rawProviders `yaml:"providers"`
 }
 
 type rawLibrary struct {
@@ -46,9 +50,18 @@ type rawLibrary struct {
 	StripScope string   `yaml:"strip_scope"`
 }
 
-type rawProviderConf struct {
-	Name        string `yaml:"name"`
-	WorkerCount int    `yaml:"worker_count"`
+// rawProviders mirrors the `providers:` block: an ordered Provider Chain by
+// name, plus each named Provider's own settings block. Named Provider
+// blocks are captured via the inline map so that KnownFields decoding still
+// rejects unrecognized keys within each block (see rawProviderSettings).
+type rawProviders struct {
+	Chain    []string                       `yaml:"chain"`
+	Settings map[string]rawProviderSettings `yaml:",inline"`
+}
+
+type rawProviderSettings struct {
+	WorkerCount int  `yaml:"worker_count"`
+	Paid        bool `yaml:"paid"`
 }
 
 // Load reads, parses, and validates the config file at path.
@@ -90,7 +103,7 @@ func fromRaw(raw rawConfig) (*Config, error) {
 		libraries = append(libraries, lib)
 	}
 
-	providerChain, err := providerChainFromRaw(raw.ProviderChain)
+	providerChain, err := providerChainFromRaw(raw.Providers)
 	if err != nil {
 		return nil, err
 	}
@@ -98,31 +111,36 @@ func fromRaw(raw rawConfig) (*Config, error) {
 	return &Config{Libraries: libraries, ProviderChain: providerChain}, nil
 }
 
-// providerChainFromRaw converts raw provider config into validated
-// ProviderConfig entries, defaulting to a single opensubtitles entry
-// if the chain is empty.
-func providerChainFromRaw(raw []rawProviderConf) ([]ProviderConfig, error) {
-	if len(raw) == 0 {
+// providerChainFromRaw converts the raw `providers:` block into validated,
+// ordered ProviderConfig entries, defaulting to a single opensubtitles
+// entry if the block is absent or its chain is empty.
+func providerChainFromRaw(raw *rawProviders) ([]ProviderConfig, error) {
+	if raw == nil || len(raw.Chain) == 0 {
 		return []ProviderConfig{{Name: "opensubtitles"}}, nil
 	}
 
-	chain := make([]ProviderConfig, 0, len(raw))
-	seenNames := make(map[string]struct{}, len(raw))
+	chain := make([]ProviderConfig, 0, len(raw.Chain))
+	seenNames := make(map[string]struct{}, len(raw.Chain))
 
-	for i, rp := range raw {
-		if rp.Name == "" {
-			return nil, fmt.Errorf("provider_chain[%d]: missing required field %q", i, "name")
+	for i, name := range raw.Chain {
+		if name == "" {
+			return nil, fmt.Errorf("providers.chain[%d]: missing required field %q", i, "name")
 		}
-		if _, exists := seenNames[rp.Name]; exists {
-			return nil, fmt.Errorf("provider_chain: duplicate provider name %q", rp.Name)
+		if _, exists := seenNames[name]; exists {
+			return nil, fmt.Errorf("providers.chain: duplicate provider name %q", name)
 		}
-		seenNames[rp.Name] = struct{}{}
+		seenNames[name] = struct{}{}
 
-		if rp.WorkerCount < 0 {
-			return nil, fmt.Errorf("provider_chain[%d]: worker_count cannot be negative", i)
+		settings := raw.Settings[name]
+		if settings.WorkerCount < 0 {
+			return nil, fmt.Errorf("providers.%s: worker_count cannot be negative", name)
 		}
 
-		chain = append(chain, ProviderConfig(rp))
+		chain = append(chain, ProviderConfig{
+			Name:        name,
+			WorkerCount: settings.WorkerCount,
+			Paid:        settings.Paid,
+		})
 	}
 
 	return chain, nil
