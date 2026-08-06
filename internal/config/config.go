@@ -122,10 +122,7 @@ func providerChainFromRaw(raw []rawProviderConf) ([]ProviderConfig, error) {
 			return nil, fmt.Errorf("provider_chain[%d]: worker_count cannot be negative", i)
 		}
 
-		chain = append(chain, ProviderConfig{
-			Name:        rp.Name,
-			WorkerCount: rp.WorkerCount,
-		})
+		chain = append(chain, ProviderConfig(rp))
 	}
 
 	return chain, nil
