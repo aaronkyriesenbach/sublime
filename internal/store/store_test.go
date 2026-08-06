@@ -1032,6 +1032,252 @@ func TestListFiles_PaginatesWithLimitAndOffset(t *testing.T) {
 	}
 }
 
+func TestRecordProviderMiss_AppendsNameAndResetsToPendingNoFailureReason(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	en := mustLang(t, "en")
+
+	file, err := s.ObserveFileContentHash(ctx, "movies", "/media/movies/a.mkv", "hash-1")
+	if err != nil {
+		t.Fatalf("ObserveFileContentHash returned error: %v", err)
+	}
+	if err := s.EnsureLanguage(ctx, file.ID, en); err != nil {
+		t.Fatalf("EnsureLanguage returned error: %v", err)
+	}
+	if err := s.MarkInProgress(ctx, file.ID, en); err != nil {
+		t.Fatalf("MarkInProgress returned error: %v", err)
+	}
+
+	// A no-candidate miss against a named Provider mirrors
+	// QuotaExhaustedError's existing handling: reset to pending, no failure
+	// reason recorded, per docs/adr/0008-tiered-provider-chain.md.
+	if err := s.RecordProviderMiss(ctx, file.ID, en, "opensubtitles"); err != nil {
+		t.Fatalf("RecordProviderMiss returned error: %v", err)
+	}
+
+	got, _, err := s.GetFile(ctx, "movies", "/media/movies/a.mkv")
+	if err != nil {
+		t.Fatalf("GetFile returned error: %v", err)
+	}
+	if got.Languages[0].Status != domain.StatusPending {
+		t.Errorf("expected status %q, got %q", domain.StatusPending, got.Languages[0].Status)
+	}
+	if got.Languages[0].FailureReason != domain.FailureNone {
+		t.Errorf("expected no failure reason recorded, got %q", got.Languages[0].FailureReason)
+	}
+
+	attempted, err := s.AttemptedProviders(ctx, file.ID, en)
+	if err != nil {
+		t.Fatalf("AttemptedProviders returned error: %v", err)
+	}
+	if len(attempted) != 1 || attempted[0] != "opensubtitles" {
+		t.Errorf("attempted = %v, want [opensubtitles]", attempted)
+	}
+}
+
+func TestRecordProviderMiss_AccumulatesMultipleDistinctProviders(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	en := mustLang(t, "en")
+
+	file, err := s.ObserveFileContentHash(ctx, "movies", "/media/movies/a.mkv", "hash-1")
+	if err != nil {
+		t.Fatalf("ObserveFileContentHash returned error: %v", err)
+	}
+	if err := s.EnsureLanguage(ctx, file.ID, en); err != nil {
+		t.Fatalf("EnsureLanguage returned error: %v", err)
+	}
+
+	if err := s.RecordProviderMiss(ctx, file.ID, en, "opensubtitles"); err != nil {
+		t.Fatalf("first RecordProviderMiss returned error: %v", err)
+	}
+	if err := s.RecordProviderMiss(ctx, file.ID, en, "subdl"); err != nil {
+		t.Fatalf("second RecordProviderMiss returned error: %v", err)
+	}
+
+	attempted, err := s.AttemptedProviders(ctx, file.ID, en)
+	if err != nil {
+		t.Fatalf("AttemptedProviders returned error: %v", err)
+	}
+	if len(attempted) != 2 || attempted[0] != "opensubtitles" || attempted[1] != "subdl" {
+		t.Errorf("attempted = %v, want [opensubtitles subdl]", attempted)
+	}
+}
+
+func TestRecordProviderMiss_SameProviderTwiceDoesNotDuplicate(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	en := mustLang(t, "en")
+
+	file, err := s.ObserveFileContentHash(ctx, "movies", "/media/movies/a.mkv", "hash-1")
+	if err != nil {
+		t.Fatalf("ObserveFileContentHash returned error: %v", err)
+	}
+	if err := s.EnsureLanguage(ctx, file.ID, en); err != nil {
+		t.Fatalf("EnsureLanguage returned error: %v", err)
+	}
+
+	if err := s.RecordProviderMiss(ctx, file.ID, en, "opensubtitles"); err != nil {
+		t.Fatalf("first RecordProviderMiss returned error: %v", err)
+	}
+	if err := s.RecordProviderMiss(ctx, file.ID, en, "opensubtitles"); err != nil {
+		t.Fatalf("second RecordProviderMiss returned error: %v", err)
+	}
+
+	attempted, err := s.AttemptedProviders(ctx, file.ID, en)
+	if err != nil {
+		t.Fatalf("AttemptedProviders returned error: %v", err)
+	}
+	if len(attempted) != 1 || attempted[0] != "opensubtitles" {
+		t.Errorf("attempted = %v, want [opensubtitles] (no duplicate)", attempted)
+	}
+}
+
+func TestRecordProviderMiss_UnknownLanguageState(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	en := mustLang(t, "en")
+
+	file, err := s.ObserveFileContentHash(ctx, "movies", "/media/movies/a.mkv", "hash-1")
+	if err != nil {
+		t.Fatalf("ObserveFileContentHash returned error: %v", err)
+	}
+
+	err = s.RecordProviderMiss(ctx, file.ID, en, "opensubtitles")
+	if !errors.Is(err, store.ErrLanguageStateNotFound) {
+		t.Fatalf("expected ErrLanguageStateNotFound, got %v", err)
+	}
+}
+
+func TestAttemptedProviders_EmptyForFreshLanguageState(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	en := mustLang(t, "en")
+
+	file, err := s.ObserveFileContentHash(ctx, "movies", "/media/movies/a.mkv", "hash-1")
+	if err != nil {
+		t.Fatalf("ObserveFileContentHash returned error: %v", err)
+	}
+	if err := s.EnsureLanguage(ctx, file.ID, en); err != nil {
+		t.Fatalf("EnsureLanguage returned error: %v", err)
+	}
+
+	attempted, err := s.AttemptedProviders(ctx, file.ID, en)
+	if err != nil {
+		t.Fatalf("AttemptedProviders returned error: %v", err)
+	}
+	if len(attempted) != 0 {
+		t.Errorf("attempted = %v, want none", attempted)
+	}
+}
+
+func TestAttemptedProviders_UnknownLanguageState(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	en := mustLang(t, "en")
+
+	file, err := s.ObserveFileContentHash(ctx, "movies", "/media/movies/a.mkv", "hash-1")
+	if err != nil {
+		t.Fatalf("ObserveFileContentHash returned error: %v", err)
+	}
+
+	_, err = s.AttemptedProviders(ctx, file.ID, en)
+	if !errors.Is(err, store.ErrLanguageStateNotFound) {
+		t.Fatalf("expected ErrLanguageStateNotFound, got %v", err)
+	}
+}
+
+func TestObserveFileContentHash_HashChangeClearsAttemptedProviders(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	en := mustLang(t, "en")
+
+	file, err := s.ObserveFileContentHash(ctx, "movies", "/media/movies/a.mkv", "hash-1")
+	if err != nil {
+		t.Fatalf("ObserveFileContentHash returned error: %v", err)
+	}
+	if err := s.EnsureLanguage(ctx, file.ID, en); err != nil {
+		t.Fatalf("EnsureLanguage returned error: %v", err)
+	}
+	if err := s.RecordProviderMiss(ctx, file.ID, en, "opensubtitles"); err != nil {
+		t.Fatalf("RecordProviderMiss returned error: %v", err)
+	}
+
+	// A Changed event (Content Hash mismatch) starts a fresh cycle: the
+	// attempted-Provider set from the prior cycle must not survive it.
+	if _, err := s.ObserveFileContentHash(ctx, "movies", "/media/movies/a.mkv", "hash-2"); err != nil {
+		t.Fatalf("hash-change ObserveFileContentHash returned error: %v", err)
+	}
+
+	attempted, err := s.AttemptedProviders(ctx, file.ID, en)
+	if err != nil {
+		t.Fatalf("AttemptedProviders returned error: %v", err)
+	}
+	if len(attempted) != 0 {
+		t.Errorf("attempted = %v, want none after a Changed reset", attempted)
+	}
+}
+
+func TestResetToPending_ClearsAttemptedProviders(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	en := mustLang(t, "en")
+
+	file, err := s.ObserveFileContentHash(ctx, "movies", "/media/movies/a.mkv", "hash-1")
+	if err != nil {
+		t.Fatalf("ObserveFileContentHash returned error: %v", err)
+	}
+	if err := s.EnsureLanguage(ctx, file.ID, en); err != nil {
+		t.Fatalf("EnsureLanguage returned error: %v", err)
+	}
+	if err := s.RecordProviderMiss(ctx, file.ID, en, "opensubtitles"); err != nil {
+		t.Fatalf("RecordProviderMiss returned error: %v", err)
+	}
+
+	// A manual reprocess request starts a fresh cycle too.
+	if err := s.ResetToPending(ctx, file.ID); err != nil {
+		t.Fatalf("ResetToPending returned error: %v", err)
+	}
+
+	attempted, err := s.AttemptedProviders(ctx, file.ID, en)
+	if err != nil {
+		t.Fatalf("AttemptedProviders returned error: %v", err)
+	}
+	if len(attempted) != 0 {
+		t.Errorf("attempted = %v, want none after a manual reprocess reset", attempted)
+	}
+}
+
+func TestResetToPendingForced_ClearsAttemptedProviders(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	en := mustLang(t, "en")
+
+	file, err := s.ObserveFileContentHash(ctx, "movies", "/media/movies/a.mkv", "hash-1")
+	if err != nil {
+		t.Fatalf("ObserveFileContentHash returned error: %v", err)
+	}
+	if err := s.EnsureLanguage(ctx, file.ID, en); err != nil {
+		t.Fatalf("EnsureLanguage returned error: %v", err)
+	}
+	if err := s.RecordProviderMiss(ctx, file.ID, en, "opensubtitles"); err != nil {
+		t.Fatalf("RecordProviderMiss returned error: %v", err)
+	}
+
+	// A forced manual reprocess request starts a fresh cycle too.
+	if err := s.ResetToPendingForced(ctx, file.ID); err != nil {
+		t.Fatalf("ResetToPendingForced returned error: %v", err)
+	}
+
+	attempted, err := s.AttemptedProviders(ctx, file.ID, en)
+	if err != nil {
+		t.Fatalf("AttemptedProviders returned error: %v", err)
+	}
+	if len(attempted) != 0 {
+		t.Errorf("attempted = %v, want none after a forced reset", attempted)
+	}
+}
+
 func TestDifferentLibrariesWithSamePathAreDistinctFiles(t *testing.T) {
 	s := openTestStore(t)
 	ctx := context.Background()

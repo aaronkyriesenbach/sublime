@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"golang.org/x/text/language"
@@ -105,7 +106,7 @@ func (s *Store) ObserveFileHash(ctx context.Context, libraryName, path, contentH
 			// investigation (e.g. fencing the terminal-status writes on
 			// the Content Hash they were computed against).
 			if _, err := tx.ExecContext(ctx,
-				`UPDATE file_language_states SET status = ?, failure_reason = NULL, force = 0, updated_at = ? WHERE file_id = ?`,
+				`UPDATE file_language_states SET status = ?, failure_reason = NULL, force = 0, attempted_providers = '', updated_at = ? WHERE file_id = ?`,
 				domain.StatusPending, now, id,
 			); err != nil {
 				return fmt.Errorf("resetting language states after content hash change: %w", err)
@@ -141,7 +142,7 @@ func (s *Store) ObserveFileHash(ctx context.Context, libraryName, path, contentH
 // Changed event per CONTEXT.md even though the hash itself may be identical.
 func (s *Store) ResetToPending(ctx context.Context, fileID int64) error {
 	_, err := s.db.ExecContext(ctx,
-		`UPDATE file_language_states SET status = ?, failure_reason = NULL, force = 0, updated_at = ? WHERE file_id = ?`,
+		`UPDATE file_language_states SET status = ?, failure_reason = NULL, force = 0, attempted_providers = '', updated_at = ? WHERE file_id = ?`,
 		domain.StatusPending, nowString(), fileID,
 	)
 	if err != nil {
@@ -160,7 +161,7 @@ func (s *Store) ResetToPending(ctx context.Context, fileID int64) error {
 // cleared by MarkInProgress once the Dispatcher claims the row.
 func (s *Store) ResetToPendingForced(ctx context.Context, fileID int64) error {
 	_, err := s.db.ExecContext(ctx,
-		`UPDATE file_language_states SET status = ?, failure_reason = NULL, force = 1, updated_at = ? WHERE file_id = ?`,
+		`UPDATE file_language_states SET status = ?, failure_reason = NULL, force = 1, attempted_providers = '', updated_at = ? WHERE file_id = ?`,
 		domain.StatusPending, nowString(), fileID,
 	)
 	if err != nil {
@@ -186,6 +187,82 @@ func (s *Store) ResetLanguageToPending(ctx context.Context, fileID int64, lang l
 		return fmt.Errorf("resetting language state to pending: %w", err)
 	}
 	return checkUpdated(res)
+}
+
+// RecordProviderMiss records that providerName searched this (file,
+// language) pair's current cycle and found no Candidate clearing the
+// scoring cutoff: it appends providerName to the pair's attempted-Provider
+// set (a no-op if already present) and resets the row to StatusPending with
+// no FailureReason, mirroring how a QuotaExhaustedError already avoids
+// marking Failed (see ResetLanguageToPending) rather than landing on Failed
+// immediately — see docs/adr/0008-tiered-provider-chain.md. It returns
+// ErrLanguageStateNotFound if no such row exists; callers must
+// EnsureLanguage first.
+func (s *Store) RecordProviderMiss(ctx context.Context, fileID int64, lang language.Tag, providerName string) error {
+	return s.withTx(ctx, func(tx *sql.Tx) error {
+		var attempted string
+		err := tx.QueryRowContext(ctx,
+			`SELECT attempted_providers FROM file_language_states WHERE file_id = ? AND language = ?`,
+			fileID, lang.String(),
+		).Scan(&attempted)
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrLanguageStateNotFound
+		}
+		if err != nil {
+			return fmt.Errorf("reading attempted providers: %w", err)
+		}
+
+		res, err := tx.ExecContext(ctx,
+			`UPDATE file_language_states SET status = ?, failure_reason = NULL, attempted_providers = ?, updated_at = ? WHERE file_id = ? AND language = ?`,
+			domain.StatusPending, addAttemptedProvider(attempted, providerName), nowString(), fileID, lang.String(),
+		)
+		if err != nil {
+			return fmt.Errorf("recording provider miss: %w", err)
+		}
+		return checkUpdated(res)
+	})
+}
+
+// AttemptedProviders returns the set of Provider names already recorded as
+// tried-and-missed for this (file, language) pair's current cycle (see
+// RecordProviderMiss), in the order they were recorded. It returns
+// ErrLanguageStateNotFound if no such row exists.
+func (s *Store) AttemptedProviders(ctx context.Context, fileID int64, lang language.Tag) ([]string, error) {
+	var attempted string
+	err := s.db.QueryRowContext(ctx,
+		`SELECT attempted_providers FROM file_language_states WHERE file_id = ? AND language = ?`,
+		fileID, lang.String(),
+	).Scan(&attempted)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrLanguageStateNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("reading attempted providers: %w", err)
+	}
+	return splitAttemptedProviders(attempted), nil
+}
+
+// splitAttemptedProviders parses attempted_providers' stored comma-separated
+// representation, returning nil for an empty set.
+func splitAttemptedProviders(raw string) []string {
+	if raw == "" {
+		return nil
+	}
+	return strings.Split(raw, ",")
+}
+
+// addAttemptedProvider appends name to raw's comma-separated representation,
+// returning raw unchanged if name is already present.
+func addAttemptedProvider(raw, name string) string {
+	for _, existing := range splitAttemptedProviders(raw) {
+		if existing == name {
+			return raw
+		}
+	}
+	if raw == "" {
+		return name
+	}
+	return raw + "," + name
 }
 
 // UpdateContentHash records a corrected Content Hash for an already-known

@@ -73,6 +73,17 @@ CREATE TABLE IF NOT EXISTS file_language_states (
 	-- Trigger call that reset it — knows to bypass the Marker+Content-Hash
 	-- gate for it. Cleared once the Dispatcher claims the row (MarkInProgress).
 	force INTEGER NOT NULL DEFAULT 0,
+	-- attempted_providers is a comma-separated set of Provider names
+	-- already tried and missed (no Candidate cleared the scoring cutoff)
+	-- for this pair's current cycle. See
+	-- docs/adr/0008-tiered-provider-chain.md: a pair remembers this across
+	-- dispatch passes so the Provider Chain walk can advance to the next
+	-- Provider on a later attempt rather than needing to finish in one.
+	-- Cleared, like force, on every reset back to Pending that starts a
+	-- new cycle (Changed, manual reprocess, force); not cleared by a
+	-- Provider miss itself or by a QuotaExhaustedError repend, since both
+	-- continue the same cycle.
+	attempted_providers TEXT NOT NULL DEFAULT '',
 	updated_at TEXT NOT NULL,
 	UNIQUE (file_id, language)
 );
