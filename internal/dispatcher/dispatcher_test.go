@@ -535,3 +535,214 @@ func (w *syncedWriter) Write(p []byte) (int, error) {
 	defer w.mu.Unlock()
 	return w.buf.Write(p)
 }
+
+// TestDispatcher_ProviderChainSkipsSuspendedProviderAndDispatchesViaNext
+// guards that when Provider #1 in the chain is Suspended, the Dispatcher
+// walks the chain and dispatches via Provider #2 instead of leaving the
+// pair Pending. Observable via the real Store's Sync Status transitions.
+func TestDispatcher_ProviderChainSkipsSuspendedProviderAndDispatchesViaNext(t *testing.T) {
+	libDir := t.TempDir()
+	videoPath := filepath.Join(libDir, "Test.Movie.2024.HDTV.x264-FAKEGROUP.mp4")
+	writeVideoFixture(t, videoPath)
+
+	st := openTestStore(t)
+	candidateContent := "1\n00:00:00,500 --> 00:00:01,900\nOne two three\n"
+
+	// Provider #1: always Suspended, should never be called
+	provider1 := &provider.Fake{
+		SearchFunc: func(ctx context.Context, q provider.Query) ([]domain.Candidate, error) {
+			t.Fatal("Provider #1 Search should not be called while Suspended")
+			return nil, nil
+		},
+		SuspendedFunc: func() (time.Time, bool) {
+			return time.Now().Add(time.Hour), true
+		},
+	}
+
+	// Provider #2: available, should handle the dispatch
+	provider2 := &provider.Fake{
+		SearchFunc: func(ctx context.Context, q provider.Query) ([]domain.Candidate, error) {
+			return []domain.Candidate{{ID: "candidate", Title: "Test Movie", Year: 2024}}, nil
+		},
+		DownloadFunc: func(ctx context.Context, c domain.Candidate) ([]byte, error) {
+			return []byte(candidateContent), nil
+		},
+		SuspendedFunc: func() (time.Time, bool) {
+			return time.Time{}, false
+		},
+	}
+
+	lib := domain.Library{
+		Name:       "test-library",
+		Path:       libDir,
+		Languages:  []language.Tag{language.English},
+		StripScope: domain.StripScopeAll,
+	}
+
+	// Create two pipelines, one per provider, sharing everything except Provider
+	pipeline1 := &pipeline.Pipeline{
+		Store:      st,
+		Provider:   provider1,
+		SyncEngine: &syncengine.FakeSyncEngine{},
+		Stripper:   &pipeline.FakeStripper{},
+	}
+	pipeline2 := &pipeline.Pipeline{
+		Store:      st,
+		Provider:   provider2,
+		SyncEngine: &syncengine.FakeSyncEngine{},
+		Stripper:   &pipeline.FakeStripper{},
+	}
+
+	// Use pipeline1 for registration (it doesn't call the Provider)
+	ctx := context.Background()
+	if _, err := pipeline1.Run(ctx, lib); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	file, found, err := st.GetFile(ctx, lib.Name, videoPath)
+	if err != nil {
+		t.Fatalf("GetFile before dispatch: %v", err)
+	}
+	if !found || file.Languages[0].Status != domain.StatusPending {
+		t.Fatalf("expected Pending after registration, got %+v", file)
+	}
+
+	// Dispatcher with a two-provider chain: provider1 (Suspended) -> provider2 (available)
+	d := &dispatcher.Dispatcher{
+		Providers: []dispatcher.ProviderEntry{
+			{Pipeline: pipeline1, WorkerCount: 2},
+			{Pipeline: pipeline2, WorkerCount: 2},
+		},
+		Store:     st,
+		Libraries: []domain.Library{lib},
+	}
+	if err := d.RunOnce(ctx); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+
+	file, found, err = st.GetFile(ctx, lib.Name, videoPath)
+	if err != nil {
+		t.Fatalf("GetFile after dispatch: %v", err)
+	}
+	if !found || file.Languages[0].Status != domain.StatusSynced {
+		t.Fatalf("expected Synced after RunOnce (via Provider #2), got %+v", file)
+	}
+}
+
+// TestDispatcher_ProviderChainPerProviderWorkerPoolBudget guards that each
+// Provider in the chain has its own independent worker pool budget, so a
+// slow/blocked Provider #1 doesn't starve dispatch capacity for Provider #2.
+func TestDispatcher_ProviderChainPerProviderWorkerPoolBudget(t *testing.T) {
+	libDir := t.TempDir()
+	// Create 4 video files to exercise concurrency
+	for i := 0; i < 4; i++ {
+		writeVideoFixture(t, filepath.Join(libDir, string(rune('A'+i))+".Movie.2020.HDTV.x264-GRP.mp4"))
+	}
+
+	st := openTestStore(t)
+	candidateContent := "1\n00:00:00,500 --> 00:00:01,900\nOne two three\n"
+
+	// Provider #1: blocks forever until unblocked, simulating a slow provider
+	block1 := make(chan struct{})
+	provider1 := &provider.Fake{
+		SearchFunc: func(ctx context.Context, q provider.Query) ([]domain.Candidate, error) {
+			<-block1
+			return nil, errors.New("provider1 unblocked")
+		},
+		SuspendedFunc: func() (time.Time, bool) {
+			return time.Time{}, false // not suspended, just slow
+		},
+	}
+
+	// Provider #2: fast, available provider
+	provider2 := &provider.Fake{
+		SearchFunc: func(ctx context.Context, q provider.Query) ([]domain.Candidate, error) {
+			return []domain.Candidate{{ID: "candidate", HashMatch: true}}, nil
+		},
+		DownloadFunc: func(ctx context.Context, c domain.Candidate) ([]byte, error) {
+			return []byte(candidateContent), nil
+		},
+		SuspendedFunc: func() (time.Time, bool) {
+			return time.Time{}, false
+		},
+	}
+
+	lib := domain.Library{
+		Name:       "test-library",
+		Path:       libDir,
+		Languages:  []language.Tag{language.English},
+		StripScope: domain.StripScopeAll,
+	}
+
+	pipeline1 := &pipeline.Pipeline{
+		Store:      st,
+		Provider:   provider1,
+		SyncEngine: &syncengine.FakeSyncEngine{},
+		Stripper:   &pipeline.FakeStripper{},
+	}
+	pipeline2 := &pipeline.Pipeline{
+		Store:      st,
+		Provider:   provider2,
+		SyncEngine: &syncengine.FakeSyncEngine{},
+		Stripper:   &pipeline.FakeStripper{},
+	}
+
+	ctx := context.Background()
+	if _, err := pipeline1.Run(ctx, lib); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	// Dispatcher with per-provider worker counts:
+	// Provider #1 gets 1 worker, Provider #2 gets 2 workers
+	// Provider #1 blocks its 1 worker; Provider #2 should still process 2 at a time
+	d := &dispatcher.Dispatcher{
+		Providers: []dispatcher.ProviderEntry{
+			{Pipeline: pipeline1, WorkerCount: 1},
+			{Pipeline: pipeline2, WorkerCount: 2},
+		},
+		Store:     st,
+		Libraries: []domain.Library{lib},
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- d.RunOnce(ctx) }()
+
+	// Wait for Provider #1 to consume its 1 worker slot (blocking on Search)
+	// and for Provider #2 to process some files. Since Provider #1 is blocked,
+	// Provider #2 should still be able to dispatch with its own 2-worker budget.
+	deadline := time.Now().Add(5 * time.Second)
+	var lastSynced int
+	for time.Now().Before(deadline) {
+		summaries, err := st.LibrarySummaries(ctx)
+		if err != nil {
+			t.Fatalf("LibrarySummaries: %v", err)
+		}
+		for _, s := range summaries {
+			if s.LibraryName == lib.Name {
+				lastSynced = s.Synced
+			}
+		}
+		// Provider #1 claims 1 file (blocked), Provider #2 should process 3.
+		// If per-provider pools are independent, we expect at least 2 Synced
+		// while Provider #1 is still blocked on its 1 file.
+		if lastSynced >= 2 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if lastSynced < 2 {
+		t.Fatalf("expected at least 2 Synced via Provider #2 while Provider #1 is blocked, got %d", lastSynced)
+	}
+
+	// Unblock Provider #1 so the test can finish
+	close(block1)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("RunOnce: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("RunOnce did not finish after unblocking Provider #1")
+	}
+}

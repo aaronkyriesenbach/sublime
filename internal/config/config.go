@@ -16,7 +16,18 @@ import (
 
 // Config is Sublime's validated, in-memory configuration.
 type Config struct {
-	Libraries []domain.Library
+	Libraries     []domain.Library
+	ProviderChain []ProviderConfig
+}
+
+// ProviderConfig represents a single Provider in the priority-ordered chain.
+type ProviderConfig struct {
+	// Name identifies the Provider (e.g., "opensubtitles").
+	Name string
+
+	// WorkerCount is the number of concurrent workers allocated to this
+	// Provider's pool. Zero means split evenly among all Providers.
+	WorkerCount int
 }
 
 // rawConfig mirrors config.yaml's on-disk shape before validation and
@@ -24,7 +35,8 @@ type Config struct {
 // rejects a stray `providers:` section: Provider secrets come from env vars
 // only (see ProviderSecrets), never the config file.
 type rawConfig struct {
-	Libraries []rawLibrary `yaml:"libraries"`
+	Libraries     []rawLibrary      `yaml:"libraries"`
+	ProviderChain []rawProviderConf `yaml:"provider_chain"`
 }
 
 type rawLibrary struct {
@@ -32,6 +44,11 @@ type rawLibrary struct {
 	Path       string   `yaml:"path"`
 	Languages  []string `yaml:"languages"`
 	StripScope string   `yaml:"strip_scope"`
+}
+
+type rawProviderConf struct {
+	Name        string `yaml:"name"`
+	WorkerCount int    `yaml:"worker_count"`
 }
 
 // Load reads, parses, and validates the config file at path.
@@ -73,7 +90,45 @@ func fromRaw(raw rawConfig) (*Config, error) {
 		libraries = append(libraries, lib)
 	}
 
-	return &Config{Libraries: libraries}, nil
+	providerChain, err := providerChainFromRaw(raw.ProviderChain)
+	if err != nil {
+		return nil, err
+	}
+
+	return &Config{Libraries: libraries, ProviderChain: providerChain}, nil
+}
+
+// providerChainFromRaw converts raw provider config into validated
+// ProviderConfig entries, defaulting to a single opensubtitles entry
+// if the chain is empty.
+func providerChainFromRaw(raw []rawProviderConf) ([]ProviderConfig, error) {
+	if len(raw) == 0 {
+		return []ProviderConfig{{Name: "opensubtitles"}}, nil
+	}
+
+	chain := make([]ProviderConfig, 0, len(raw))
+	seenNames := make(map[string]struct{}, len(raw))
+
+	for i, rp := range raw {
+		if rp.Name == "" {
+			return nil, fmt.Errorf("provider_chain[%d]: missing required field %q", i, "name")
+		}
+		if _, exists := seenNames[rp.Name]; exists {
+			return nil, fmt.Errorf("provider_chain: duplicate provider name %q", rp.Name)
+		}
+		seenNames[rp.Name] = struct{}{}
+
+		if rp.WorkerCount < 0 {
+			return nil, fmt.Errorf("provider_chain[%d]: worker_count cannot be negative", i)
+		}
+
+		chain = append(chain, ProviderConfig{
+			Name:        rp.Name,
+			WorkerCount: rp.WorkerCount,
+		})
+	}
+
+	return chain, nil
 }
 
 func libraryFromRaw(rl rawLibrary) (domain.Library, error) {
