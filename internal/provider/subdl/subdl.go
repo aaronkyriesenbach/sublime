@@ -38,11 +38,12 @@ import (
 )
 
 const (
-	defaultBaseURL        = "https://api.subdl.com/api/v1"
-	defaultUserAgent      = "Sublime v1"
-	defaultPace           = time.Second
-	defaultMaxDelay       = 60 * time.Second
-	defaultDecayThreshold = 10
+	defaultBaseURL         = "https://api.subdl.com/api/v1"
+	defaultDownloadBaseURL = "https://dl.subdl.com"
+	defaultUserAgent       = "Sublime v1"
+	defaultPace            = time.Second
+	defaultMaxDelay        = 60 * time.Second
+	defaultDecayThreshold  = 10
 )
 
 // subdlLanguageOverrides maps a full BCP 47 tag to SubDL's own language
@@ -72,9 +73,16 @@ type Config struct {
 	// 0006).
 	Paid bool
 
-	// BaseURL overrides SubDL's API's base URL; defaults to defaultBaseURL.
-	// Point it at an httptest.Server's URL in tests.
+	// BaseURL overrides SubDL's JSON search API's base URL; defaults to
+	// defaultBaseURL. Point it at an httptest.Server's URL in tests.
 	BaseURL string
+
+	// DownloadBaseURL overrides the host subtitle downloads are served
+	// from; defaults to defaultDownloadBaseURL. Deliberately separate from
+	// BaseURL: SubDL serves downloads from a different host
+	// (dl.subdl.com) than its api.subdl.com search API. Point it at an
+	// httptest.Server's URL in tests.
+	DownloadBaseURL string
 
 	// UserAgent overrides the User-Agent header sent on every request.
 	UserAgent string
@@ -127,6 +135,10 @@ func New(cfg Config) (*Provider, error) {
 	if baseURL == "" {
 		baseURL = defaultBaseURL
 	}
+	downloadBaseURL := cfg.DownloadBaseURL
+	if downloadBaseURL == "" {
+		downloadBaseURL = defaultDownloadBaseURL
+	}
 	userAgent := cfg.UserAgent
 	if userAgent == "" {
 		userAgent = defaultUserAgent
@@ -150,11 +162,12 @@ func New(cfg Config) (*Provider, error) {
 
 	pacerCfg := retry.PacerConfig{Pace: pace, MaxDelay: defaultMaxDelay, DecayThreshold: defaultDecayThreshold}
 	c := &client{
-		baseURL:    baseURL,
-		userAgent:  userAgent,
-		httpClient: httpClient,
-		pacer:      retry.NewPacer(pacerCfg, clock),
-		now:        now,
+		baseURL:         baseURL,
+		downloadBaseURL: downloadBaseURL,
+		userAgent:       userAgent,
+		httpClient:      httpClient,
+		pacer:           retry.NewPacer(pacerCfg, clock),
+		now:             now,
 	}
 
 	return &Provider{
@@ -287,30 +300,23 @@ func (p *Provider) Search(ctx context.Context, query provider.Query) ([]domain.C
 
 // Download implements provider.Provider. It attaches APIKey (SubDL's
 // authenticated/paid download path) only when Config.Paid is true;
-// otherwise the key is omitted entirely, using SubDL's anonymous per-IP
-// download path (ADR 0006). This choice is fixed by config, never
-// runtime-detected or retried across paths. Quota-exhaustion detection
-// (quotaOrWrap) only ever applies to the paid path: the anonymous path's
-// rejection response has no documented shape and must never be
-// pattern-matched into a Provider Suspension (ADR 0007).
+// otherwise the key is omitted entirely -- even if candidate.ID's URL
+// already had one embedded by Search's response, it's stripped -- using
+// SubDL's anonymous per-IP download path (ADR 0006). This choice is fixed
+// by config, never runtime-detected or retried across paths.
+// Quota-exhaustion detection (quotaOrWrap) only ever applies to the paid
+// path: the anonymous path's rejection response has no documented shape
+// and must never be pattern-matched into a Provider Suspension (ADR 0007).
 func (p *Provider) Download(ctx context.Context, candidate domain.Candidate) ([]byte, error) {
 	if err := p.suspendedError(); err != nil {
 		return nil, err
 	}
 
-	nID, fileNID, err := parseCandidateID(candidate.ID)
+	path, err := downloadPathFromCandidateID(candidate.ID, p.paid, p.apiKey)
 	if err != nil {
 		return nil, fmt.Errorf("subdl: %w", err)
 	}
 
-	params := url.Values{}
-	params.Set("n_id", strconv.Itoa(nID))
-	params.Set("file_n_id", strconv.Itoa(fileNID))
-	if p.paid {
-		params.Set("api_key", p.apiKey)
-	}
-
-	path := "/download?" + params.Encode()
 	op := func(ctx context.Context, _ int) ([]byte, error) {
 		return p.client.getRaw(ctx, path)
 	}
@@ -344,47 +350,61 @@ func languageParam(tag language.Tag) string {
 	return strings.ToLower(base.String())
 }
 
-// candidateID encodes SubDL's n_id/file_n_id pair as a single opaque
-// Candidate.ID, round-tripped by parseCandidateID. The encoding itself
-// isn't prescribed by SubDL's API (issue #69's noted ambiguity) — a simple
-// delimited string is the least machinery that still round-trips exactly.
-func candidateID(nID, fileNID int) string {
-	return fmt.Sprintf("%d-%d", nID, fileNID)
-}
+// downloadPathFromCandidateID validates that id is one of this Provider's
+// own Candidate IDs -- SubDL's relative /subtitle/... download path,
+// echoed back verbatim from Search (see candidatesFromResponse), never a
+// reconstructed n_id/file_n_id pair (SubDL's API exposes no such fields;
+// the path is the only identifier there is) -- and returns the path+query
+// to request it with: api_key attached only when paid is true (ADR 0006),
+// removed otherwise even if Search's own response already embedded one.
+func downloadPathFromCandidateID(id string, paid bool, apiKey string) (string, error) {
+	if id == "" {
+		return "", errors.New("candidate ID is empty")
+	}
+	u, err := url.Parse(id)
+	if err != nil {
+		return "", fmt.Errorf("candidate ID %q is not a valid URL: %w", id, err)
+	}
+	if !strings.HasPrefix(u.Path, "/subtitle/") {
+		return "", fmt.Errorf("candidate ID %q is not a subdl download path", id)
+	}
 
-// parseCandidateID reverses candidateID, rejecting any ID not shaped like
-// this Provider's own encoding — e.g. a Candidate.ID that actually came
-// from a different Provider.
-func parseCandidateID(id string) (nID, fileNID int, err error) {
-	before, after, ok := strings.Cut(id, "-")
-	if !ok {
-		return 0, 0, fmt.Errorf("candidate ID %q is not in the expected n_id-file_n_id form", id)
+	q := u.Query()
+	if paid {
+		q.Set("api_key", apiKey)
+	} else {
+		q.Del("api_key")
 	}
-	nID, err = strconv.Atoi(before)
-	if err != nil {
-		return 0, 0, fmt.Errorf("candidate ID %q: invalid n_id: %w", id, err)
-	}
-	fileNID, err = strconv.Atoi(after)
-	if err != nil {
-		return 0, 0, fmt.Errorf("candidate ID %q: invalid file_n_id: %w", id, err)
-	}
-	return nID, fileNID, nil
+	u.RawQuery = q.Encode()
+	return u.String(), nil
 }
 
 // candidatesFromResponse converts a search response into domain.Candidates.
-// Every one has HashMatch: false — SubDL has no moviehash-equivalent search
-// (issue #69) — so results flow through the same fuzzy/cosmetic scoring
-// cutoff OpenSubtitles' own non-hash path already uses.
+// Title and Year come from resp.Results[0], not the subtitle item itself --
+// SubDL's docs state Subtitles is always "an array of subtitles for the
+// first movie/TV show in results", and a subtitle item carries no title or
+// year field of its own, so every Candidate from one response shares that
+// single identity. Every Candidate has HashMatch: false — SubDL has no
+// moviehash-equivalent search (issue #69) — so results flow through the
+// same fuzzy/cosmetic scoring cutoff OpenSubtitles' own non-hash path
+// already uses.
 func candidatesFromResponse(resp searchResponseBody) []domain.Candidate {
+	var title string
+	var year int
+	if len(resp.Results) > 0 {
+		title = resp.Results[0].Name
+		year = resp.Results[0].Year
+	}
+
 	var candidates []domain.Candidate
 	for _, item := range resp.Subtitles {
 		source, releaseGroup, resolution, codec := provider.ParseCosmetics(item.ReleaseName)
 		candidates = append(candidates, domain.Candidate{
-			ID:           candidateID(item.NID, item.FileNID),
-			Title:        item.Name,
-			Year:         item.Year,
-			Season:       item.SeasonNumber,
-			Episode:      item.EpisodeNumber,
+			ID:           item.URL,
+			Title:        title,
+			Year:         year,
+			Season:       item.Season,
+			Episode:      item.Episode,
 			Source:       source,
 			ReleaseGroup: releaseGroup,
 			Resolution:   resolution,
