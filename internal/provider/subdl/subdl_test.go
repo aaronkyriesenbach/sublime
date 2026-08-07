@@ -152,16 +152,15 @@ func TestSearch_TVQuery_SendsSeasonAndEpisode(t *testing.T) {
 		"season_number":  "2",
 		"episode_number": "1",
 		"subs_per_page":  "30",
+		"unpack":         "1",
 	}
 	for k, want := range wantParams {
 		if got := params.Get(k); got != want {
 			t.Errorf("param %q = %q, want %q", k, got, want)
 		}
 	}
-	for _, forbidden := range []string{"full_season", "unpack"} {
-		if params.Has(forbidden) {
-			t.Errorf("TV query must never send %q, got query %q", forbidden, reqs[0].Query)
-		}
+	if params.Has("full_season") {
+		t.Errorf("TV query must never send full_season, got query %q", reqs[0].Query)
 	}
 }
 
@@ -435,6 +434,176 @@ func TestSearch_LaterPageQuotaExhausted_DiscardsEarlierPagesAndSuspends(t *testi
 
 	if _, suspended := p.Suspension(); !suspended {
 		t.Error("expected Provider to be Suspended after a quota-exhaustion response mid-walk")
+	}
+}
+
+// --- Season-pack unpacking (issue #79, ADR 0011) ---
+
+// packItem builds a full_season pack entry of a /subtitles response's
+// "subtitles" array, with the given unpack_files entries.
+func packItem(url string, unpackFiles ...map[string]any) map[string]any {
+	return map[string]any{
+		"release_name": "",
+		"url":          url,
+		"season":       0,
+		"episode":      0,
+		"full_season":  true,
+		"unpack_files": unpackFiles,
+	}
+}
+
+// unpackFile builds one entry of a pack item's own "unpack_files" array:
+// name, release_name, url, plus SubDL's own (untrusted, per ADR 0011)
+// season/episode fields, included here to prove Sublime never reads them.
+func unpackFile(name, releaseName, url string, wireSeason, wireEpisode int) map[string]any {
+	return map[string]any{
+		"name":         name,
+		"release_name": releaseName,
+		"url":          url,
+		"season":       wireSeason,
+		"episode":      wireEpisode,
+	}
+}
+
+func TestSearch_TVQuery_SendsUnpack(t *testing.T) {
+	mock := newMockServer(t)
+	mock.on(http.MethodGet, "/subtitles", jsonHandler(http.StatusOK, searchResponse()))
+
+	clock := &fakeClock{}
+	p := newTestProvider(t, mock, clock, false)
+
+	query := provider.Query{Title: "Community", Season: 2, Episode: 1}
+	if _, err := p.Search(context.Background(), query); err != nil {
+		t.Fatalf("Search() error = %v", err)
+	}
+
+	reqs := mock.requestsFor(http.MethodGet, "/subtitles")
+	params, err := url.ParseQuery(reqs[0].Query)
+	if err != nil {
+		t.Fatalf("parsing query %q: %v", reqs[0].Query, err)
+	}
+	if got := params.Get("unpack"); got != "1" {
+		t.Errorf("unpack = %q, want %q", got, "1")
+	}
+}
+
+func TestSearch_MovieQuery_NeverSendsUnpack(t *testing.T) {
+	mock := newMockServer(t)
+	mock.on(http.MethodGet, "/subtitles", jsonHandler(http.StatusOK, searchResponse()))
+
+	clock := &fakeClock{}
+	p := newTestProvider(t, mock, clock, false)
+
+	if _, err := p.Search(context.Background(), provider.Query{Title: "Arrival", Year: 2016}); err != nil {
+		t.Fatalf("Search() error = %v", err)
+	}
+
+	reqs := mock.requestsFor(http.MethodGet, "/subtitles")
+	params, err := url.ParseQuery(reqs[0].Query)
+	if err != nil {
+		t.Fatalf("parsing query %q: %v", reqs[0].Query, err)
+	}
+	if params.Has("unpack") {
+		t.Errorf("movie query must not send unpack, got query %q", reqs[0].Query)
+	}
+}
+
+func TestSearch_FullSeasonPack_ItselfNeverBecomesACandidate(t *testing.T) {
+	mock := newMockServer(t)
+	mock.on(http.MethodGet, "/subtitles", jsonHandler(http.StatusOK, searchResponseWithTitle("Andor", 2022,
+		packItem("/subtitle/pack-1.zip"),
+	)))
+
+	clock := &fakeClock{}
+	p := newTestProvider(t, mock, clock, false)
+
+	query := provider.Query{Title: "Andor", Season: 1, Episode: 1}
+	candidates, err := p.Search(context.Background(), query)
+	if err != nil {
+		t.Fatalf("Search() error = %v", err)
+	}
+	for _, c := range candidates {
+		if c.ID == "/subtitle/pack-1.zip" {
+			t.Errorf("pack's own whole-archive item became a Candidate: %+v", c)
+		}
+	}
+}
+
+func TestSearch_FullSeasonPack_NoUnpackFiles_YieldsNoCandidates(t *testing.T) {
+	mock := newMockServer(t)
+	mock.on(http.MethodGet, "/subtitles", jsonHandler(http.StatusOK, searchResponseWithTitle("Andor", 2022,
+		packItem("/subtitle/pack-1.zip"),
+	)))
+
+	clock := &fakeClock{}
+	p := newTestProvider(t, mock, clock, false)
+
+	query := provider.Query{Title: "Andor", Season: 1, Episode: 1}
+	candidates, err := p.Search(context.Background(), query)
+	if err != nil {
+		t.Fatalf("Search() error = %v", err)
+	}
+	if len(candidates) != 0 {
+		t.Errorf("got %d candidates, want 0 (pack has no unpack_files)", len(candidates))
+	}
+}
+
+func TestSearch_FullSeasonPack_MixOfClassifiableAndUnclassifiableEntries(t *testing.T) {
+	mock := newMockServer(t)
+	mock.on(http.MethodGet, "/subtitles", jsonHandler(http.StatusOK, searchResponseWithTitle("Andor", 2022,
+		packItem("/subtitle/pack-1.zip",
+			// Classifiable via name; wire season/episode are deliberately wrong
+			// (ADR 0011) to prove they're never read.
+			unpackFile("Andor.S01E06.1080p.WEB-DL.x264-GROUP", "", "/subtitle/pack-1/6.zip", 11, 1),
+			// Classifiable only via release_name, since name carries no tag.
+			unpackFile("08 Narkina 5.en.srt", "Andor.S01E08.1080p.WEB-DL.x264-GROUP", "/subtitle/pack-1/8.zip", 0, 5),
+			// Unclassifiable: no S0xEyy/NxYY tag anywhere, wire fields zeroed.
+			unpackFile("12 Rix Road.en.srt", "", "/subtitle/pack-1/12.zip", 0, 0),
+		),
+	)))
+
+	clock := &fakeClock{}
+	p := newTestProvider(t, mock, clock, false)
+
+	query := provider.Query{Title: "Andor", Season: 1, Episode: 6}
+	candidates, err := p.Search(context.Background(), query)
+	if err != nil {
+		t.Fatalf("Search() error = %v", err)
+	}
+	if len(candidates) != 2 {
+		t.Fatalf("got %d candidates, want 2 (only the classifiable entries)", len(candidates))
+	}
+
+	want := []domain.Candidate{
+		{
+			ID:           "/subtitle/pack-1/6.zip",
+			Title:        "Andor",
+			Year:         2022,
+			Season:       1,
+			Episode:      6,
+			Source:       "WEB-DL",
+			Codec:        "x264",
+			Resolution:   "1080p",
+			ReleaseGroup: "GROUP",
+			HashMatch:    false,
+		},
+		{
+			ID:           "/subtitle/pack-1/8.zip",
+			Title:        "Andor",
+			Year:         2022,
+			Season:       1,
+			Episode:      8,
+			Source:       "WEB-DL",
+			Codec:        "x264",
+			Resolution:   "1080p",
+			ReleaseGroup: "GROUP",
+			HashMatch:    false,
+		},
+	}
+	for i, c := range candidates {
+		if c != want[i] {
+			t.Errorf("candidate[%d] = %+v, want %+v", i, c, want[i])
+		}
 	}
 }
 

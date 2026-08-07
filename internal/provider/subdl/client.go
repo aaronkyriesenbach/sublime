@@ -239,9 +239,27 @@ type searchResultInfo struct {
 // client.getRaw. Season/Episode are 0 for a movie or a full-season pack
 // (SubDL leaves Episode null for those; decoding JSON null into an int
 // field is a no-op in Go, so it comes through as the zero value here).
+// FullSeason marks a whole-season-pack archive (never itself a
+// Candidate); UnpackFiles is its per-file breakdown, populated only when
+// Search sent unpack=1 (see candidatesFromResponse, ADR 0011).
 type searchResultItem struct {
+	ReleaseName string           `json:"release_name"`
+	URL         string           `json:"url"`
+	Season      int              `json:"season"`
+	Episode     int              `json:"episode"`
+	FullSeason  bool             `json:"full_season"`
+	UnpackFiles []unpackFileItem `json:"unpack_files"`
+}
+
+// unpackFileItem mirrors one entry in a full-season pack's "unpack_files"
+// breakdown: Name/ReleaseName feed internal/media.Classify to resolve the
+// file's episode identity, and URL becomes the resulting Candidate's ID.
+//
+// Deliberately no season/episode fields: SubDL's own values there are
+// frequently wrong or zeroed in live testing (ADR 0011,
+// docs/adr/0011-subdl-unpack-files-matched-via-classify-not-wire-fields.md).
+type unpackFileItem struct {
+	Name        string `json:"name"`
 	ReleaseName string `json:"release_name"`
 	URL         string `json:"url"`
-	Season      int    `json:"season"`
-	Episode     int    `json:"episode"`
 }

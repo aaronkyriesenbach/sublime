@@ -22,9 +22,13 @@
 // fetches additional pages — via the response's own
 // totalPages/currentPage fields — until no further pages exist or a fixed
 // cap is reached, merging every page's results into the one candidate
-// list Search returns. full_season is still never sent: this is a
-// coverage fix delivered entirely through page size and pagination, not
-// by asking SubDL for packs specifically.
+// list Search returns.
+//
+// For a TV query, Search also sends unpack=1 and turns a full-season
+// pack's own unpack_files entries into Candidates via
+// internal/media.Classify, never the entries' own season/episode wire
+// fields (issue #79, ADR 0011); the pack's own whole-archive item is never
+// itself a Candidate.
 package subdl
 
 import (
@@ -42,6 +46,7 @@ import (
 	"golang.org/x/text/language"
 
 	"github.com/aaronkyriesenbach/sublime/internal/domain"
+	"github.com/aaronkyriesenbach/sublime/internal/media"
 	"github.com/aaronkyriesenbach/sublime/internal/provider"
 	"github.com/aaronkyriesenbach/sublime/internal/retry"
 )
@@ -276,8 +281,11 @@ func (p *Provider) quotaOrWrap(err error) (wrapped error, ok bool) {
 
 // Search implements provider.Provider. It maps query to SubDL's
 // /subtitles search params — film_name, year, season_number,
-// episode_number, and a translated languages value — never full_season or
-// unpack, since SubDL season-pack results aren't supported (issue #69).
+// episode_number, and a translated languages value. For a TV query (query
+// has an episode), it also sends unpack=1, requesting SubDL's per-file
+// breakdown of any full-season pack in the results, resolved into
+// Candidates by candidatesFromResponse (issue #79, ADR 0011); a movie
+// query never sends it.
 //
 // Every request also sends subs_per_page=30, SubDL's maximum page size,
 // and Search walks additional pages — same query params, only page
@@ -306,6 +314,7 @@ func (p *Provider) Search(ctx context.Context, query provider.Query) ([]domain.C
 	}
 	if query.Episode != 0 {
 		params.Set("episode_number", strconv.Itoa(query.Episode))
+		params.Set("unpack", "1")
 	}
 	if lang := languageParam(query.Language); lang != "" {
 		params.Set("languages", lang)
@@ -433,6 +442,10 @@ func downloadPathFromCandidateID(id string, paid bool, apiKey string) (string, e
 // moviehash-equivalent search (issue #69) — so results flow through the
 // same fuzzy/cosmetic scoring cutoff OpenSubtitles' own non-hash path
 // already uses.
+//
+// A FullSeason item is never itself turned into a Candidate; instead its
+// UnpackFiles are resolved individually via candidatesFromUnpackFiles
+// (issue #79, ADR 0011).
 func candidatesFromResponse(resp searchResponseBody) []domain.Candidate {
 	var title string
 	var year int
@@ -443,6 +456,11 @@ func candidatesFromResponse(resp searchResponseBody) []domain.Candidate {
 
 	var candidates []domain.Candidate
 	for _, item := range resp.Subtitles {
+		if item.FullSeason {
+			candidates = append(candidates, candidatesFromUnpackFiles(item.UnpackFiles, title, year)...)
+			continue
+		}
+
 		source, releaseGroup, resolution, codec := provider.ParseCosmetics(item.ReleaseName)
 		candidates = append(candidates, domain.Candidate{
 			ID:           item.URL,
@@ -450,6 +468,49 @@ func candidatesFromResponse(resp searchResponseBody) []domain.Candidate {
 			Year:         year,
 			Season:       item.Season,
 			Episode:      item.Episode,
+			Source:       source,
+			ReleaseGroup: releaseGroup,
+			Resolution:   resolution,
+			Codec:        codec,
+			HashMatch:    false,
+		})
+	}
+	return candidates
+}
+
+// candidatesFromUnpackFiles resolves a full-season pack's own unpack_files
+// breakdown into Candidates, sharing title/year with the rest of the
+// response (candidatesFromResponse). Each entry is classified via
+// media.Classify against its Name, falling back to ReleaseName if Name
+// doesn't classify; an entry Classify doesn't tag as media.Episode is
+// dropped, never guessed at (ADR 0011). A resolved entry's Season/Episode
+// come from that Classification alone, never the entry's own wire fields
+// (client.go's unpackFileItem doesn't even decode those); its ID is its own
+// URL, and its cosmetics come from provider.ParseCosmetics against
+// ReleaseName, falling back to Name when ReleaseName is blank.
+func candidatesFromUnpackFiles(files []unpackFileItem, title string, year int) []domain.Candidate {
+	var candidates []domain.Candidate
+	for _, file := range files {
+		classification := media.Classify(file.Name)
+		if classification.Type != media.Episode {
+			classification = media.Classify(file.ReleaseName)
+		}
+		if classification.Type != media.Episode {
+			continue
+		}
+
+		releaseForCosmetics := file.ReleaseName
+		if releaseForCosmetics == "" {
+			releaseForCosmetics = file.Name
+		}
+		source, releaseGroup, resolution, codec := provider.ParseCosmetics(releaseForCosmetics)
+
+		candidates = append(candidates, domain.Candidate{
+			ID:           file.URL,
+			Title:        title,
+			Year:         year,
+			Season:       classification.Season,
+			Episode:      classification.Episode,
 			Source:       source,
 			ReleaseGroup: releaseGroup,
 			Resolution:   resolution,
