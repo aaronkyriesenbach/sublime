@@ -1,16 +1,39 @@
 package trigger_test
 
 import (
+	"bytes"
 	"context"
+	"log/slog"
+	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
 	"golang.org/x/text/language"
 
 	"github.com/aaronkyriesenbach/sublime/internal/domain"
+	"github.com/aaronkyriesenbach/sublime/internal/strip"
 	"github.com/aaronkyriesenbach/sublime/internal/trigger"
 )
+
+// syncedLogBuffer serializes writes so a slog.TextHandler can be shared across goroutines.
+type syncedLogBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (w *syncedLogBuffer) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.buf.Write(p)
+}
+
+func (w *syncedLogBuffer) String() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.buf.String()
+}
 
 // waitForPending polls st for videoPath's Sync Status to show up as
 // Pending, failing the test if it doesn't within timeout. Watch/scan side
@@ -107,6 +130,56 @@ func TestWatcher_LiveFileCreationEventIsRegistered(t *testing.T) {
 	file := waitForPending(t, ctx, st, lib.Name, videoPath, 2*time.Second)
 	if file.Languages[0].Status != domain.StatusPending {
 		t.Errorf("status = %q, want %q (Watcher only registers, never dispatches)", file.Languages[0].Status, domain.StatusPending)
+	}
+}
+
+// TestWatcher_StripStrayTempFileEventIsIgnored is issue #81's regression test: a stray Strip temp file's fsnotify event must never reach registration.
+func TestWatcher_StripStrayTempFileEventIsIgnored(t *testing.T) {
+	libDir := t.TempDir()
+
+	p, _ := newTestPipeline(t, nil)
+	logBuf := &syncedLogBuffer{}
+	p.Logger = slog.New(slog.NewTextHandler(logBuf, nil))
+	lib := domain.Library{
+		Name:       "test-library",
+		Path:       libDir,
+		Languages:  []language.Tag{language.English},
+		StripScope: domain.StripScopeAll,
+	}
+
+	ready := make(chan struct{})
+	w := &trigger.Watcher{
+		Pipeline:         p,
+		Library:          lib,
+		DebounceInterval: 20 * time.Millisecond,
+		OnWatching:       func() { close(ready) },
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- w.Start(ctx) }()
+	defer func() {
+		cancel()
+		<-done
+	}()
+
+	select {
+	case <-ready:
+	case <-time.After(2 * time.Second):
+		t.Fatal("watcher did not become ready in time")
+	}
+
+	// Simulates StripEmbedded's remux temp file vanishing via rename before its debounce window elapses — the exact timing behind #81's phantom Found bug.
+	strayPath := strip.NewTempVideoPath(libDir, "Test.Movie.2024.HDTV.x264-FAKEGROUP", ".mp4")
+	writeSampleVideo(t, strayPath)
+	if err := os.Remove(strayPath); err != nil {
+		t.Fatalf("removing stray temp fixture: %v", err)
+	}
+
+	time.Sleep(200 * time.Millisecond)
+
+	if got := logBuf.String(); got != "" {
+		t.Errorf("pipeline logged activity for a stray temp file, want none:\n%s", got)
 	}
 }
 
