@@ -1,11 +1,28 @@
 package scoring
 
 import (
+	"regexp"
 	"strings"
 
 	"github.com/aaronkyriesenbach/sublime/internal/domain"
 	"github.com/aaronkyriesenbach/sublime/internal/media"
 )
+
+// titleFoldPattern: \p{L}/\p{N} are Unicode letter/digit classes, so
+// accented letters survive while punctuation, symbols, and whitespace
+// (including a stray non-breaking space) don't.
+var titleFoldPattern = regexp.MustCompile(`[^\p{L}\p{N}]+`)
+
+// foldTitle builds a title comparison key tolerant of cosmetic formatting
+// differences only. It deliberately doesn't fold accents to a base letter,
+// drop a leading "The"/"A"/"An", equate "&" with "and", or equate a numeral
+// with its spelled-out word -- those are vocabulary-level differences with
+// their own false-positive risk, left as genuine mismatches on purpose (see
+// docs/adr/0009). Case is folded separately, by strings.EqualFold at this
+// function's one call site.
+func foldTitle(title string) string {
+	return strings.TrimSpace(titleFoldPattern.ReplaceAllString(title, " "))
+}
 
 // Score computes candidate's score against info and whether it clears the
 // eligibility cutoff (see identityCutoff). A HashMatch candidate short-
@@ -18,7 +35,7 @@ func Score(info Info, candidate domain.Candidate) (score int, eligible bool) {
 
 	isEpisode := info.ContentType == media.Episode
 
-	if info.Title != "" && strings.EqualFold(info.Title, candidate.Title) {
+	if info.Title != "" && strings.EqualFold(foldTitle(info.Title), foldTitle(candidate.Title)) {
 		score += weightTitle
 	}
 	if info.Year != 0 && info.Year == candidate.Year {

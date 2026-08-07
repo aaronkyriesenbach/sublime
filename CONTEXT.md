@@ -21,7 +21,7 @@ A fast, fixed-cost hash Sublime computes for a video file (independent of file s
 _Avoid_: Checksum, fingerprint, provider hash
 
 **Candidate**:
-A subtitle result returned by a Provider search, not yet chosen. Candidates are scored against the video's metadata (title, year, season/episode, source, release group, resolution, codec); the highest-scoring Candidate above the minimum cutoff is selected, or none is if nothing clears it.
+A subtitle result returned by a Provider search, not yet chosen. Candidates are scored against the video's metadata (title, year, season/episode, source, release group, resolution, codec); the highest-scoring Candidate above the minimum cutoff is selected, or none is if nothing clears it. Title comparison folds cosmetic formatting differences (punctuation, symbols, whitespace) between a video's filename-derived title and a Candidate's own claimed title, but not vocabulary-level differences (numerals vs. spelled-out numbers, leading articles, "&" vs. "and") — those are treated as genuinely different titles.
 _Avoid_: Result, match (as a noun — Match is reserved for a scored attribute)
 
 **Provider**:
