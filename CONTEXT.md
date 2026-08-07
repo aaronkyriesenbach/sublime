@@ -21,12 +21,36 @@ A fast, fixed-cost hash Sublime computes for a video file (independent of file s
 _Avoid_: Checksum, fingerprint, provider hash
 
 **Candidate**:
-A subtitle result returned by a Provider search, not yet chosen. Candidates are scored against the video's metadata (title, year, season/episode, source, release group, resolution, codec); the highest-scoring Candidate above the minimum cutoff is selected, or none is if nothing clears it.
+A subtitle result returned by a Provider search, not yet chosen. Candidates are scored against the video's metadata (title, year, season/episode, source, release group, resolution, codec); the highest-scoring Candidate above the minimum cutoff is selected, or none is if nothing clears it. Title comparison folds cosmetic formatting differences (punctuation, symbols, whitespace) between a video's filename-derived title and a Candidate's own claimed title, but not vocabulary-level differences (numerals vs. spelled-out numbers, leading articles, "&" vs. "and") — those are treated as genuinely different titles.
 _Avoid_: Result, match (as a noun — Match is reserved for a scored attribute)
 
 **Provider**:
 An external subtitle source Sublime can query for Candidates (e.g., OpenSubtitles). Each Provider owns its own rate limit and derives whatever hash or query key it needs from the video internally; Sublime supports one Provider in v1 but is built to support several.
 _Avoid_: Source, backend
+
+**Suspended**:
+A time-bounded state of a single Provider — not a Sync Status of any (file, language) pair — entered when the Provider reports its request quota is exhausted, and lasting until the Provider-reported (or, failing that, a conservative default) resume time. While Suspended, no further Search or Download calls are made against that Provider; every (file, language) pair that would otherwise be attempted is left Pending rather than marked Failed, since the Provider's unavailability says nothing about whether any individual file can be synced. Scoped to the one Provider that reported exhaustion — other Providers are unaffected. Distinct from Failed: Suspended is an environmental, self-clearing condition owned by the Provider, not a per-file outcome owned by the state store.
+_Avoid_: Paused (used informally above, but Suspended is the canonical term), rate-limited, blocked
+
+**Quota Exhausted**:
+The cause recorded for a Provider entering Suspended: it has used its full allotment of a rate-limited operation (e.g. OpenSubtitles' 24h download quota) and been told to wait until a reset time. Distinct from ordinary throttling (a 429/5xx response, handled by adaptive backoff on individual requests) — Quota Exhausted is a hard stop with a known-ish resume time, not a rate to slow down.
+_Avoid_: Rate limited, throttled
+
+**Trigger**:
+The mechanism by which a video file enters the pipeline's Pending state: an initial Library scan, a live fsnotify watch over the Library's tree, or a manual reprocess request. A Trigger only registers Found/Changed files and fans out Pending Sync Statuses for them — it never itself claims a (file, language) pair or calls a Provider; that's the Dispatcher's job.
+_Avoid_: Scanner, Watcher (the Go type implementing the live-watch Trigger specifically, not the whole concept)
+
+**Dispatcher**:
+The component that claims Pending (file, language) pairs and hands them to a Provider for real work (Search through Sync) — one dispatch loop shared across every Library, independent of any single Trigger. Honors each pair's Provider Chain and each Provider's Suspended state: a pair whose next Provider is Suspended is left Pending rather than dispatched, until that Provider resumes.
+_Avoid_: Scheduler, Worker (a Dispatcher's execution unit, not the Dispatcher itself)
+
+**Tier**:
+A named rank within a Provider Chain holding one or more Providers the operator trusts equally at that priority level. List order inside a Tier is still a soft preference — the first healthy, non-Suspended Provider is tried first — but any Provider in a Tier is an acceptable substitute for another: a pair's dispatch is only ever gated by Suspension at the Tier boundary, never within a lower-vs-higher Tier comparison across the whole chain.
+_Avoid_: Rank, Priority group
+
+**Provider Chain**:
+The ordered sequence of Tiers a single (file, language) pair may be attempted against, highest Tier first. A pair advances to the next Provider — first to the next Provider within its current Tier, then into the next Tier — only once every Provider it has tried has completed a real Search and found no Candidate clearing the scoring cutoff; Sublime remembers which Providers a pair has already tried and missed, so this walk can span many dispatch passes rather than needing to finish in one. Suspension gates dispatch differently from a no-candidate miss: a Suspended Provider is skipped in favor of a Tier-mate, but never in favor of a lower Tier — every Provider in the current Tier being Suspended leaves the pair waiting on that Tier rather than descending. Failed's `no_candidate` reason is reached only once every Provider in every Tier of the chain has been tried and found nothing.
+_Avoid_: Fallback (describes the mechanism informally; Provider Chain is the noun for the ordered list itself), Priority list
 
 **Sync Engine**:
 The tool Sublime uses to perform Sync (e.g., alass). Swappable independently of the Provider used to retrieve the Candidate.
@@ -35,3 +59,35 @@ _Avoid_: Aligner, sync tool
 **Sync**:
 Actively re-timing a retrieved subtitle's timestamps to align with a video's actual audio, using audio-based alignment — not merely placing a file next to the video. Always performed, even after a successful hash match, since a claimed match can still be mistimed.
 _Avoid_: Match, align (as a standalone term — use Sync)
+
+**Sync Status**:
+The lifecycle state of a single (file, language) pair: Pending, In Progress, Synced, or Failed. Owned by the state store, not any Provider or Sync Engine.
+_Avoid_: State, status (too generic on their own — always qualify as Sync Status), Job (a single (file, language) pair's retrieve/sync attempt — always name the pair and its Sync Status instead of calling it a Job)
+
+**Found**:
+The moment a video file is first recorded by the state store — via a Library scan's directory walk or a file-system watch event for a brand-new path — registering it and fanning out a Pending Sync Status for each of its Library's configured languages. Logged once per file, not per language.
+_Avoid_: Discovered, scanned, indexed
+
+**Changed**:
+The moment an already-tracked file's Content Hash is observed to differ from its last-recorded value (an external edit, e.g. a re-encode), or a manual reprocess request targets it — resetting its existing Sync Statuses back to Pending in place. Distinct from Found: a Changed file was already known to Sublime.
+_Avoid_: Modified, updated, rescanned
+
+**Removed**:
+The moment a tracked file is observed to no longer exist — either a live filesystem delete/rename-away event, or a Library scan finding a previously tracked path absent after a fully successful walk — deleting its file row and, by cascade, every one of its language states. Logged once per file, not per language. A rename is not distinguished from a deletion: the file at the old path is Removed, and if a file appears at a new path it is Found there as an unrelated row, with no Content Hash or prior Sync Status carried across — see docs/adr/0013-rename-is-removed-plus-found-not-tracked.md.
+_Avoid_: Deleted (reserve for a possible future operator-initiated destructive action, distinct from this passive observation), Missing, Vanished
+
+**Pending**:
+The Sync Status of a (file, language) pair that has been Found (or reset by a Changed event) but not yet picked up by a worker. Counted for every tracked file regardless of how large the backlog is — not bounded by worker count.
+_Avoid_: Queued, waiting, new
+
+**In Progress**:
+The Sync Status of a (file, language) pair currently checked out by a pipeline worker, from its Marker gate check through a final Synced/Failed outcome. Bounded by the pipeline's worker count — reflects the actual in-flight batch, not the backlog. A Marker-gate hit (already synced, no Provider work needed) skips In Progress entirely and goes straight from Pending to Synced, so In Progress only ever reflects real work. Deliberately not "Syncing" — that would overload Sync's specific re-timing meaning with a much broader in-flight-work meaning.
+_Avoid_: Syncing, processing, active, working
+
+**Synced** (Sync Status):
+The Sync Status of a (file, language) pair whose subtitle is up to date with the file's current Content Hash, whether from a fresh Provider fetch this pass or a prior pass's still-valid Marker.
+_Avoid_: Done, complete
+
+**Failed** (Sync Status):
+The Sync Status of a (file, language) pair whose most recent attempt did not produce a Synced subtitle, paired with a failure reason (no candidate cleared the scoring cutoff, retrieval failed, Sync failed, or an internal error). Not retried until a Changed event resets it.
+_Avoid_: Error, broken

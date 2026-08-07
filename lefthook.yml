@@ -1,0 +1,7 @@
+---
+pre-commit:
+  commands:
+    golangci-lint:
+      run: golangci-lint run
+      fail_text: >
+        golangci-lint failed — fix the issues above before committing.

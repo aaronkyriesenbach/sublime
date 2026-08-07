@@ -33,7 +33,7 @@ func (s *Server) handleReprocess(w http.ResponseWriter, r *http.Request) {
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
-		if _, err := s.reprocess(s.ctx, lib, req.Path); err != nil {
+		if err := s.reprocess(s.ctx, lib, req.Path); err != nil {
 			s.logger.Error("background reprocess failed", "path", req.Path, "library", lib.Name, "error", err)
 		}
 	}()

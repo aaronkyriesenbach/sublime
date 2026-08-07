@@ -32,6 +32,15 @@ var ErrLanguageStateNotFound = errors.New("store: language state not found")
 // ObserveFileContentHash.
 var ErrFileNotFound = errors.New("store: file not found")
 
+// ErrClaimLost is returned by MarkInProgress when the (file, language) row
+// exists but is no longer StatusPending, whether because another caller
+// already claimed it or for any other reason. It is not distinguished from
+// ErrLanguageStateNotFound beyond that: nothing in the store deletes
+// file_language_states rows, so a genuinely missing row is practically
+// unreachable once a pair has been registered, and both cases warrant the
+// same reaction from a caller (skip, don't treat as a processing failure).
+var ErrClaimLost = errors.New("store: claim lost, language state is no longer pending")
+
 // bootstrapSQL is Sublime's entire schema. There is no migration framework:
 // every statement uses IF NOT EXISTS so Open is safe to call against an
 // existing database file.
@@ -49,11 +58,32 @@ CREATE TABLE IF NOT EXISTS file_language_states (
 	id INTEGER PRIMARY KEY,
 	file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
 	language TEXT NOT NULL,
-	status TEXT NOT NULL CHECK (status IN ('pending', 'synced', 'failed')),
+	-- See docs/adr/0002-no-migration-for-in-progress-status.md: widening
+	-- this CHECK to add 'in_progress' is an accepted breaking change for
+	-- existing databases, not migrated.
+	status TEXT NOT NULL CHECK (status IN ('pending', 'in_progress', 'synced', 'failed')),
 	failure_reason TEXT CHECK (
 		(status = 'failed' AND failure_reason IN ('no_candidate', 'retrieval_failed', 'sync_failed', 'internal_error'))
 		OR (status != 'failed' AND failure_reason IS NULL)
 	),
+	-- force records that this Pending pair was reset by a manual reprocess
+	-- request (see docs/adr/0004-decouple-trigger-and-dispatcher.md) rather
+	-- than an ordinary Found/Changed event, so the Dispatcher — which now
+	-- claims and processes this row on its own, asynchronously from the
+	-- Trigger call that reset it — knows to bypass the Marker+Content-Hash
+	-- gate for it. Cleared once the Dispatcher claims the row (MarkInProgress).
+	force INTEGER NOT NULL DEFAULT 0,
+	-- attempted_providers is a comma-separated set of Provider names
+	-- already tried and missed (no Candidate cleared the scoring cutoff)
+	-- for this pair's current cycle. See
+	-- docs/adr/0008-tiered-provider-chain.md: a pair remembers this across
+	-- dispatch passes so the Provider Chain walk can advance to the next
+	-- Provider on a later attempt rather than needing to finish in one.
+	-- Cleared, like force, on every reset back to Pending that starts a
+	-- new cycle (Changed, manual reprocess, force); not cleared by a
+	-- Provider miss itself or by a QuotaExhaustedError repend, since both
+	-- continue the same cycle.
+	attempted_providers TEXT NOT NULL DEFAULT '',
 	updated_at TEXT NOT NULL,
 	UNIQUE (file_id, language)
 );

@@ -5,17 +5,32 @@ import (
 	"log/slog"
 	"net/http"
 	"sync"
+	"time"
 
 	"github.com/aaronkyriesenbach/sublime/internal/domain"
-	"github.com/aaronkyriesenbach/sublime/internal/pipeline"
 	"github.com/aaronkyriesenbach/sublime/internal/store"
 )
 
 // ReprocessFunc forces target (a file, directory, or Library path) through
 // lib's pipeline, bypassing the Marker+Content-Hash gate. It matches
 // internal/trigger.Reprocess's signature so the production serve command
-// can pass that function directly; tests can inject a fake.
-type ReprocessFunc func(ctx context.Context, lib domain.Library, target string) (pipeline.Result, error)
+// can pass that function directly; tests can inject a fake. It's a pure
+// registration/reset operation — it returns once target's (file, language)
+// pairs are reset to Pending, before the Dispatcher has necessarily
+// claimed or processed any of them.
+type ReprocessFunc func(ctx context.Context, lib domain.Library, target string) error
+
+// ProviderStatusFunc reports one configured Provider's identity and live
+// suspension status for GET /status' providers array. Status may be nil —
+// meaning that Provider doesn't implement the optional suspension-
+// reporting capability (see pipeline.NewProduction's suspensionReporter) —
+// in which case it's always reported as not suspended. This mirrors the
+// ReprocessFunc injection pattern above, keeping this package free of any
+// import on a concrete Provider implementation.
+type ProviderStatusFunc struct {
+	Name   string
+	Status func() (resumeAt time.Time, suspended bool)
+}
 
 // Deps holds Server's dependencies.
 type Deps struct {
@@ -33,6 +48,11 @@ type Deps struct {
 	// POST /reprocess. Required for that route to do anything.
 	Reprocess ReprocessFunc
 
+	// Providers reports each configured Provider's live suspension status
+	// for GET /status' providers array. Nil or empty means that array is
+	// empty.
+	Providers []ProviderStatusFunc
+
 	// Logger receives background reprocess outcomes/errors. Defaults to
 	// slog.Default() if nil.
 	Logger *slog.Logger
@@ -46,6 +66,7 @@ type Server struct {
 	store     *store.Store
 	libraries []domain.Library
 	reprocess ReprocessFunc
+	providers []ProviderStatusFunc
 	logger    *slog.Logger
 
 	wg     sync.WaitGroup
@@ -67,6 +88,7 @@ func NewServer(deps Deps) *Server {
 		store:     deps.Store,
 		libraries: deps.Libraries,
 		reprocess: deps.Reprocess,
+		providers: deps.Providers,
 		logger:    logger,
 		ctx:       ctx,
 		cancel:    cancel,

@@ -17,6 +17,7 @@ import (
 
 	"github.com/aaronkyriesenbach/sublime/internal/api"
 	"github.com/aaronkyriesenbach/sublime/internal/config"
+	"github.com/aaronkyriesenbach/sublime/internal/dispatcher"
 	"github.com/aaronkyriesenbach/sublime/internal/domain"
 	"github.com/aaronkyriesenbach/sublime/internal/pipeline"
 	"github.com/aaronkyriesenbach/sublime/internal/store"
@@ -33,6 +34,11 @@ const (
 	// see "Core stack & storage" (issue #2): SQLite state under /data.
 	defaultDBPath = "/data/sublime.db"
 
+	// defaultDispatchPollInterval is how often the Dispatcher wakes to look
+	// for newly Pending (file, language) pairs when --dispatch-poll-interval
+	// isn't given.
+	defaultDispatchPollInterval = 5 * time.Second
+
 	shutdownTimeout = 10 * time.Second
 )
 
@@ -41,6 +47,11 @@ type ServeOptions struct {
 	ConfigPath string
 	DBPath     string
 	Addr       string
+
+	// DispatchPollInterval is how often the Dispatcher wakes to look for
+	// newly Pending (file, language) pairs. Zero uses
+	// defaultDispatchPollInterval.
+	DispatchPollInterval time.Duration
 
 	// OnReady, if set, is called once the HTTP listener is bound (before
 	// Libraries start their initial scan), with the listener's actual
@@ -55,6 +66,7 @@ type ServeOptions struct {
 func newServeCommand(configPath *string) *cobra.Command {
 	var addr string
 	var dbPath string
+	var dispatchPollInterval time.Duration
 
 	cmd := &cobra.Command{
 		Use:   "serve",
@@ -65,21 +77,27 @@ func newServeCommand(configPath *string) *cobra.Command {
 			defer stop()
 
 			return Serve(ctx, ServeOptions{
-				ConfigPath: *configPath,
-				DBPath:     dbPath,
-				Addr:       addr,
+				ConfigPath:           *configPath,
+				DBPath:               dbPath,
+				Addr:                 addr,
+				DispatchPollInterval: dispatchPollInterval,
 			})
 		},
 	}
 
 	cmd.Flags().StringVar(&addr, "addr", defaultServeAddr, "address to bind the HTTP API on")
 	cmd.Flags().StringVar(&dbPath, "db", defaultDBPath, "path to the SQLite state store")
+	cmd.Flags().DurationVar(&dispatchPollInterval, "dispatch-poll-interval", defaultDispatchPollInterval,
+		"how often the Dispatcher looks for newly Pending (file, language) pairs")
 	return cmd
 }
 
 // Serve is the daemon entrypoint: it loads config, opens the state store,
 // wires a production Pipeline, starts a trigger.Watcher per configured
-// Library, and serves the HTTP API (internal/api) until ctx is cancelled.
+// Library plus one shared dispatcher.Dispatcher, and serves the HTTP API
+// (internal/api) until ctx is cancelled. Watchers and the Dispatcher run as
+// independent goroutines, coordinating only through the state store — see
+// docs/adr/0004-decouple-trigger-and-dispatcher.md.
 //
 // The HTTP listener is bound and serving before any Library's initial scan
 // starts, so /health answers immediately even while a large Library is
@@ -109,22 +127,42 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 	defer func() { _ = st.Close() }()
 
 	secrets := config.LoadProviderSecrets()
-	p, err := pipeline.NewProduction(pipeline.ProductionConfig{
-		Store:   st,
-		Secrets: secrets.OpenSubtitles,
-		Logger:  logger,
+	p, providerStatuses, tierStatuses, err := pipeline.NewProduction(pipeline.ProductionConfig{
+		Store:         st,
+		Secrets:       secrets,
+		ProviderTiers: cfg.ProviderTiers,
+		Logger:        logger,
 	})
 	if err != nil {
 		return fmt.Errorf("constructing pipeline: %w", err)
 	}
 
+	apiProviders := make([]api.ProviderStatusFunc, 0, len(providerStatuses))
+	for _, ps := range providerStatuses {
+		apiProviders = append(apiProviders, api.ProviderStatusFunc{Name: ps.Name, Status: ps.Suspension})
+	}
+
+	providerTiers := make([]dispatcher.ProviderTier, 0, len(tierStatuses))
+	for _, ts := range tierStatuses {
+		entries := make([]dispatcher.ProviderEntry, 0, len(ts.Providers))
+		for _, ps := range ts.Providers {
+			entries = append(entries, dispatcher.ProviderEntry{
+				Name:        ps.Name,
+				Pipeline:    ps.Pipeline,
+				WorkerCount: ps.WorkerCount,
+			})
+		}
+		providerTiers = append(providerTiers, dispatcher.ProviderTier{Providers: entries})
+	}
+
 	apiServer := api.NewServer(api.Deps{
 		Store:     st,
 		Libraries: cfg.Libraries,
-		Reprocess: func(ctx context.Context, lib domain.Library, target string) (pipeline.Result, error) {
+		Reprocess: func(ctx context.Context, lib domain.Library, target string) error {
 			return trigger.Reprocess(ctx, p, lib, target)
 		},
-		Logger: logger,
+		Providers: apiProviders,
+		Logger:    logger,
 	})
 	defer apiServer.Close()
 
@@ -155,6 +193,21 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 			}
 		}(lib)
 	}
+
+	d := &dispatcher.Dispatcher{
+		ProviderTiers: providerTiers,
+		Store:         st,
+		Libraries:     cfg.Libraries,
+		PollInterval:  opts.DispatchPollInterval,
+		Logger:        logger,
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if err := d.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			logger.Error("dispatcher stopped", "error", err)
+		}
+	}()
 
 	<-ctx.Done()
 	logger.Info("sublime daemon shutting down")

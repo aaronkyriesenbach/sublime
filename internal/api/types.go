@@ -4,6 +4,8 @@
 // contract (see internal/cli).
 package api
 
+import "time"
+
 // ErrorEnvelope is the uniform JSON shape for every non-2xx response.
 type ErrorEnvelope struct {
 	Error   string `json:"error"`
@@ -21,12 +23,13 @@ const (
 // LibraryEntry is one Library's full listing shape for GET /libraries: its
 // config identity plus aggregate sync counts.
 type LibraryEntry struct {
-	Name      string   `json:"name"`
-	Path      string   `json:"path"`
-	Languages []string `json:"languages"`
-	Pending   int      `json:"pending"`
-	Synced    int      `json:"synced"`
-	Failed    int      `json:"failed"`
+	Name       string   `json:"name"`
+	Path       string   `json:"path"`
+	Languages  []string `json:"languages"`
+	Pending    int      `json:"pending"`
+	InProgress int      `json:"in_progress"`
+	Synced     int      `json:"synced"`
+	Failed     int      `json:"failed"`
 }
 
 // LibrariesResponse is GET /libraries' response shape.
@@ -37,17 +40,23 @@ type LibrariesResponse struct {
 // LibrarySummaryEntry is the lighter-weight library shape /status embeds:
 // aggregate counts only, without LibraryEntry's path/languages detail.
 type LibrarySummaryEntry struct {
-	Name    string `json:"name"`
-	Pending int    `json:"pending"`
-	Synced  int    `json:"synced"`
-	Failed  int    `json:"failed"`
+	Name       string `json:"name"`
+	Pending    int    `json:"pending"`
+	InProgress int    `json:"in_progress"`
+	Synced     int    `json:"synced"`
+	Failed     int    `json:"failed"`
 }
 
 // LanguageStateEntry is one language's sync state within a FileEntry.
-// Reason is only populated when Status is "failed".
+// Reason is only populated when Status is "failed". Attempted lists
+// Provider names already tried-and-missed this cycle (see
+// store.RecordProviderMiss), letting a caller tell a pair that's never
+// been attempted apart from one that's already been missed by every
+// Provider but one.
 type LanguageStateEntry struct {
-	Status string `json:"status"`
-	Reason string `json:"reason,omitempty"`
+	Status    string   `json:"status"`
+	Reason    string   `json:"reason,omitempty"`
+	Attempted []string `json:"attempted,omitempty"`
 }
 
 // FileEntry is one tracked file's shape within GET /status' scoped "files"
@@ -59,12 +68,22 @@ type FileEntry struct {
 	Languages   map[string]LanguageStateEntry `json:"languages"`
 }
 
+// ProviderEntry is one configured Provider's shape within GET /status'
+// providers array: identity plus current Suspended state. ResumeAt is
+// only populated when Suspended is true.
+type ProviderEntry struct {
+	Name      string     `json:"name"`
+	Suspended bool       `json:"suspended"`
+	ResumeAt  *time.Time `json:"resumeAt,omitempty"`
+}
+
 // StatusResponse is GET /status' response shape. Files/Total/Limit/Offset
 // are only populated for a scoped request (?library= or ?path= given);
 // pointers so an unscoped response omits them entirely via omitempty
 // instead of emitting misleading zero values.
 type StatusResponse struct {
 	Libraries []LibrarySummaryEntry `json:"libraries"`
+	Providers []ProviderEntry       `json:"providers"`
 	Files     []FileEntry           `json:"files,omitempty"`
 	Total     *int                  `json:"total,omitempty"`
 	Limit     *int                  `json:"limit,omitempty"`

@@ -119,12 +119,11 @@ func TestIntegration_RealPipeline_EndToEnd(t *testing.T) {
 	if result.FilesScanned != 1 {
 		t.Errorf("FilesScanned = %d, want 1", result.FilesScanned)
 	}
-	if result.Synced != 1 {
-		t.Errorf("Synced = %d, want 1", result.Synced)
+	if result.Found != 1 {
+		t.Errorf("Found = %d, want 1", result.Found)
 	}
-	if result.Failed != 0 {
-		t.Errorf("Failed = %d, want 0; errors: %v", result.Failed, result.Errors)
-	}
+
+	dispatchPending(t, ctx, p, st, lib)
 
 	sidecarPath := filepath.Join(libDir, "Test.Movie.2024.BluRay.x264-TESTGROUP.en.srt")
 	sidecarContent, err := os.ReadFile(sidecarPath)
@@ -169,11 +168,15 @@ func TestIntegration_RealPipeline_EndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("second pipeline.Run: %v", err)
 	}
-	if result2.Skipped != 1 {
-		t.Errorf("second run Skipped = %d, want 1 (marker recognized)", result2.Skipped)
+	if result2.Found != 0 || result2.Changed != 0 {
+		t.Errorf("second run Found=%d Changed=%d, want 0,0 (unchanged file)", result2.Found, result2.Changed)
 	}
-	if result2.Synced != 0 {
-		t.Errorf("second run Synced = %d, want 0", result2.Synced)
+
+	requestsBeforeSecondDispatch := mock.RequestCount()
+	dispatchPending(t, ctx, p, st, lib)
+	if got := mock.RequestCount(); got != requestsBeforeSecondDispatch {
+		t.Errorf("second dispatch hit the mock Provider server: request count went from %d to %d, want unchanged (marker recognized)",
+			requestsBeforeSecondDispatch, got)
 	}
 }
 
@@ -252,15 +255,22 @@ func TestIntegration_RealPipeline_RestartAfterStripSkipsResync(t *testing.T) {
 	defer func() { _ = st1.Close() }()
 
 	ctx := context.Background()
-	result, err := newPipeline(st1).Run(ctx, lib)
+	p1 := newPipeline(st1)
+	result, err := p1.Run(ctx, lib)
 	if err != nil {
 		t.Fatalf("first pipeline.Run: %v", err)
 	}
-	if result.Synced != 1 {
-		t.Errorf("first run Synced = %d, want 1", result.Synced)
+	if result.Found != 1 {
+		t.Errorf("first run Found = %d, want 1", result.Found)
 	}
-	if result.Failed != 0 {
-		t.Errorf("first run Failed = %d, want 0; errors: %v", result.Failed, result.Errors)
+	dispatchPending(t, ctx, p1, st1, lib)
+
+	file1, found1, err := st1.GetFile(ctx, lib.Name, videoPath)
+	if err != nil {
+		t.Fatalf("GetFile after first dispatch: %v", err)
+	}
+	if !found1 || file1.Languages[0].Status != domain.StatusSynced {
+		t.Fatalf("expected Synced after first dispatch, got %+v", file1)
 	}
 
 	streams, err := stripper.ProbeSubtitleStreams(ctx, videoPath)
@@ -287,11 +297,18 @@ func TestIntegration_RealPipeline_RestartAfterStripSkipsResync(t *testing.T) {
 	if err != nil {
 		t.Fatalf("second pipeline.Run: %v", err)
 	}
-	if result2.Skipped != 1 {
-		t.Errorf("second run (fresh store) Skipped = %d, want 1", result2.Skipped)
+	if result2.Found != 0 || result2.Changed != 0 {
+		t.Errorf("second run (fresh store) Found=%d Changed=%d, want 0,0", result2.Found, result2.Changed)
 	}
-	if result2.Synced != 0 {
-		t.Errorf("second run (fresh store) Synced = %d, want 0", result2.Synced)
+
+	dispatchPending(t, ctx, newPipeline(st2), st2, lib)
+
+	file2, found2, err := st2.GetFile(ctx, lib.Name, videoPath)
+	if err != nil {
+		t.Fatalf("GetFile after second dispatch: %v", err)
+	}
+	if !found2 || file2.Languages[0].Status != domain.StatusSynced {
+		t.Fatalf("expected Marker-gate hit to leave file Synced, got %+v", file2)
 	}
 
 	if got := mock.RequestCount(); got != requestsAfterFirstRun {
@@ -337,12 +354,14 @@ func TestIntegration_NewProduction_Success(t *testing.T) {
 	}
 	defer func() { _ = st.Close() }()
 
-	p, err := pipeline.NewProduction(pipeline.ProductionConfig{
+	p, providerStatuses, _, err := pipeline.NewProduction(pipeline.ProductionConfig{
 		Store: st,
-		Secrets: config.OpenSubtitlesSecrets{
-			APIKey:   "test-api-key",
-			Username: "testuser",
-			Password: "testpass",
+		Secrets: config.ProviderSecrets{
+			OpenSubtitles: config.OpenSubtitlesSecrets{
+				APIKey:   "test-api-key",
+				Username: "testuser",
+				Password: "testpass",
+			},
 		},
 		WorkerCount: 1,
 	})
@@ -362,6 +381,108 @@ func TestIntegration_NewProduction_Success(t *testing.T) {
 	if p.Stripper == nil {
 		t.Error("pipeline.Stripper is nil")
 	}
+	if len(providerStatuses) != 1 || providerStatuses[0].Name != "opensubtitles" {
+		t.Errorf("providerStatuses = %+v, want a single opensubtitles entry", providerStatuses)
+	}
+	if providerStatuses[0].Suspension == nil {
+		t.Error("providerStatuses[0].Suspension is nil, want the opensubtitles Provider's suspension reporter")
+	}
+	if providerStatuses[0].Pipeline != p {
+		t.Error("providerStatuses[0].Pipeline should be the same instance returned as the primary Pipeline")
+	}
+}
+
+// TestIntegration_NewProduction_MultiProviderChain validates that
+// NewProduction constructs a real Provider per providers.chain entry (#71):
+// opensubtitles and subdl, in chain order, each with its own Pipeline and
+// configured worker_count, and that subdl's Suspension is reported exactly
+// like opensubtitles' is.
+func TestIntegration_NewProduction_MultiProviderChain(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "sublime.db")
+	st, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("opening store: %v", err)
+	}
+	defer func() { _ = st.Close() }()
+
+	p, providerStatuses, _, err := pipeline.NewProduction(pipeline.ProductionConfig{
+		Store: st,
+		Secrets: config.ProviderSecrets{
+			OpenSubtitles: config.OpenSubtitlesSecrets{
+				APIKey:   "test-api-key",
+				Username: "testuser",
+				Password: "testpass",
+			},
+			SubDL: config.SubDLSecrets{APIKey: "test-subdl-key"},
+		},
+		ProviderChain: []config.ProviderConfig{
+			{Name: "opensubtitles", WorkerCount: 2},
+			{Name: "subdl", WorkerCount: 3, Paid: true},
+		},
+		WorkerCount: 1,
+	})
+	if err != nil {
+		t.Fatalf("NewProduction() error = %v", err)
+	}
+
+	if len(providerStatuses) != 2 {
+		t.Fatalf("providerStatuses = %+v, want 2 entries", providerStatuses)
+	}
+
+	os := providerStatuses[0]
+	if os.Name != "opensubtitles" {
+		t.Errorf("providerStatuses[0].Name = %q, want %q", os.Name, "opensubtitles")
+	}
+	if os.WorkerCount != 2 {
+		t.Errorf("providerStatuses[0].WorkerCount = %d, want 2", os.WorkerCount)
+	}
+	if os.Suspension == nil {
+		t.Error("providerStatuses[0].Suspension is nil, want the opensubtitles Provider's suspension reporter")
+	}
+	if os.Pipeline == nil || os.Pipeline.Provider == nil {
+		t.Error("providerStatuses[0].Pipeline is not wired with a Provider")
+	}
+	if os.Pipeline != p {
+		t.Error("the first chain entry's Pipeline should be returned as the primary Pipeline")
+	}
+
+	sd := providerStatuses[1]
+	if sd.Name != "subdl" {
+		t.Errorf("providerStatuses[1].Name = %q, want %q", sd.Name, "subdl")
+	}
+	if sd.WorkerCount != 3 {
+		t.Errorf("providerStatuses[1].WorkerCount = %d, want 3", sd.WorkerCount)
+	}
+	if sd.Suspension == nil {
+		t.Error("providerStatuses[1].Suspension is nil, want the subdl Provider's suspension reporter")
+	}
+	if sd.Pipeline == nil || sd.Pipeline.Provider == nil {
+		t.Error("providerStatuses[1].Pipeline is not wired with a Provider")
+	}
+	if sd.Pipeline == os.Pipeline {
+		t.Error("each chain entry should get its own distinct Pipeline")
+	}
+
+	if resumeAt, suspended := sd.Suspension(); suspended {
+		t.Errorf("subdl Suspension() = (%v, %v), want not suspended for a freshly constructed Provider", resumeAt, suspended)
+	}
+}
+
+func TestIntegration_NewProduction_UnknownProviderInChain(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "sublime.db")
+	st, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("opening store: %v", err)
+	}
+	defer func() { _ = st.Close() }()
+
+	_, _, _, err = pipeline.NewProduction(pipeline.ProductionConfig{
+		Store:         st,
+		ProviderChain: []config.ProviderConfig{{Name: "not-a-real-provider"}},
+	})
+	if err == nil {
+		t.Fatal("expected an error for an unrecognized provider name in the chain")
+	}
 }
 
 func TestIntegration_NewProduction_MissingSecrets(t *testing.T) {
@@ -372,9 +493,9 @@ func TestIntegration_NewProduction_MissingSecrets(t *testing.T) {
 	}
 	defer func() { _ = st.Close() }()
 
-	_, err = pipeline.NewProduction(pipeline.ProductionConfig{
+	_, _, _, err = pipeline.NewProduction(pipeline.ProductionConfig{
 		Store:   st,
-		Secrets: config.OpenSubtitlesSecrets{},
+		Secrets: config.ProviderSecrets{},
 	})
 	if err == nil {
 		t.Fatal("expected an error when secrets are missing")

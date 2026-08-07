@@ -12,7 +12,6 @@ import (
 
 	"github.com/aaronkyriesenbach/sublime/internal/api"
 	"github.com/aaronkyriesenbach/sublime/internal/domain"
-	"github.com/aaronkyriesenbach/sublime/internal/pipeline"
 )
 
 type reprocessResponse = api.ReprocessResponse
@@ -36,7 +35,7 @@ func newRecordingReprocessor() *recordingReprocessor {
 	return &recordingReprocessor{release: make(chan struct{})}
 }
 
-func (r *recordingReprocessor) Reprocess(ctx context.Context, lib domain.Library, target string) (pipeline.Result, error) {
+func (r *recordingReprocessor) Reprocess(ctx context.Context, lib domain.Library, target string) error {
 	r.mu.Lock()
 	r.calls = append(r.calls, recordedCall{Library: lib, Target: target})
 	err := r.err
@@ -46,7 +45,7 @@ func (r *recordingReprocessor) Reprocess(ctx context.Context, lib domain.Library
 	case <-r.release:
 	case <-ctx.Done():
 	}
-	return pipeline.Result{}, err
+	return err
 }
 
 func (r *recordingReprocessor) Calls() []recordedCall {

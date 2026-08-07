@@ -92,22 +92,23 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	for _, lib := range summaryScope {
 		sum := summaryFor(allSummaries, lib.Name)
 		libSummaries = append(libSummaries, LibrarySummaryEntry{
-			Name:    lib.Name,
-			Pending: sum.Pending,
-			Synced:  sum.Synced,
-			Failed:  sum.Failed,
+			Name:       lib.Name,
+			Pending:    sum.Pending,
+			InProgress: sum.InProgress,
+			Synced:     sum.Synced,
+			Failed:     sum.Failed,
 		})
 	}
 
-	resp := StatusResponse{Libraries: libSummaries}
+	resp := StatusResponse{Libraries: libSummaries, Providers: s.providerEntries()}
 
 	if scoped {
 		files, total, err := s.store.ListFiles(r.Context(), store.FileFilter{
-			LibraryName:         scopeLib.Name,
-			PathPrefix:          pathParam,
-			PendingOrFailedOnly: stateParam != "all",
-			Limit:               limit,
-			Offset:              offset,
+			LibraryName:    scopeLib.Name,
+			PathPrefix:     pathParam,
+			IncompleteOnly: stateParam != "all",
+			Limit:          limit,
+			Offset:         offset,
 		})
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, codeInternalError, "failed to load files")
@@ -123,12 +124,30 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
+// providerEntries builds GET /status' providers array from s.providers,
+// calling each Status func live so a currently-Suspended Provider's
+// resumeAt reflects its actual current state.
+func (s *Server) providerEntries() []ProviderEntry {
+	entries := make([]ProviderEntry, 0, len(s.providers))
+	for _, p := range s.providers {
+		entry := ProviderEntry{Name: p.Name}
+		if p.Status != nil {
+			if resumeAt, suspended := p.Status(); suspended {
+				entry.Suspended = true
+				entry.ResumeAt = &resumeAt
+			}
+		}
+		entries = append(entries, entry)
+	}
+	return entries
+}
+
 func toFileEntries(files []domain.File) []FileEntry {
 	entries := make([]FileEntry, 0, len(files))
 	for _, f := range files {
 		languages := make(map[string]LanguageStateEntry, len(f.Languages))
 		for _, ls := range f.Languages {
-			entry := LanguageStateEntry{Status: string(ls.Status)}
+			entry := LanguageStateEntry{Status: string(ls.Status), Attempted: ls.Attempted}
 			if ls.Status == domain.StatusFailed {
 				entry.Reason = string(ls.FailureReason)
 			}

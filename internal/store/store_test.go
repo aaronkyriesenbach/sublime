@@ -2,9 +2,11 @@ package store_test
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"path/filepath"
+	"slices"
 	"testing"
 
 	"golang.org/x/text/language"
@@ -168,6 +170,182 @@ func TestObserveFileContentHash_HashChangeResetsLanguageStatesInPlace(t *testing
 	}
 	if len(fetched.Languages) != 2 {
 		t.Fatalf("expected exactly 2 language rows after reset, got %d: %+v", len(fetched.Languages), fetched.Languages)
+	}
+}
+
+func TestObserveFileHash_ReportsFileHashNewOnFirstInsert(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+
+	file, obs, err := s.ObserveFileHash(ctx, "movies", "/media/movies/a.mkv", "hash-1")
+	if err != nil {
+		t.Fatalf("ObserveFileHash returned error: %v", err)
+	}
+
+	if obs != store.FileHashNew {
+		t.Errorf("observation = %v, want FileHashNew", obs)
+	}
+	if file.ID == 0 {
+		t.Errorf("expected a non-zero file ID, got %d", file.ID)
+	}
+}
+
+func TestObserveFileHash_ReportsFileHashUnchangedOnSameHash(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+
+	if _, _, err := s.ObserveFileHash(ctx, "movies", "/media/movies/a.mkv", "hash-1"); err != nil {
+		t.Fatalf("initial ObserveFileHash returned error: %v", err)
+	}
+
+	_, obs, err := s.ObserveFileHash(ctx, "movies", "/media/movies/a.mkv", "hash-1")
+	if err != nil {
+		t.Fatalf("repeat ObserveFileHash returned error: %v", err)
+	}
+
+	if obs != store.FileHashUnchanged {
+		t.Errorf("observation = %v, want FileHashUnchanged", obs)
+	}
+}
+
+func TestObserveFileHash_ReportsFileHashChangedOnDifferentHash(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+
+	if _, _, err := s.ObserveFileHash(ctx, "movies", "/media/movies/a.mkv", "hash-1"); err != nil {
+		t.Fatalf("initial ObserveFileHash returned error: %v", err)
+	}
+
+	_, obs, err := s.ObserveFileHash(ctx, "movies", "/media/movies/a.mkv", "hash-2")
+	if err != nil {
+		t.Fatalf("hash-change ObserveFileHash returned error: %v", err)
+	}
+
+	if obs != store.FileHashChanged {
+		t.Errorf("observation = %v, want FileHashChanged", obs)
+	}
+}
+
+func TestResetToPending_ResetsExistingLanguageStatesRegardlessOfContentHash(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	en := mustLang(t, "en")
+	pt := mustLang(t, "pt-BR")
+
+	file, err := s.ObserveFileContentHash(ctx, "movies", "/media/movies/a.mkv", "hash-1")
+	if err != nil {
+		t.Fatalf("ObserveFileContentHash returned error: %v", err)
+	}
+	if err := s.EnsureLanguage(ctx, file.ID, en); err != nil {
+		t.Fatalf("EnsureLanguage(en) returned error: %v", err)
+	}
+	if err := s.EnsureLanguage(ctx, file.ID, pt); err != nil {
+		t.Fatalf("EnsureLanguage(pt-BR) returned error: %v", err)
+	}
+	if err := s.MarkSynced(ctx, file.ID, en); err != nil {
+		t.Fatalf("MarkSynced returned error: %v", err)
+	}
+	if err := s.MarkFailed(ctx, file.ID, pt, domain.FailureNoCandidate); err != nil {
+		t.Fatalf("MarkFailed returned error: %v", err)
+	}
+
+	// A manual reprocess request resets an already-tracked file's language
+	// states to Pending even though its Content Hash hasn't changed.
+	if err := s.ResetToPending(ctx, file.ID); err != nil {
+		t.Fatalf("ResetToPending returned error: %v", err)
+	}
+
+	fetched, ok, err := s.GetFile(ctx, "movies", "/media/movies/a.mkv")
+	if err != nil {
+		t.Fatalf("GetFile returned error: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected GetFile to find the file")
+	}
+	if len(fetched.Languages) != 2 {
+		t.Fatalf("expected exactly 2 language rows after reset, got %d: %+v", len(fetched.Languages), fetched.Languages)
+	}
+	for _, ls := range fetched.Languages {
+		if ls.Status != domain.StatusPending {
+			t.Errorf("expected language %q to be reset to %q, got %q", ls.Language, domain.StatusPending, ls.Status)
+		}
+		if ls.FailureReason != domain.FailureNone {
+			t.Errorf("expected language %q to have no failure reason after reset, got %q", ls.Language, ls.FailureReason)
+		}
+	}
+}
+
+func TestResetLanguageToPending_ResetsOnlyTheGivenLanguage(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	en := mustLang(t, "en")
+	pt := mustLang(t, "pt-BR")
+
+	file, err := s.ObserveFileContentHash(ctx, "movies", "/media/movies/a.mkv", "hash-1")
+	if err != nil {
+		t.Fatalf("ObserveFileContentHash returned error: %v", err)
+	}
+	if err := s.EnsureLanguage(ctx, file.ID, en); err != nil {
+		t.Fatalf("EnsureLanguage(en) returned error: %v", err)
+	}
+	if err := s.EnsureLanguage(ctx, file.ID, pt); err != nil {
+		t.Fatalf("EnsureLanguage(pt-BR) returned error: %v", err)
+	}
+	if err := s.MarkFailed(ctx, file.ID, en, domain.FailureRetrievalFailed); err != nil {
+		t.Fatalf("MarkFailed(en) returned error: %v", err)
+	}
+	if err := s.MarkSynced(ctx, file.ID, pt); err != nil {
+		t.Fatalf("MarkSynced(pt-BR) returned error: %v", err)
+	}
+
+	// A quota-exhausted attempt on one language shouldn't touch the state
+	// of the file's other, unrelated languages.
+	if err := s.ResetLanguageToPending(ctx, file.ID, en); err != nil {
+		t.Fatalf("ResetLanguageToPending returned error: %v", err)
+	}
+
+	fetched, ok, err := s.GetFile(ctx, "movies", "/media/movies/a.mkv")
+	if err != nil {
+		t.Fatalf("GetFile returned error: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected GetFile to find the file")
+	}
+	if len(fetched.Languages) != 2 {
+		t.Fatalf("expected exactly 2 language rows, got %d: %+v", len(fetched.Languages), fetched.Languages)
+	}
+	for _, ls := range fetched.Languages {
+		switch ls.Language {
+		case en:
+			if ls.Status != domain.StatusPending {
+				t.Errorf("expected en to be reset to %q, got %q", domain.StatusPending, ls.Status)
+			}
+			if ls.FailureReason != domain.FailureNone {
+				t.Errorf("expected en to have no failure reason after reset, got %q", ls.FailureReason)
+			}
+		case pt:
+			if ls.Status != domain.StatusSynced {
+				t.Errorf("expected pt-BR to remain untouched at %q, got %q", domain.StatusSynced, ls.Status)
+			}
+		default:
+			t.Errorf("unexpected language state: %+v", ls)
+		}
+	}
+}
+
+func TestResetLanguageToPending_UnknownLanguageState(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	en := mustLang(t, "en")
+
+	file, err := s.ObserveFileContentHash(ctx, "movies", "/media/movies/a.mkv", "hash-1")
+	if err != nil {
+		t.Fatalf("ObserveFileContentHash returned error: %v", err)
+	}
+
+	err = s.ResetLanguageToPending(ctx, file.ID, en)
+	if !errors.Is(err, store.ErrLanguageStateNotFound) {
+		t.Fatalf("expected ErrLanguageStateNotFound, got %v", err)
 	}
 }
 
@@ -403,6 +581,119 @@ func TestMarkFailed_RejectsInvalidReason(t *testing.T) {
 	}
 }
 
+func TestMarkInProgress_TransitionsFromPendingAndBackToSyncedOrFailed(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	en := mustLang(t, "en")
+
+	file, err := s.ObserveFileContentHash(ctx, "movies", "/media/movies/a.mkv", "hash-1")
+	if err != nil {
+		t.Fatalf("ObserveFileContentHash returned error: %v", err)
+	}
+	if err := s.EnsureLanguage(ctx, file.ID, en); err != nil {
+		t.Fatalf("EnsureLanguage returned error: %v", err)
+	}
+
+	if err := s.MarkInProgress(ctx, file.ID, en); err != nil {
+		t.Fatalf("MarkInProgress returned error: %v", err)
+	}
+
+	got, _, err := s.GetFile(ctx, "movies", "/media/movies/a.mkv")
+	if err != nil {
+		t.Fatalf("GetFile returned error: %v", err)
+	}
+	if got.Languages[0].Status != domain.StatusInProgress {
+		t.Errorf("expected status %q, got %q", domain.StatusInProgress, got.Languages[0].Status)
+	}
+	if got.Languages[0].FailureReason != domain.FailureNone {
+		t.Errorf("expected no failure reason while in progress, got %q", got.Languages[0].FailureReason)
+	}
+
+	// in_progress -> synced
+	if err := s.MarkSynced(ctx, file.ID, en); err != nil {
+		t.Fatalf("MarkSynced returned error: %v", err)
+	}
+	got, _, err = s.GetFile(ctx, "movies", "/media/movies/a.mkv")
+	if err != nil {
+		t.Fatalf("GetFile returned error: %v", err)
+	}
+	if got.Languages[0].Status != domain.StatusSynced {
+		t.Errorf("expected status %q, got %q", domain.StatusSynced, got.Languages[0].Status)
+	}
+
+	// back to pending, then in_progress, then to failed
+	if err := s.ResetLanguageToPending(ctx, file.ID, en); err != nil {
+		t.Fatalf("ResetLanguageToPending returned error: %v", err)
+	}
+	if err := s.MarkInProgress(ctx, file.ID, en); err != nil {
+		t.Fatalf("second MarkInProgress returned error: %v", err)
+	}
+	if err := s.MarkFailed(ctx, file.ID, en, domain.FailureRetrievalFailed); err != nil {
+		t.Fatalf("MarkFailed returned error: %v", err)
+	}
+	got, _, err = s.GetFile(ctx, "movies", "/media/movies/a.mkv")
+	if err != nil {
+		t.Fatalf("GetFile returned error: %v", err)
+	}
+	if got.Languages[0].Status != domain.StatusFailed || got.Languages[0].FailureReason != domain.FailureRetrievalFailed {
+		t.Errorf("expected failed/retrieval_failed, got %q/%q", got.Languages[0].Status, got.Languages[0].FailureReason)
+	}
+}
+
+func TestMarkInProgress_UnknownLanguageState(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	en := mustLang(t, "en")
+
+	file, err := s.ObserveFileContentHash(ctx, "movies", "/media/movies/a.mkv", "hash-1")
+	if err != nil {
+		t.Fatalf("ObserveFileContentHash returned error: %v", err)
+	}
+
+	// No row exists at all for this (file, language) pair, which surfaces
+	// the same way as a row that's no longer pending: nothing in the store
+	// deletes file_language_states rows, so callers can't tell these apart
+	// and shouldn't need to.
+	err = s.MarkInProgress(ctx, file.ID, en)
+	if !errors.Is(err, store.ErrClaimLost) {
+		t.Fatalf("expected ErrClaimLost, got %v", err)
+	}
+}
+
+func TestMarkInProgress_ClaimLostWhenNotPending(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	en := mustLang(t, "en")
+
+	file, err := s.ObserveFileContentHash(ctx, "movies", "/media/movies/a.mkv", "hash-1")
+	if err != nil {
+		t.Fatalf("ObserveFileContentHash returned error: %v", err)
+	}
+	if err := s.EnsureLanguage(ctx, file.ID, en); err != nil {
+		t.Fatalf("EnsureLanguage returned error: %v", err)
+	}
+
+	// First claim succeeds from pending.
+	if err := s.MarkInProgress(ctx, file.ID, en); err != nil {
+		t.Fatalf("first MarkInProgress returned error: %v", err)
+	}
+
+	// A second claim attempt against the same (now in_progress) row must
+	// lose, leaving the first claim's state untouched.
+	err = s.MarkInProgress(ctx, file.ID, en)
+	if !errors.Is(err, store.ErrClaimLost) {
+		t.Fatalf("expected ErrClaimLost, got %v", err)
+	}
+
+	got, _, err := s.GetFile(ctx, "movies", "/media/movies/a.mkv")
+	if err != nil {
+		t.Fatalf("GetFile returned error: %v", err)
+	}
+	if got.Languages[0].Status != domain.StatusInProgress {
+		t.Errorf("expected status to remain %q, got %q", domain.StatusInProgress, got.Languages[0].Status)
+	}
+}
+
 func TestLibrarySummaries_CountsStatusesPerLibrary(t *testing.T) {
 	s := openTestStore(t)
 	ctx := context.Background()
@@ -431,6 +722,17 @@ func TestLibrarySummaries_CountsStatusesPerLibrary(t *testing.T) {
 		t.Fatalf("MarkFailed: %v", err)
 	}
 
+	movieC, err := s.ObserveFileContentHash(ctx, "movies", "/media/movies/c.mkv", "hash-4")
+	if err != nil {
+		t.Fatalf("ObserveFileContentHash: %v", err)
+	}
+	if err := s.EnsureLanguage(ctx, movieC.ID, en); err != nil {
+		t.Fatalf("EnsureLanguage: %v", err)
+	}
+	if err := s.MarkInProgress(ctx, movieC.ID, en); err != nil {
+		t.Fatalf("MarkInProgress: %v", err)
+	}
+
 	tvA, err := s.ObserveFileContentHash(ctx, "tv", "/media/tv/a.mkv", "hash-3")
 	if err != nil {
 		t.Fatalf("ObserveFileContentHash: %v", err)
@@ -454,8 +756,8 @@ func TestLibrarySummaries_CountsStatusesPerLibrary(t *testing.T) {
 	if !ok {
 		t.Fatal("expected a summary for \"movies\"")
 	}
-	if movies.Synced != 1 || movies.Failed != 1 || movies.Pending != 0 {
-		t.Errorf("movies summary = %+v, want Synced=1 Failed=1 Pending=0", movies)
+	if movies.Synced != 1 || movies.Failed != 1 || movies.Pending != 0 || movies.InProgress != 1 {
+		t.Errorf("movies summary = %+v, want Synced=1 Failed=1 Pending=0 InProgress=1", movies)
 	}
 
 	tv, ok := byName["tv"]
@@ -515,25 +817,36 @@ func TestListFiles_DefaultFilterOmitsFullySyncedFiles(t *testing.T) {
 		t.Fatalf("EnsureLanguage: %v", err)
 	}
 
+	inProgress, err := s.ObserveFileContentHash(ctx, "movies", "/media/movies/inprogress.mkv", "hash-4")
+	if err != nil {
+		t.Fatalf("ObserveFileContentHash: %v", err)
+	}
+	if err := s.EnsureLanguage(ctx, inProgress.ID, en); err != nil {
+		t.Fatalf("EnsureLanguage: %v", err)
+	}
+	if err := s.MarkInProgress(ctx, inProgress.ID, en); err != nil {
+		t.Fatalf("MarkInProgress: %v", err)
+	}
+
 	files, total, err := s.ListFiles(ctx, store.FileFilter{
-		LibraryName:         "movies",
-		PendingOrFailedOnly: true,
-		Limit:               100,
+		LibraryName:    "movies",
+		IncompleteOnly: true,
+		Limit:          100,
 	})
 	if err != nil {
 		t.Fatalf("ListFiles: %v", err)
 	}
-	if total != 2 {
-		t.Errorf("total = %d, want 2 (synced file excluded by default)", total)
+	if total != 3 {
+		t.Errorf("total = %d, want 3 (synced file excluded by default)", total)
 	}
 	var gotPaths []string
 	for _, f := range files {
 		gotPaths = append(gotPaths, f.Path)
 	}
-	if len(files) != 2 {
-		t.Fatalf("files = %d, want 2: %v", len(files), gotPaths)
+	if len(files) != 3 {
+		t.Fatalf("files = %d, want 3: %v", len(files), gotPaths)
 	}
-	for _, want := range []string{failed.Path, pending.Path} {
+	for _, want := range []string{failed.Path, pending.Path, inProgress.Path} {
 		found := false
 		for _, p := range gotPaths {
 			if p == want {
@@ -721,6 +1034,321 @@ func TestListFiles_PaginatesWithLimitAndOffset(t *testing.T) {
 	}
 }
 
+func TestRecordProviderMiss_AppendsNameAndResetsToPendingNoFailureReason(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	en := mustLang(t, "en")
+
+	file, err := s.ObserveFileContentHash(ctx, "movies", "/media/movies/a.mkv", "hash-1")
+	if err != nil {
+		t.Fatalf("ObserveFileContentHash returned error: %v", err)
+	}
+	if err := s.EnsureLanguage(ctx, file.ID, en); err != nil {
+		t.Fatalf("EnsureLanguage returned error: %v", err)
+	}
+	if err := s.MarkInProgress(ctx, file.ID, en); err != nil {
+		t.Fatalf("MarkInProgress returned error: %v", err)
+	}
+
+	// A no-candidate miss against a named Provider mirrors
+	// QuotaExhaustedError's existing handling: reset to pending, no failure
+	// reason recorded, per docs/adr/0008-tiered-provider-chain.md.
+	if err := s.RecordProviderMiss(ctx, file.ID, en, "opensubtitles"); err != nil {
+		t.Fatalf("RecordProviderMiss returned error: %v", err)
+	}
+
+	got, _, err := s.GetFile(ctx, "movies", "/media/movies/a.mkv")
+	if err != nil {
+		t.Fatalf("GetFile returned error: %v", err)
+	}
+	if got.Languages[0].Status != domain.StatusPending {
+		t.Errorf("expected status %q, got %q", domain.StatusPending, got.Languages[0].Status)
+	}
+	if got.Languages[0].FailureReason != domain.FailureNone {
+		t.Errorf("expected no failure reason recorded, got %q", got.Languages[0].FailureReason)
+	}
+
+	attempted, err := s.AttemptedProviders(ctx, file.ID, en)
+	if err != nil {
+		t.Fatalf("AttemptedProviders returned error: %v", err)
+	}
+	if len(attempted) != 1 || attempted[0] != "opensubtitles" {
+		t.Errorf("attempted = %v, want [opensubtitles]", attempted)
+	}
+}
+
+func TestGetFile_SurfacesAttemptedProvidersOnLanguageState(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	en := mustLang(t, "en")
+
+	file, err := s.ObserveFileContentHash(ctx, "movies", "/media/movies/a.mkv", "hash-1")
+	if err != nil {
+		t.Fatalf("ObserveFileContentHash returned error: %v", err)
+	}
+	if err := s.EnsureLanguage(ctx, file.ID, en); err != nil {
+		t.Fatalf("EnsureLanguage returned error: %v", err)
+	}
+
+	// Before any Provider has missed, GetFile must report no attempted
+	// Providers rather than omitting the field silently.
+	fresh, _, err := s.GetFile(ctx, "movies", "/media/movies/a.mkv")
+	if err != nil {
+		t.Fatalf("GetFile returned error: %v", err)
+	}
+	if len(fresh.Languages[0].Attempted) != 0 {
+		t.Errorf("Attempted = %v, want empty before any RecordProviderMiss", fresh.Languages[0].Attempted)
+	}
+
+	if err := s.RecordProviderMiss(ctx, file.ID, en, "opensubtitles"); err != nil {
+		t.Fatalf("first RecordProviderMiss returned error: %v", err)
+	}
+	if err := s.RecordProviderMiss(ctx, file.ID, en, "subdl"); err != nil {
+		t.Fatalf("second RecordProviderMiss returned error: %v", err)
+	}
+
+	got, _, err := s.GetFile(ctx, "movies", "/media/movies/a.mkv")
+	if err != nil {
+		t.Fatalf("GetFile returned error: %v", err)
+	}
+	want := []string{"opensubtitles", "subdl"}
+	if !slices.Equal(got.Languages[0].Attempted, want) {
+		t.Errorf("Languages[0].Attempted = %v, want %v", got.Languages[0].Attempted, want)
+	}
+}
+
+func TestListFiles_SurfacesAttemptedProvidersOnLanguageState(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	en := mustLang(t, "en")
+
+	file, err := s.ObserveFileContentHash(ctx, "movies", "/media/movies/a.mkv", "hash-1")
+	if err != nil {
+		t.Fatalf("ObserveFileContentHash returned error: %v", err)
+	}
+	if err := s.EnsureLanguage(ctx, file.ID, en); err != nil {
+		t.Fatalf("EnsureLanguage returned error: %v", err)
+	}
+	if err := s.RecordProviderMiss(ctx, file.ID, en, "opensubtitles"); err != nil {
+		t.Fatalf("RecordProviderMiss returned error: %v", err)
+	}
+
+	files, _, err := s.ListFiles(ctx, store.FileFilter{LibraryName: "movies", Limit: 10})
+	if err != nil {
+		t.Fatalf("ListFiles returned error: %v", err)
+	}
+	if len(files) != 1 {
+		t.Fatalf("len(files) = %d, want 1", len(files))
+	}
+	want := []string{"opensubtitles"}
+	if !slices.Equal(files[0].Languages[0].Attempted, want) {
+		t.Errorf("Languages[0].Attempted = %v, want %v", files[0].Languages[0].Attempted, want)
+	}
+}
+
+func TestRecordProviderMiss_AccumulatesMultipleDistinctProviders(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	en := mustLang(t, "en")
+
+	file, err := s.ObserveFileContentHash(ctx, "movies", "/media/movies/a.mkv", "hash-1")
+	if err != nil {
+		t.Fatalf("ObserveFileContentHash returned error: %v", err)
+	}
+	if err := s.EnsureLanguage(ctx, file.ID, en); err != nil {
+		t.Fatalf("EnsureLanguage returned error: %v", err)
+	}
+
+	if err := s.RecordProviderMiss(ctx, file.ID, en, "opensubtitles"); err != nil {
+		t.Fatalf("first RecordProviderMiss returned error: %v", err)
+	}
+	if err := s.RecordProviderMiss(ctx, file.ID, en, "subdl"); err != nil {
+		t.Fatalf("second RecordProviderMiss returned error: %v", err)
+	}
+
+	attempted, err := s.AttemptedProviders(ctx, file.ID, en)
+	if err != nil {
+		t.Fatalf("AttemptedProviders returned error: %v", err)
+	}
+	if len(attempted) != 2 || attempted[0] != "opensubtitles" || attempted[1] != "subdl" {
+		t.Errorf("attempted = %v, want [opensubtitles subdl]", attempted)
+	}
+}
+
+func TestRecordProviderMiss_SameProviderTwiceDoesNotDuplicate(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	en := mustLang(t, "en")
+
+	file, err := s.ObserveFileContentHash(ctx, "movies", "/media/movies/a.mkv", "hash-1")
+	if err != nil {
+		t.Fatalf("ObserveFileContentHash returned error: %v", err)
+	}
+	if err := s.EnsureLanguage(ctx, file.ID, en); err != nil {
+		t.Fatalf("EnsureLanguage returned error: %v", err)
+	}
+
+	if err := s.RecordProviderMiss(ctx, file.ID, en, "opensubtitles"); err != nil {
+		t.Fatalf("first RecordProviderMiss returned error: %v", err)
+	}
+	if err := s.RecordProviderMiss(ctx, file.ID, en, "opensubtitles"); err != nil {
+		t.Fatalf("second RecordProviderMiss returned error: %v", err)
+	}
+
+	attempted, err := s.AttemptedProviders(ctx, file.ID, en)
+	if err != nil {
+		t.Fatalf("AttemptedProviders returned error: %v", err)
+	}
+	if len(attempted) != 1 || attempted[0] != "opensubtitles" {
+		t.Errorf("attempted = %v, want [opensubtitles] (no duplicate)", attempted)
+	}
+}
+
+func TestRecordProviderMiss_UnknownLanguageState(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	en := mustLang(t, "en")
+
+	file, err := s.ObserveFileContentHash(ctx, "movies", "/media/movies/a.mkv", "hash-1")
+	if err != nil {
+		t.Fatalf("ObserveFileContentHash returned error: %v", err)
+	}
+
+	err = s.RecordProviderMiss(ctx, file.ID, en, "opensubtitles")
+	if !errors.Is(err, store.ErrLanguageStateNotFound) {
+		t.Fatalf("expected ErrLanguageStateNotFound, got %v", err)
+	}
+}
+
+func TestAttemptedProviders_EmptyForFreshLanguageState(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	en := mustLang(t, "en")
+
+	file, err := s.ObserveFileContentHash(ctx, "movies", "/media/movies/a.mkv", "hash-1")
+	if err != nil {
+		t.Fatalf("ObserveFileContentHash returned error: %v", err)
+	}
+	if err := s.EnsureLanguage(ctx, file.ID, en); err != nil {
+		t.Fatalf("EnsureLanguage returned error: %v", err)
+	}
+
+	attempted, err := s.AttemptedProviders(ctx, file.ID, en)
+	if err != nil {
+		t.Fatalf("AttemptedProviders returned error: %v", err)
+	}
+	if len(attempted) != 0 {
+		t.Errorf("attempted = %v, want none", attempted)
+	}
+}
+
+func TestAttemptedProviders_UnknownLanguageState(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	en := mustLang(t, "en")
+
+	file, err := s.ObserveFileContentHash(ctx, "movies", "/media/movies/a.mkv", "hash-1")
+	if err != nil {
+		t.Fatalf("ObserveFileContentHash returned error: %v", err)
+	}
+
+	_, err = s.AttemptedProviders(ctx, file.ID, en)
+	if !errors.Is(err, store.ErrLanguageStateNotFound) {
+		t.Fatalf("expected ErrLanguageStateNotFound, got %v", err)
+	}
+}
+
+func TestObserveFileContentHash_HashChangeClearsAttemptedProviders(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	en := mustLang(t, "en")
+
+	file, err := s.ObserveFileContentHash(ctx, "movies", "/media/movies/a.mkv", "hash-1")
+	if err != nil {
+		t.Fatalf("ObserveFileContentHash returned error: %v", err)
+	}
+	if err := s.EnsureLanguage(ctx, file.ID, en); err != nil {
+		t.Fatalf("EnsureLanguage returned error: %v", err)
+	}
+	if err := s.RecordProviderMiss(ctx, file.ID, en, "opensubtitles"); err != nil {
+		t.Fatalf("RecordProviderMiss returned error: %v", err)
+	}
+
+	// A Changed event (Content Hash mismatch) starts a fresh cycle: the
+	// attempted-Provider set from the prior cycle must not survive it.
+	if _, err := s.ObserveFileContentHash(ctx, "movies", "/media/movies/a.mkv", "hash-2"); err != nil {
+		t.Fatalf("hash-change ObserveFileContentHash returned error: %v", err)
+	}
+
+	attempted, err := s.AttemptedProviders(ctx, file.ID, en)
+	if err != nil {
+		t.Fatalf("AttemptedProviders returned error: %v", err)
+	}
+	if len(attempted) != 0 {
+		t.Errorf("attempted = %v, want none after a Changed reset", attempted)
+	}
+}
+
+func TestResetToPending_ClearsAttemptedProviders(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	en := mustLang(t, "en")
+
+	file, err := s.ObserveFileContentHash(ctx, "movies", "/media/movies/a.mkv", "hash-1")
+	if err != nil {
+		t.Fatalf("ObserveFileContentHash returned error: %v", err)
+	}
+	if err := s.EnsureLanguage(ctx, file.ID, en); err != nil {
+		t.Fatalf("EnsureLanguage returned error: %v", err)
+	}
+	if err := s.RecordProviderMiss(ctx, file.ID, en, "opensubtitles"); err != nil {
+		t.Fatalf("RecordProviderMiss returned error: %v", err)
+	}
+
+	// A manual reprocess request starts a fresh cycle too.
+	if err := s.ResetToPending(ctx, file.ID); err != nil {
+		t.Fatalf("ResetToPending returned error: %v", err)
+	}
+
+	attempted, err := s.AttemptedProviders(ctx, file.ID, en)
+	if err != nil {
+		t.Fatalf("AttemptedProviders returned error: %v", err)
+	}
+	if len(attempted) != 0 {
+		t.Errorf("attempted = %v, want none after a manual reprocess reset", attempted)
+	}
+}
+
+func TestResetToPendingForced_ClearsAttemptedProviders(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	en := mustLang(t, "en")
+
+	file, err := s.ObserveFileContentHash(ctx, "movies", "/media/movies/a.mkv", "hash-1")
+	if err != nil {
+		t.Fatalf("ObserveFileContentHash returned error: %v", err)
+	}
+	if err := s.EnsureLanguage(ctx, file.ID, en); err != nil {
+		t.Fatalf("EnsureLanguage returned error: %v", err)
+	}
+	if err := s.RecordProviderMiss(ctx, file.ID, en, "opensubtitles"); err != nil {
+		t.Fatalf("RecordProviderMiss returned error: %v", err)
+	}
+
+	// A forced manual reprocess request starts a fresh cycle too.
+	if err := s.ResetToPendingForced(ctx, file.ID); err != nil {
+		t.Fatalf("ResetToPendingForced returned error: %v", err)
+	}
+
+	attempted, err := s.AttemptedProviders(ctx, file.ID, en)
+	if err != nil {
+		t.Fatalf("AttemptedProviders returned error: %v", err)
+	}
+	if len(attempted) != 0 {
+		t.Errorf("attempted = %v, want none after a forced reset", attempted)
+	}
+}
+
 func TestDifferentLibrariesWithSamePathAreDistinctFiles(t *testing.T) {
 	s := openTestStore(t)
 	ctx := context.Background()
@@ -736,5 +1364,154 @@ func TestDifferentLibrariesWithSamePathAreDistinctFiles(t *testing.T) {
 
 	if movies.ID == tv.ID {
 		t.Errorf("expected distinct file IDs for the same path under different libraries, got %d for both", movies.ID)
+	}
+}
+
+func TestFilePathsForLibrary_ScopesByLibraryNameOnly(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+
+	if _, err := s.ObserveFileContentHash(ctx, "movies", "/media/movies/a.mkv", "hash-1"); err != nil {
+		t.Fatalf("ObserveFileContentHash: %v", err)
+	}
+	if _, err := s.ObserveFileContentHash(ctx, "movies", "/media/movies/b.mkv", "hash-2"); err != nil {
+		t.Fatalf("ObserveFileContentHash: %v", err)
+	}
+	if _, err := s.ObserveFileContentHash(ctx, "tv", "/media/tv/c.mkv", "hash-3"); err != nil {
+		t.Fatalf("ObserveFileContentHash: %v", err)
+	}
+
+	paths, err := s.FilePathsForLibrary(ctx, "movies", "/media/movies")
+	if err != nil {
+		t.Fatalf("FilePathsForLibrary: %v", err)
+	}
+
+	slices.Sort(paths)
+	want := []string{"/media/movies/a.mkv", "/media/movies/b.mkv"}
+	if !slices.Equal(paths, want) {
+		t.Errorf("paths = %v, want %v", paths, want)
+	}
+}
+
+// TestFilePathsForLibrary_ScopesByPathPrefix guards a Reprocess-scoped scan
+// (whose Run target is a Library subdirectory, not the whole Library):
+// reconciliation must never see a sibling file outside the walked subtree.
+func TestFilePathsForLibrary_ScopesByPathPrefix(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+
+	if _, err := s.ObserveFileContentHash(ctx, "tv", "/media/tv/Show/S01/a.mkv", "hash-1"); err != nil {
+		t.Fatalf("ObserveFileContentHash: %v", err)
+	}
+	if _, err := s.ObserveFileContentHash(ctx, "tv", "/media/tv/Show/S02/b.mkv", "hash-2"); err != nil {
+		t.Fatalf("ObserveFileContentHash: %v", err)
+	}
+
+	paths, err := s.FilePathsForLibrary(ctx, "tv", "/media/tv/Show/S01")
+	if err != nil {
+		t.Fatalf("FilePathsForLibrary: %v", err)
+	}
+
+	want := []string{"/media/tv/Show/S01/a.mkv"}
+	if !slices.Equal(paths, want) {
+		t.Errorf("paths = %v, want %v (S02's file must not leak into an S01-scoped diff)", paths, want)
+	}
+}
+
+func TestFilePathsForLibrary_NoTrackedFilesReturnsEmpty(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+
+	paths, err := s.FilePathsForLibrary(ctx, "movies", "/media/movies")
+	if err != nil {
+		t.Fatalf("FilePathsForLibrary: %v", err)
+	}
+	if len(paths) != 0 {
+		t.Errorf("paths = %v, want empty", paths)
+	}
+}
+
+func TestDeleteFile_RemovesRowAndCascadesLanguageStates(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "sublime.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	ctx := context.Background()
+	en := mustLang(t, "en")
+
+	file, err := s.ObserveFileContentHash(ctx, "movies", "/media/movies/a.mkv", "hash-1")
+	if err != nil {
+		t.Fatalf("ObserveFileContentHash: %v", err)
+	}
+	if err := s.EnsureLanguage(ctx, file.ID, en); err != nil {
+		t.Fatalf("EnsureLanguage: %v", err)
+	}
+
+	deleted, err := s.DeleteFile(ctx, "movies", "/media/movies/a.mkv")
+	if err != nil {
+		t.Fatalf("DeleteFile: %v", err)
+	}
+	if !deleted {
+		t.Error("deleted = false, want true")
+	}
+
+	if _, found, err := s.GetFile(ctx, "movies", "/media/movies/a.mkv"); err != nil || found {
+		t.Errorf("GetFile after DeleteFile: found=%v err=%v, want found=false", found, err)
+	}
+
+	// A second raw connection to the same file confirms ON DELETE CASCADE
+	// actually fired, not just that files-first queries can't see the row.
+	raw, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("opening raw connection: %v", err)
+	}
+	defer func() { _ = raw.Close() }()
+
+	var count int
+	if err := raw.QueryRowContext(ctx, `SELECT COUNT(*) FROM file_language_states WHERE file_id = ?`, file.ID).Scan(&count); err != nil {
+		t.Fatalf("counting language states: %v", err)
+	}
+	if count != 0 {
+		t.Errorf("file_language_states rows remaining for deleted file_id %d = %d, want 0", file.ID, count)
+	}
+}
+
+func TestDeleteFile_AlreadyGoneIsSilentNoOp(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+
+	deleted, err := s.DeleteFile(ctx, "movies", "/media/movies/never-existed.mkv")
+	if err != nil {
+		t.Fatalf("DeleteFile: %v", err)
+	}
+	if deleted {
+		t.Error("deleted = true, want false for a path that was never tracked")
+	}
+}
+
+func TestDeleteFile_ScopesByLibraryName(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+
+	if _, err := s.ObserveFileContentHash(ctx, "movies", "/shared/a.mkv", "hash-1"); err != nil {
+		t.Fatalf("ObserveFileContentHash: %v", err)
+	}
+	if _, err := s.ObserveFileContentHash(ctx, "tv", "/shared/a.mkv", "hash-1"); err != nil {
+		t.Fatalf("ObserveFileContentHash: %v", err)
+	}
+
+	deleted, err := s.DeleteFile(ctx, "movies", "/shared/a.mkv")
+	if err != nil {
+		t.Fatalf("DeleteFile: %v", err)
+	}
+	if !deleted {
+		t.Error("deleted = false, want true")
+	}
+
+	if _, found, err := s.GetFile(ctx, "tv", "/shared/a.mkv"); err != nil || !found {
+		t.Errorf("tv library's file wrongly affected: found=%v err=%v, want found=true", found, err)
 	}
 }
