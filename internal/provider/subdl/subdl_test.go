@@ -694,6 +694,147 @@ func TestDownload_InvalidCandidateID(t *testing.T) {
 	}
 }
 
+// --- Zip-shape download extraction (issue #80) ---
+
+func TestDownload_ZipMovie_SingleSRTEntry_ExtractsContent(t *testing.T) {
+	mock := newMockServer(t)
+	zipBytes := buildZip(t, zipEntry{name: "Movie.2022.srt", content: "1\n00:00:01,000 --> 00:00:02,000\nHello\n"})
+	mock.on(http.MethodGet, "/subtitle/1234-1.zip", rawHandler(http.StatusOK, string(zipBytes)))
+
+	clock := &fakeClock{}
+	p := newTestProvider(t, mock, clock, false)
+
+	candidate := domain.Candidate{ID: "/subtitle/1234-1.zip", Title: "Movie", Year: 2022}
+	data, err := p.Download(context.Background(), candidate)
+	if err != nil {
+		t.Fatalf("Download() error = %v", err)
+	}
+	if want := "1\n00:00:01,000 --> 00:00:02,000\nHello\n"; string(data) != want {
+		t.Errorf("Download() = %q, want %q", data, want)
+	}
+}
+
+func TestDownload_ZipTV_MultipleEntries_ClassifyMatchesCorrectEpisode(t *testing.T) {
+	mock := newMockServer(t)
+	zipBytes := buildZip(t,
+		zipEntry{name: "Show.S01E05.srt", content: "wrong episode"},
+		zipEntry{name: "Show.S01E06.srt", content: "right episode"},
+	)
+	mock.on(http.MethodGet, "/subtitle/9-6.zip", rawHandler(http.StatusOK, string(zipBytes)))
+
+	clock := &fakeClock{}
+	p := newTestProvider(t, mock, clock, false)
+
+	candidate := domain.Candidate{ID: "/subtitle/9-6.zip", Title: "Show", Season: 1, Episode: 6}
+	data, err := p.Download(context.Background(), candidate)
+	if err != nil {
+		t.Fatalf("Download() error = %v", err)
+	}
+	if want := "right episode"; string(data) != want {
+		t.Errorf("Download() = %q, want %q", data, want)
+	}
+}
+
+func TestDownload_ZipMovie_MultipleEntries_FiltersToSoleSRT(t *testing.T) {
+	mock := newMockServer(t)
+	zipBytes := buildZip(t,
+		zipEntry{name: "Movie.2022.nfo", content: "release info, not a subtitle"},
+		zipEntry{name: "Movie.2022.srt", content: "the subtitle"},
+	)
+	mock.on(http.MethodGet, "/subtitle/1234-1.zip", rawHandler(http.StatusOK, string(zipBytes)))
+
+	clock := &fakeClock{}
+	p := newTestProvider(t, mock, clock, false)
+
+	candidate := domain.Candidate{ID: "/subtitle/1234-1.zip", Title: "Movie", Year: 2022}
+	data, err := p.Download(context.Background(), candidate)
+	if err != nil {
+		t.Fatalf("Download() error = %v", err)
+	}
+	if want := "the subtitle"; string(data) != want {
+		t.Errorf("Download() = %q, want %q", data, want)
+	}
+}
+
+func TestDownload_ZipMovie_MultipleSRTEntries_Errors(t *testing.T) {
+	mock := newMockServer(t)
+	zipBytes := buildZip(t,
+		zipEntry{name: "Movie.2022.srt", content: "unforced"},
+		zipEntry{name: "Movie.2022.forced.srt", content: "forced"},
+	)
+	mock.on(http.MethodGet, "/subtitle/1234-1.zip", rawHandler(http.StatusOK, string(zipBytes)))
+
+	clock := &fakeClock{}
+	p := newTestProvider(t, mock, clock, false)
+
+	candidate := domain.Candidate{ID: "/subtitle/1234-1.zip", Title: "Movie", Year: 2022}
+	if _, err := p.Download(context.Background(), candidate); err == nil {
+		t.Fatal("expected an error when a movie zip has more than one .srt entry")
+	}
+}
+
+func TestDownload_ZipTV_NoEntryMatchesEpisode_Errors(t *testing.T) {
+	mock := newMockServer(t)
+	zipBytes := buildZip(t, zipEntry{name: "Show.S01E05.srt", content: "wrong episode"})
+	mock.on(http.MethodGet, "/subtitle/9-6.zip", rawHandler(http.StatusOK, string(zipBytes)))
+
+	clock := &fakeClock{}
+	p := newTestProvider(t, mock, clock, false)
+
+	candidate := domain.Candidate{ID: "/subtitle/9-6.zip", Title: "Show", Season: 1, Episode: 6}
+	if _, err := p.Download(context.Background(), candidate); err == nil {
+		t.Fatal("expected an error when no zip entry classifies to the candidate's season/episode")
+	}
+}
+
+func TestDownload_ZipTV_MultipleEntriesMatchEpisode_Errors(t *testing.T) {
+	mock := newMockServer(t)
+	zipBytes := buildZip(t,
+		zipEntry{name: "Show.S01E06.srt", content: "unforced"},
+		zipEntry{name: "Show.S01E06.forced.srt", content: "forced"},
+	)
+	mock.on(http.MethodGet, "/subtitle/9-6.zip", rawHandler(http.StatusOK, string(zipBytes)))
+
+	clock := &fakeClock{}
+	p := newTestProvider(t, mock, clock, false)
+
+	candidate := domain.Candidate{ID: "/subtitle/9-6.zip", Title: "Show", Season: 1, Episode: 6}
+	if _, err := p.Download(context.Background(), candidate); err == nil {
+		t.Fatal("expected an error when more than one entry classifies to the same season/episode")
+	}
+}
+
+func TestDownload_ZipNoSRTEntries_Errors(t *testing.T) {
+	mock := newMockServer(t)
+	zipBytes := buildZip(t, zipEntry{name: "Movie.2022.nfo", content: "release info, not a subtitle"})
+	mock.on(http.MethodGet, "/subtitle/1234-1.zip", rawHandler(http.StatusOK, string(zipBytes)))
+
+	clock := &fakeClock{}
+	p := newTestProvider(t, mock, clock, false)
+
+	candidate := domain.Candidate{ID: "/subtitle/1234-1.zip", Title: "Movie", Year: 2022}
+	if _, err := p.Download(context.Background(), candidate); err == nil {
+		t.Fatal("expected an error when a zip has no .srt entries at all")
+	}
+}
+
+func TestDownload_NonZipRawBytes_PassThroughUnmodified(t *testing.T) {
+	mock := newMockServer(t)
+	mock.on(http.MethodGet, "/subtitle/1234-1.zip", rawHandler(http.StatusOK, "1\n00:00:01,000 --> 00:00:02,000\nplain srt bytes\n"))
+
+	clock := &fakeClock{}
+	p := newTestProvider(t, mock, clock, false)
+
+	candidate := domain.Candidate{ID: "/subtitle/1234-1.zip", Title: "Movie", Year: 2022}
+	data, err := p.Download(context.Background(), candidate)
+	if err != nil {
+		t.Fatalf("Download() error = %v", err)
+	}
+	if want := "1\n00:00:01,000 --> 00:00:02,000\nplain srt bytes\n"; string(data) != want {
+		t.Errorf("Download() = %q, want %q (non-zip bytes must pass through unmodified)", data, want)
+	}
+}
+
 // --- Retry/backoff integration (shared retry.Pacer + retry.Executor) ---
 
 func TestSearch_RetriesOn429ThenSucceeds(t *testing.T) {

@@ -1,6 +1,8 @@
 package subdl_test
 
 import (
+	"archive/zip"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -118,4 +120,32 @@ func withHeader(key, value string, handler func(w http.ResponseWriter, r *http.R
 		w.Header().Set(key, value)
 		handler(w, r)
 	}
+}
+
+// zipEntry is one file to write into a buildZip test fixture.
+type zipEntry struct {
+	name    string
+	content string
+}
+
+// buildZip encodes entries as a real zip archive's bytes, in order -- a
+// fixture standing in for SubDL's own zip-shape download response (issue
+// #80), as opposed to a fixture that already assumes raw bytes.
+func buildZip(t *testing.T, entries ...zipEntry) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	w := zip.NewWriter(&buf)
+	for _, e := range entries {
+		f, err := w.Create(e.name)
+		if err != nil {
+			t.Fatalf("zip.Create(%q): %v", e.name, err)
+		}
+		if _, err := f.Write([]byte(e.content)); err != nil {
+			t.Fatalf("writing zip entry %q: %v", e.name, err)
+		}
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("closing zip writer: %v", err)
+	}
+	return buf.Bytes()
 }
