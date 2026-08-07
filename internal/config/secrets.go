@@ -11,11 +11,18 @@ type OpenSubtitlesSecrets struct {
 	Password string
 }
 
+// SubDLSecrets holds the SubDL Provider's credentials, read from
+// environment variables rather than the config file — see
+// LoadProviderSecrets. SubDL requires an API key unconditionally, even on
+// a free account (ADR 0006), unlike OpenSubtitles' username/password pair.
+type SubDLSecrets struct {
+	APIKey string
+}
+
 // ProviderSecrets holds credentials for every Provider Sublime supports.
-// Sublime supports one Provider (OpenSubtitles) in v1, but this is
-// structured to add more without a breaking change.
 type ProviderSecrets struct {
 	OpenSubtitles OpenSubtitlesSecrets
+	SubDL         SubDLSecrets
 }
 
 // LoadProviderSecrets reads Provider credentials from their designated
@@ -27,6 +34,9 @@ func LoadProviderSecrets() ProviderSecrets {
 			APIKey:   os.Getenv("SUBLIME_OPENSUBTITLES_API_KEY"),
 			Username: os.Getenv("SUBLIME_OPENSUBTITLES_USERNAME"),
 			Password: os.Getenv("SUBLIME_OPENSUBTITLES_PASSWORD"),
+		},
+		SubDL: SubDLSecrets{
+			APIKey: os.Getenv("SUBLIME_SUBDL_API_KEY"),
 		},
 	}
 }

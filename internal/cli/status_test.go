@@ -86,6 +86,45 @@ func TestStatusCommand_ScopedByLibraryPassesQueryParamAndPrintsFiles(t *testing.
 	}
 }
 
+func TestStatusCommand_PrintsAttemptedProvidersColumn(t *testing.T) {
+	apiURL := newFakeAPIServer(t, func(w http.ResponseWriter, r *http.Request) {
+		total, limit, offset := 1, 100, 0
+		resp := api.StatusResponse{
+			Libraries: []api.LibrarySummaryEntry{{Name: "movies", Pending: 1}},
+			Files: []api.FileEntry{
+				{
+					Path:        "/media/movies/a.mkv",
+					Library:     "movies",
+					ContentHash: "abc123",
+					Languages: map[string]api.LanguageStateEntry{
+						"en": {Status: "pending", Attempted: []string{"opensubtitles", "subdl"}},
+					},
+				},
+			},
+			Total: &total, Limit: &limit, Offset: &offset,
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	})
+
+	root := cli.NewRootCommand()
+	out := &bytes.Buffer{}
+	root.SetOut(out)
+	root.SetErr(out)
+	root.SetArgs([]string{"status", "--library", "movies", "--api", apiURL})
+
+	if err := root.Execute(); err != nil {
+		t.Fatalf("Execute returned error: %v", err)
+	}
+
+	output := out.String()
+	for _, want := range []string{"ATTEMPTED", "opensubtitles,subdl"} {
+		if !strings.Contains(output, want) {
+			t.Errorf("output missing %q; got:\n%s", want, output)
+		}
+	}
+}
+
 func TestStatusCommand_PassesPathStateLimitOffsetQueryParams(t *testing.T) {
 	apiURL := newFakeAPIServer(t, func(w http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query()

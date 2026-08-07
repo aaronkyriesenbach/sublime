@@ -15,3 +15,23 @@ libraries:
 #   SUBLIME_OPENSUBTITLES_API_KEY
 #   SUBLIME_OPENSUBTITLES_USERNAME
 #   SUBLIME_OPENSUBTITLES_PASSWORD
+#   SUBLIME_SUBDL_API_KEY
+
+providers:
+  # chain is the ordered Provider Chain: a list of Tiers, highest-priority
+  # first, tried in order until one succeeds. Defaults to a single
+  # opensubtitles Tier if omitted.
+  #
+  # A bare name is its own one-member Tier (today's flat behavior):
+  #   chain: [opensubtitles, subdl]
+  #
+  # A nested list is one Tier of Providers the operator trusts equally
+  # (see CONTEXT.md's Tier entry and docs/adr/0008-tiered-provider-chain.md):
+  chain: [[opensubtitles, subdl]]
+
+  opensubtitles:
+    worker_count: 4 # concurrent workers in this Provider's pool
+
+  subdl:
+    worker_count: 2
+    paid: true # use SubDL's paid tier

@@ -18,12 +18,13 @@ func (s *Server) handleLibraries(w http.ResponseWriter, r *http.Request) {
 	for _, lib := range s.libraries {
 		sum := summaryFor(summaries, lib.Name)
 		entries = append(entries, LibraryEntry{
-			Name:      lib.Name,
-			Path:      lib.Path,
-			Languages: languageTags(lib),
-			Pending:   sum.Pending,
-			Synced:    sum.Synced,
-			Failed:    sum.Failed,
+			Name:       lib.Name,
+			Path:       lib.Path,
+			Languages:  languageTags(lib),
+			Pending:    sum.Pending,
+			InProgress: sum.InProgress,
+			Synced:     sum.Synced,
+			Failed:     sum.Failed,
 		})
 	}
 

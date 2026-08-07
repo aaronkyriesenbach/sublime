@@ -2,9 +2,12 @@ package api_test
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 
 	"golang.org/x/text/language"
 
@@ -70,6 +73,52 @@ func TestStatus_UnscopedReturnsAllLibrarySummariesOnly(t *testing.T) {
 	}
 }
 
+func TestStatus_LibrarySummaryIncludesInProgressCount(t *testing.T) {
+	st := openTestStore(t)
+	ctx := t.Context()
+	en := mustLang(t, "en")
+
+	f, err := st.ObserveFileContentHash(ctx, "movies", "/media/movies/a.mkv", "hash-1")
+	if err != nil {
+		t.Fatalf("ObserveFileContentHash: %v", err)
+	}
+	if err := st.EnsureLanguage(ctx, f.ID, en); err != nil {
+		t.Fatalf("EnsureLanguage: %v", err)
+	}
+	if err := st.MarkInProgress(ctx, f.ID, en); err != nil {
+		t.Fatalf("MarkInProgress: %v", err)
+	}
+
+	srv := api.NewServer(api.Deps{Store: st, Libraries: testLibraries()})
+	defer srv.Close()
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/status")
+	if err != nil {
+		t.Fatalf("GET /status: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("reading response body: %v", err)
+	}
+	if !strings.Contains(string(raw), `"in_progress":1`) {
+		t.Errorf("expected response to contain \"in_progress\":1, got %s", raw)
+	}
+
+	var body statusResponse
+	if err := json.Unmarshal(raw, &body); err != nil {
+		t.Fatalf("decoding response: %v", err)
+	}
+	for _, lib := range body.Libraries {
+		if lib.Name == "movies" && lib.InProgress != 1 {
+			t.Errorf("movies in_progress = %d, want 1", lib.InProgress)
+		}
+	}
+}
+
 func TestStatus_ScopedByLibraryDefaultsToPendingAndFailed(t *testing.T) {
 	st := openTestStore(t)
 	ctx := t.Context()
@@ -97,6 +146,17 @@ func TestStatus_ScopedByLibraryDefaultsToPendingAndFailed(t *testing.T) {
 		t.Fatalf("MarkFailed: %v", err)
 	}
 
+	inProgress, err := st.ObserveFileContentHash(ctx, "movies", "/media/movies/inprogress.mkv", "hash-3")
+	if err != nil {
+		t.Fatalf("ObserveFileContentHash: %v", err)
+	}
+	if err := st.EnsureLanguage(ctx, inProgress.ID, en); err != nil {
+		t.Fatalf("EnsureLanguage: %v", err)
+	}
+	if err := st.MarkInProgress(ctx, inProgress.ID, en); err != nil {
+		t.Fatalf("MarkInProgress: %v", err)
+	}
+
 	srv := api.NewServer(api.Deps{Store: st, Libraries: testLibraries()})
 	defer srv.Close()
 	ts := httptest.NewServer(srv)
@@ -120,14 +180,81 @@ func TestStatus_ScopedByLibraryDefaultsToPendingAndFailed(t *testing.T) {
 	if len(body.Libraries) != 1 || body.Libraries[0].Name != "movies" {
 		t.Fatalf("libraries = %+v, want a single movies summary", body.Libraries)
 	}
-	if len(body.Files) != 1 || body.Files[0].Path != failed.Path {
-		t.Fatalf("files = %+v, want only the failed file (synced omitted by default)", body.Files)
+	if body.Libraries[0].InProgress != 1 {
+		t.Errorf("in_progress = %d, want 1", body.Libraries[0].InProgress)
 	}
-	if body.Files[0].Languages["en"].Status != "failed" || body.Files[0].Languages["en"].Reason != "sync_failed" {
-		t.Errorf("en language state = %+v", body.Files[0].Languages["en"])
+	if len(body.Files) != 2 {
+		t.Fatalf("files = %+v, want the failed and in-progress files (synced omitted by default)", body.Files)
 	}
-	if body.Total == nil || *body.Total != 1 {
-		t.Errorf("total = %v, want 1", body.Total)
+	var gotPaths []string
+	for _, f := range body.Files {
+		gotPaths = append(gotPaths, f.Path)
+	}
+	for _, want := range []string{failed.Path, inProgress.Path} {
+		found := false
+		for _, p := range gotPaths {
+			if p == want {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("expected %q in results, got %v", want, gotPaths)
+		}
+	}
+	for _, f := range body.Files {
+		if f.Path == failed.Path {
+			if f.Languages["en"].Status != "failed" || f.Languages["en"].Reason != "sync_failed" {
+				t.Errorf("en language state = %+v", f.Languages["en"])
+			}
+		}
+		if f.Path == inProgress.Path {
+			if f.Languages["en"].Status != "in_progress" {
+				t.Errorf("en language state = %+v, want status in_progress", f.Languages["en"])
+			}
+		}
+	}
+	if body.Total == nil || *body.Total != 2 {
+		t.Errorf("total = %v, want 2", body.Total)
+	}
+}
+
+func TestStatus_LanguageStateSurfacesAttemptedProviders(t *testing.T) {
+	st := openTestStore(t)
+	ctx := t.Context()
+	en := mustLang(t, "en")
+
+	file, err := st.ObserveFileContentHash(ctx, "movies", "/media/movies/pending.mkv", "hash-1")
+	if err != nil {
+		t.Fatalf("ObserveFileContentHash: %v", err)
+	}
+	if err := st.EnsureLanguage(ctx, file.ID, en); err != nil {
+		t.Fatalf("EnsureLanguage: %v", err)
+	}
+	if err := st.RecordProviderMiss(ctx, file.ID, en, "opensubtitles"); err != nil {
+		t.Fatalf("RecordProviderMiss: %v", err)
+	}
+
+	srv := api.NewServer(api.Deps{Store: st, Libraries: testLibraries()})
+	defer srv.Close()
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/status?library=movies")
+	if err != nil {
+		t.Fatalf("GET /status: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	var body statusResponse
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decoding response: %v", err)
+	}
+
+	if len(body.Files) != 1 {
+		t.Fatalf("files = %+v, want 1", body.Files)
+	}
+	if got := body.Files[0].Languages["en"].Attempted; len(got) != 1 || got[0] != "opensubtitles" {
+		t.Errorf("attempted = %v, want [opensubtitles]", got)
 	}
 }
 
@@ -257,6 +384,107 @@ func TestStatus_PaginatesWithLimitAndOffset(t *testing.T) {
 
 func fileNameForIndex(i int) string {
 	return "/media/movies/file" + string(rune('a'+i)) + ".mkv"
+}
+
+func TestStatus_ProvidersReflectsSuspendedStateAndResumeAt(t *testing.T) {
+	st := openTestStore(t)
+	resumeAt := time.Date(2026, 1, 1, 1, 0, 0, 0, time.UTC)
+
+	srv := api.NewServer(api.Deps{
+		Store:     st,
+		Libraries: testLibraries(),
+		Providers: []api.ProviderStatusFunc{
+			{
+				Name:   "opensubtitles",
+				Status: func() (time.Time, bool) { return resumeAt, true },
+			},
+		},
+	})
+	defer srv.Close()
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/status")
+	if err != nil {
+		t.Fatalf("GET /status: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	var body statusResponse
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decoding response: %v", err)
+	}
+
+	if len(body.Providers) != 1 {
+		t.Fatalf("providers = %+v, want 1 entry", body.Providers)
+	}
+	p := body.Providers[0]
+	if p.Name != "opensubtitles" || !p.Suspended {
+		t.Errorf("providers[0] = %+v, want name=opensubtitles suspended=true", p)
+	}
+	if p.ResumeAt == nil || !p.ResumeAt.Equal(resumeAt) {
+		t.Errorf("providers[0].ResumeAt = %v, want %v", p.ResumeAt, resumeAt)
+	}
+}
+
+func TestStatus_ProvidersReflectsNotSuspendedAndMissingCapability(t *testing.T) {
+	st := openTestStore(t)
+
+	srv := api.NewServer(api.Deps{
+		Store:     st,
+		Libraries: testLibraries(),
+		Providers: []api.ProviderStatusFunc{
+			{Name: "not-suspended", Status: func() (time.Time, bool) { return time.Time{}, false }},
+			{Name: "no-capability"},
+		},
+	})
+	defer srv.Close()
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/status")
+	if err != nil {
+		t.Fatalf("GET /status: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	var body statusResponse
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decoding response: %v", err)
+	}
+
+	if len(body.Providers) != 2 {
+		t.Fatalf("providers = %+v, want 2 entries", body.Providers)
+	}
+	for _, p := range body.Providers {
+		if p.Suspended {
+			t.Errorf("providers = %+v, want none suspended", body.Providers)
+		}
+		if p.ResumeAt != nil {
+			t.Errorf("provider %q ResumeAt = %v, want nil", p.Name, p.ResumeAt)
+		}
+	}
+}
+
+func TestStatus_ProvidersEmptyWhenNoneConfigured(t *testing.T) {
+	srv := api.NewServer(api.Deps{Store: openTestStore(t), Libraries: testLibraries()})
+	defer srv.Close()
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/status")
+	if err != nil {
+		t.Fatalf("GET /status: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("reading response body: %v", err)
+	}
+	if !strings.Contains(string(raw), `"providers":[]`) {
+		t.Errorf("expected response to contain an empty providers array, got %s", raw)
+	}
 }
 
 func TestStatus_UnknownLibraryReturns404WithErrorEnvelope(t *testing.T) {
