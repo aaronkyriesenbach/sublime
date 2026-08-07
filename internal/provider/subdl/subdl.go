@@ -16,6 +16,15 @@
 // its resume time, short-circuiting further Search/Download calls until
 // then. The anonymous download path's undocumented rejection shape is
 // deliberately excluded from this detection (ADR 0007).
+//
+// Every Search call also walks SubDL's own result pagination (issue #78,
+// ADR 0010): it requests SubDL's maximum page size (subs_per_page=30) and
+// fetches additional pages — via the response's own
+// totalPages/currentPage fields — until no further pages exist or a fixed
+// cap is reached, merging every page's results into the one candidate
+// list Search returns. full_season is still never sent: this is a
+// coverage fix delivered entirely through page size and pagination, not
+// by asking SubDL for packs specifically.
 package subdl
 
 import (
@@ -44,6 +53,16 @@ const (
 	defaultPace            = time.Second
 	defaultMaxDelay        = 60 * time.Second
 	defaultDecayThreshold  = 10
+
+	// searchSubsPerPage is the subs_per_page value Search always sends —
+	// SubDL's maximum page size — to shrink the number of pages a full walk
+	// needs (issue #78, ADR 0010).
+	searchSubsPerPage = 30
+
+	// searchMaxPages caps how many pages one Search call will walk, even if
+	// the response keeps reporting further pages exist (issue #78, ADR
+	// 0010). Fixed, not adaptive to totalPages.
+	searchMaxPages = 3
 )
 
 // subdlLanguageOverrides maps a full BCP 47 tag to SubDL's own language
@@ -259,6 +278,16 @@ func (p *Provider) quotaOrWrap(err error) (wrapped error, ok bool) {
 // /subtitles search params — film_name, year, season_number,
 // episode_number, and a translated languages value — never full_season or
 // unpack, since SubDL season-pack results aren't supported (issue #69).
+//
+// Every request also sends subs_per_page=30, SubDL's maximum page size,
+// and Search walks additional pages — same query params, only page
+// varying — via the response's own totalPages/currentPage fields, until
+// currentPage == totalPages or the fixed searchMaxPages cap is reached,
+// merging every page's candidates into the one slice returned (issue #78,
+// ADR 0010). If any page in the walk fails, including a quota-exhaustion
+// response converting to a *provider.QuotaExhaustedError, Search returns
+// that error for the whole call and discards candidates already gathered
+// from earlier pages — no partial-success return shape.
 func (p *Provider) Search(ctx context.Context, query provider.Query) ([]domain.Candidate, error) {
 	if err := p.suspendedError(); err != nil {
 		return nil, err
@@ -281,21 +310,37 @@ func (p *Provider) Search(ctx context.Context, query provider.Query) ([]domain.C
 	if lang := languageParam(query.Language); lang != "" {
 		params.Set("languages", lang)
 	}
+	params.Set("subs_per_page", strconv.Itoa(searchSubsPerPage))
 
-	path := "/subtitles?" + params.Encode()
-	op := func(ctx context.Context, _ int) (searchResponseBody, error) {
-		var out searchResponseBody
-		err := p.client.getJSON(ctx, path, &out)
-		return out, err
-	}
-	resp, err := retry.Do(ctx, p.executor, op)
-	if err != nil {
-		if wrapped, ok := p.quotaOrWrap(err); ok {
-			return nil, wrapped
+	var candidates []domain.Candidate
+	for page := 1; page <= searchMaxPages; page++ {
+		pageParams := url.Values{}
+		for k, v := range params {
+			pageParams[k] = v
 		}
-		return nil, fmt.Errorf("subdl: search: %w", err)
+		pageParams.Set("page", strconv.Itoa(page))
+
+		path := "/subtitles?" + pageParams.Encode()
+		op := func(ctx context.Context, _ int) (searchResponseBody, error) {
+			var out searchResponseBody
+			err := p.client.getJSON(ctx, path, &out)
+			return out, err
+		}
+		resp, err := retry.Do(ctx, p.executor, op)
+		if err != nil {
+			if wrapped, ok := p.quotaOrWrap(err); ok {
+				return nil, wrapped
+			}
+			return nil, fmt.Errorf("subdl: search: %w", err)
+		}
+
+		candidates = append(candidates, candidatesFromResponse(resp)...)
+
+		if resp.CurrentPage >= resp.TotalPages {
+			break
+		}
 	}
-	return candidatesFromResponse(resp), nil
+	return candidates, nil
 }
 
 // Download implements provider.Provider. It attaches APIKey (SubDL's

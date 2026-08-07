@@ -3,8 +3,10 @@ package subdl_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/url"
+	"strconv"
 	"testing"
 	"time"
 
@@ -106,10 +108,11 @@ func TestSearch_MovieQuery_SendsFilmNameAndYear(t *testing.T) {
 	}
 
 	wantParams := map[string]string{
-		"film_name": "Arrival",
-		"year":      "2016",
-		"languages": "en",
-		"api_key":   "test-api-key",
+		"film_name":     "Arrival",
+		"year":          "2016",
+		"languages":     "en",
+		"api_key":       "test-api-key",
+		"subs_per_page": "30",
 	}
 	for k, want := range wantParams {
 		if got := params.Get(k); got != want {
@@ -148,6 +151,7 @@ func TestSearch_TVQuery_SendsSeasonAndEpisode(t *testing.T) {
 		"film_name":      "Community",
 		"season_number":  "2",
 		"episode_number": "1",
+		"subs_per_page":  "30",
 	}
 	for k, want := range wantParams {
 		if got := params.Get(k); got != want {
@@ -286,6 +290,151 @@ func TestSearch_NoResults_ReturnsEmptyNotError(t *testing.T) {
 	}
 	if len(candidates) != 0 {
 		t.Errorf("got %d candidates, want 0", len(candidates))
+	}
+}
+
+// --- Paging (ADR 0010, issue #78) ---
+
+// pagedSearchResponse builds a /subtitles response like
+// searchResponseWithTitle, plus the totalPages/currentPage fields SubDL's
+// paging protocol reports.
+func pagedSearchResponse(title string, year int, currentPage, totalPages int, items ...map[string]any) map[string]any {
+	body := searchResponseWithTitle(title, year, items...)
+	body["currentPage"] = currentPage
+	body["totalPages"] = totalPages
+	return body
+}
+
+func TestSearch_SinglePage_WhenCurrentPageEqualsTotalPages_IssuesOneRequest(t *testing.T) {
+	mock := newMockServer(t)
+	mock.on(http.MethodGet, "/subtitles", jsonHandler(http.StatusOK, pagedSearchResponse("Arrival", 2016, 1, 1,
+		searchItem("Arrival.2016.1080p.BluRay.x264-GROUP", "/subtitle/1234-1.zip", 0, 0),
+	)))
+
+	clock := &fakeClock{}
+	p := newTestProvider(t, mock, clock, false)
+
+	candidates, err := p.Search(context.Background(), provider.Query{Title: "Arrival", Year: 2016})
+	if err != nil {
+		t.Fatalf("Search() error = %v", err)
+	}
+	if len(candidates) != 1 {
+		t.Fatalf("got %d candidates, want 1", len(candidates))
+	}
+
+	reqs := mock.requestsFor(http.MethodGet, "/subtitles")
+	if len(reqs) != 1 {
+		t.Fatalf("got %d /subtitles requests, want 1 (currentPage already == totalPages)", len(reqs))
+	}
+}
+
+func TestSearch_MultiplePages_WalksAndMergesCandidates(t *testing.T) {
+	mock := newMockServer(t)
+	mock.on(http.MethodGet, "/subtitles", jsonHandler(http.StatusOK, pagedSearchResponse("Arrival", 2016, 1, 3,
+		searchItem("Arrival.2016.1080p.BluRay.x264-GROUP", "/subtitle/1-1.zip", 0, 0),
+	)))
+	mock.on(http.MethodGet, "/subtitles", jsonHandler(http.StatusOK, pagedSearchResponse("Arrival", 2016, 2, 3,
+		searchItem("Arrival.2016.720p.WEBRip.x265-OTHER", "/subtitle/2-1.zip", 0, 0),
+	)))
+	mock.on(http.MethodGet, "/subtitles", jsonHandler(http.StatusOK, pagedSearchResponse("Arrival", 2016, 3, 3,
+		searchItem("Arrival.2016.2160p.WEBRip.x265-THIRD", "/subtitle/3-1.zip", 0, 0),
+	)))
+
+	clock := &fakeClock{}
+	p := newTestProvider(t, mock, clock, false)
+
+	candidates, err := p.Search(context.Background(), provider.Query{Title: "Arrival", Year: 2016})
+	if err != nil {
+		t.Fatalf("Search() error = %v", err)
+	}
+	if len(candidates) != 3 {
+		t.Fatalf("got %d candidates, want 3 (merged across all 3 pages)", len(candidates))
+	}
+
+	reqs := mock.requestsFor(http.MethodGet, "/subtitles")
+	if len(reqs) != 3 {
+		t.Fatalf("got %d /subtitles requests, want 3", len(reqs))
+	}
+	for i, req := range reqs {
+		params, err := url.ParseQuery(req.Query)
+		if err != nil {
+			t.Fatalf("parsing query %q: %v", req.Query, err)
+		}
+		wantPage := strconv.Itoa(i + 1)
+		if got := params.Get("page"); got != wantPage {
+			t.Errorf("request %d: page param = %q, want %q", i, got, wantPage)
+		}
+		if got := params.Get("subs_per_page"); got != "30" {
+			t.Errorf("request %d: subs_per_page param = %q, want %q", i, got, "30")
+		}
+	}
+}
+
+func TestSearch_StopsAtPageCapEvenIfMorePagesReported(t *testing.T) {
+	mock := newMockServer(t)
+	for page := 1; page <= 3; page++ {
+		mock.on(http.MethodGet, "/subtitles", jsonHandler(http.StatusOK, pagedSearchResponse("Arrival", 2016, page, 10,
+			searchItem(fmt.Sprintf("Arrival.2016.page%d.BluRay.x264-GROUP", page), fmt.Sprintf("/subtitle/%d-1.zip", page), 0, 0),
+		)))
+	}
+
+	clock := &fakeClock{}
+	p := newTestProvider(t, mock, clock, false)
+
+	candidates, err := p.Search(context.Background(), provider.Query{Title: "Arrival", Year: 2016})
+	if err != nil {
+		t.Fatalf("Search() error = %v", err)
+	}
+	if len(candidates) != 3 {
+		t.Fatalf("got %d candidates, want 3 (capped even though totalPages=10)", len(candidates))
+	}
+
+	reqs := mock.requestsFor(http.MethodGet, "/subtitles")
+	if len(reqs) != 3 {
+		t.Fatalf("got %d /subtitles requests, want 3 (fixed cap, not adaptive to totalPages)", len(reqs))
+	}
+}
+
+func TestSearch_LaterPageFailure_DiscardsEarlierPagesAndReturnsError(t *testing.T) {
+	mock := newMockServer(t)
+	mock.on(http.MethodGet, "/subtitles", jsonHandler(http.StatusOK, pagedSearchResponse("Arrival", 2016, 1, 3,
+		searchItem("Arrival.2016.1080p.BluRay.x264-GROUP", "/subtitle/1-1.zip", 0, 0),
+	)))
+	mock.on(http.MethodGet, "/subtitles", jsonHandler(http.StatusBadRequest, map[string]any{"status": false, "error": "bad query"}))
+
+	clock := &fakeClock{}
+	p := newTestProvider(t, mock, clock, false)
+
+	candidates, err := p.Search(context.Background(), provider.Query{Title: "Arrival", Year: 2016})
+	if err == nil {
+		t.Fatal("expected an error when a later page request fails")
+	}
+	if candidates != nil {
+		t.Errorf("got candidates %+v, want nil (earlier-page candidates must be discarded)", candidates)
+	}
+}
+
+func TestSearch_LaterPageQuotaExhausted_DiscardsEarlierPagesAndSuspends(t *testing.T) {
+	mock := newMockServer(t)
+	mock.on(http.MethodGet, "/subtitles", jsonHandler(http.StatusOK, pagedSearchResponse("Arrival", 2016, 1, 3,
+		searchItem("Arrival.2016.1080p.BluRay.x264-GROUP", "/subtitle/1-1.zip", 0, 0),
+	)))
+	mock.on(http.MethodGet, "/subtitles", quotaExceededHandler())
+
+	clock := &fakeClock{}
+	p := newTestProvider(t, mock, clock, false)
+
+	candidates, err := p.Search(context.Background(), provider.Query{Title: "Arrival", Year: 2016})
+	var quotaErr *provider.QuotaExhaustedError
+	if !errors.As(err, &quotaErr) {
+		t.Fatalf("Search() error = %v, want a *provider.QuotaExhaustedError", err)
+	}
+	if candidates != nil {
+		t.Errorf("got candidates %+v, want nil (earlier-page candidates must be discarded)", candidates)
+	}
+
+	if _, suspended := p.Suspension(); !suspended {
+		t.Error("expected Provider to be Suspended after a quota-exhaustion response mid-walk")
 	}
 }
 
