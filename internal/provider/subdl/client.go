@@ -213,9 +213,15 @@ func nextUTCMidnight(now time.Time) time.Time {
 // against SubDL's published API docs and a live response; see
 // candidatesFromResponse in subdl.go, which is why both arrays are
 // decoded here rather than Subtitles alone).
+// TotalPages and CurrentPage are SubDL's own pagination fields (ADR 0010):
+// Search walks additional pages, requesting the same query params with
+// only page varied, until CurrentPage == TotalPages or a fixed page cap is
+// reached, merging every page's Subtitles into one candidate list.
 type searchResponseBody struct {
-	Results   []searchResultInfo `json:"results"`
-	Subtitles []searchResultItem `json:"subtitles"`
+	Results     []searchResultInfo `json:"results"`
+	Subtitles   []searchResultItem `json:"subtitles"`
+	TotalPages  int                `json:"totalPages"`
+	CurrentPage int                `json:"currentPage"`
 }
 
 // searchResultInfo mirrors one entry in SubDL's /subtitles response
