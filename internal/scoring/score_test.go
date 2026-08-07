@@ -220,11 +220,11 @@ func TestScore_EpisodeWithUnknownYearStillRejectsWrongEpisode(t *testing.T) {
 }
 
 func TestBest_ReturnsTopScoringCandidateEvenWhenIneligible(t *testing.T) {
-	info := scoring.Info{ContentType: media.Movie, Title: "Blue Mountain State: The Rise of Thadland", Year: 2016}
-	// Punctuation dropped from the filename-derived title never matches
-	// info.Title's exact EqualFold check, so this candidate is ineligible --
-	// but it's still the only, and therefore top-scoring, candidate.
-	candidate := domain.Candidate{ID: "only-candidate", Title: "Blue Mountain State the Rise of Thadland", Year: 2016}
+	info := scoring.Info{ContentType: media.Movie, Title: "Arrival", Year: 2016}
+	// A genuinely different title never matches, so this candidate is
+	// ineligible -- but it's still the only, and therefore top-scoring,
+	// candidate.
+	candidate := domain.Candidate{ID: "only-candidate", Title: "Completely Different Title", Year: 2016}
 
 	best, score, cutoff, ok := scoring.Best(info, []domain.Candidate{candidate})
 
@@ -242,6 +242,72 @@ func TestBest_ReturnsTopScoringCandidateEvenWhenIneligible(t *testing.T) {
 	}
 	if score >= cutoff {
 		t.Errorf("score %d >= cutoff %d, want the candidate to actually miss", score, cutoff)
+	}
+}
+
+func TestScore_TitleFoldIgnoresPunctuationAndWhitespaceDifferences(t *testing.T) {
+	// The reported bug: SubDL's canonical title carries a colon a
+	// filename-derived title dropped. Table covers the same class of
+	// difference across every punctuation/whitespace case Fix A folds.
+	tests := []struct {
+		name           string
+		infoTitle      string
+		candidateTitle string
+	}{
+		{"colon", "Blue Mountain State: The Rise of Thadland", "Blue Mountain State the Rise of Thadland"},
+		{"em dash", "Arrival — Redux", "Arrival Redux"},
+		{"en dash", "Arrival – Redux", "Arrival Redux"},
+		{"hyphen with no surrounding space", "Spider-Man", "Spider Man"},
+		{"typographic apostrophe", "Assassin’s Creed", "Assassin's Creed"},
+		{"curly quotes", "“Arrival”", "Arrival"},
+		{"ampersand as punctuation", "Q & A", "Q A"},
+		{"collapsed internal whitespace", "Arrival   Redux", "Arrival Redux"},
+		{"non-breaking space", "Arrival\u00a0Redux", "Arrival Redux"},
+		{"leading/trailing punctuation", "- Arrival -", "Arrival"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			info := scoring.Info{ContentType: media.Movie, Title: tt.infoTitle, Year: 2016}
+			candidate := domain.Candidate{Title: tt.candidateTitle, Year: 2016}
+
+			_, eligible := scoring.Score(info, candidate)
+
+			if !eligible {
+				t.Errorf("Score(...) eligible = false, want true: %q and %q should fold to the same title", tt.infoTitle, tt.candidateTitle)
+			}
+		})
+	}
+}
+
+// TestScore_TitleFoldDoesNotCoverVocabularyDifferences locks in Fix A's
+// deliberate scope boundary (see docs/adr/0009): folding is
+// punctuation/whitespace only. These vocabulary-level differences must
+// keep failing so a future change doesn't silently widen the fold into
+// territory with real false-positive risk without a fresh decision.
+func TestScore_TitleFoldDoesNotCoverVocabularyDifferences(t *testing.T) {
+	tests := []struct {
+		name           string
+		infoTitle      string
+		candidateTitle string
+	}{
+		{"accented letter vs unaccented", "Amelie", "Amélie"},
+		{"leading article dropped", "Matrix", "The Matrix"},
+		{"ampersand vs spelled-out word", "Q & A", "Q and A"},
+		{"numeral vs spelled-out number", "Movie Part 2", "Movie Part Two"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			info := scoring.Info{ContentType: media.Movie, Title: tt.infoTitle, Year: 2016}
+			candidate := domain.Candidate{Title: tt.candidateTitle, Year: 2016}
+
+			_, eligible := scoring.Score(info, candidate)
+
+			if eligible {
+				t.Errorf("Score(...) eligible = true, want false: %q and %q are a vocabulary-level difference, out of Fix A's scope", tt.infoTitle, tt.candidateTitle)
+			}
+		})
 	}
 }
 
