@@ -20,6 +20,7 @@ import (
 	"github.com/aaronkyriesenbach/sublime/internal/pipeline"
 	"github.com/aaronkyriesenbach/sublime/internal/provider"
 	"github.com/aaronkyriesenbach/sublime/internal/store"
+	"github.com/aaronkyriesenbach/sublime/internal/strip"
 	"github.com/aaronkyriesenbach/sublime/internal/syncengine"
 )
 
@@ -212,6 +213,50 @@ func TestPipeline_ScanFindsVideoFilesAcrossSubdirectories(t *testing.T) {
 	}
 	if result.Found != 2 {
 		t.Errorf("Found = %d, want 2", result.Found)
+	}
+}
+
+// TestIsVideoFile_ExcludesStripStrayTempFiles guards issue #81's phantom Found registration: Strip's own remux temp file carries a normal video extension.
+func TestIsVideoFile_ExcludesStripStrayTempFiles(t *testing.T) {
+	temp := strip.NewTempVideoPath(t.TempDir(), "Movie", ".mkv")
+	if pipeline.IsVideoFile(temp) {
+		t.Errorf("IsVideoFile(%q) = true, want false for Strip's own stray remux temp file", temp)
+	}
+}
+
+// TestPipeline_ScanSkipsStripStrayTempFile guards issue #81's directory-walk case: a crash-orphaned Strip remux temp file on disk must never be registered as Found.
+func TestPipeline_ScanSkipsStripStrayTempFile(t *testing.T) {
+	libDir := t.TempDir()
+	videoPath := filepath.Join(libDir, "Movie.One.2020.HDTV.x264-GRP.mp4")
+	writeVideoFixture(t, videoPath)
+
+	strayPath := strip.NewTempVideoPath(libDir, "Movie.One.2020.HDTV.x264-GRP", ".mp4")
+	writeVideoFixture(t, strayPath)
+
+	st := openTestStore(t)
+	lib := domain.Library{
+		Name:       "test-library",
+		Path:       libDir,
+		Languages:  []language.Tag{language.English},
+		StripScope: domain.StripScopeAll,
+	}
+	p := &pipeline.Pipeline{Store: st}
+
+	ctx := context.Background()
+	result, err := p.Run(ctx, lib)
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	if result.FilesScanned != 1 {
+		t.Errorf("FilesScanned = %d, want 1 (stray temp file must not be scanned)", result.FilesScanned)
+	}
+	if result.Found != 1 {
+		t.Errorf("Found = %d, want 1", result.Found)
+	}
+
+	if _, found, err := st.GetFile(ctx, lib.Name, strayPath); err != nil || found {
+		t.Errorf("stray temp file registered: found=%v err=%v", found, err)
 	}
 }
 

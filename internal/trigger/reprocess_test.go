@@ -13,6 +13,7 @@ import (
 	"github.com/aaronkyriesenbach/sublime/internal/pipeline"
 	"github.com/aaronkyriesenbach/sublime/internal/provider"
 	"github.com/aaronkyriesenbach/sublime/internal/store"
+	"github.com/aaronkyriesenbach/sublime/internal/strip"
 	"github.com/aaronkyriesenbach/sublime/internal/syncengine"
 	"github.com/aaronkyriesenbach/sublime/internal/trigger"
 )
@@ -234,6 +235,41 @@ func TestReprocess_EntireLibraryForcesEveryFile(t *testing.T) {
 	dispatchOnce(t, ctx, p, st, lib)
 	if searched[video1] != 1 || searched[video2] != 1 {
 		t.Errorf("searches = %d,%d, want 1,1 (whole library reprocessed)", searched[video1], searched[video2])
+	}
+}
+
+// TestReprocess_DirectorySkipsStripStrayTempFile is issue #81's regression test for the directory-walk entrypoint: a stray Strip temp file must be skipped, not reset to Pending.
+func TestReprocess_DirectorySkipsStripStrayTempFile(t *testing.T) {
+	libDir := t.TempDir()
+	videoPath := filepath.Join(libDir, "Movie.One.2020.HDTV.x264-GRP.mp4")
+	writeSampleVideo(t, videoPath)
+
+	strayPath := strip.NewTempVideoPath(libDir, "Movie.One.2020.HDTV.x264-GRP", ".mp4")
+	writeSampleVideo(t, strayPath)
+
+	p, st := newTestPipeline(t, nil)
+	lib := domain.Library{
+		Name:       "test-library",
+		Path:       libDir,
+		Languages:  []language.Tag{language.English},
+		StripScope: domain.StripScopeAll,
+	}
+
+	ctx := context.Background()
+	if err := trigger.Reprocess(ctx, p, lib, libDir); err != nil {
+		t.Fatalf("Reprocess: %v", err)
+	}
+
+	pairs, err := st.PendingPairs(ctx)
+	if err != nil {
+		t.Fatalf("PendingPairs: %v", err)
+	}
+	if len(pairs) != 1 || pairs[0].Path != videoPath {
+		t.Fatalf("PendingPairs = %+v, want a single pending pair for %q (stray temp file must be skipped)", pairs, videoPath)
+	}
+
+	if _, found, err := st.GetFile(ctx, lib.Name, strayPath); err != nil || found {
+		t.Errorf("stray temp file registered by directory reprocess: found=%v err=%v", found, err)
 	}
 }
 

@@ -323,10 +323,12 @@ scan:
 	return result, nil
 }
 
-// IsVideoFile reports whether path has a file extension the pipeline
-// recognizes as a video file.
+// IsVideoFile reports whether path is a recognized-extension video file that isn't one of Strip's own stray remux temp files (strip.IsStrayTempFile).
 func IsVideoFile(path string) bool {
-	return videoExtensions[strings.ToLower(filepath.Ext(path))]
+	if !videoExtensions[strings.ToLower(filepath.Ext(path))] {
+		return false
+	}
+	return !strip.IsStrayTempFile(filepath.Base(path))
 }
 
 // scanLibraryStream walks root on its own goroutine and streams the
