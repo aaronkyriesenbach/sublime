@@ -2,6 +2,7 @@ package store_test
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -1363,5 +1364,154 @@ func TestDifferentLibrariesWithSamePathAreDistinctFiles(t *testing.T) {
 
 	if movies.ID == tv.ID {
 		t.Errorf("expected distinct file IDs for the same path under different libraries, got %d for both", movies.ID)
+	}
+}
+
+func TestFilePathsForLibrary_ScopesByLibraryNameOnly(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+
+	if _, err := s.ObserveFileContentHash(ctx, "movies", "/media/movies/a.mkv", "hash-1"); err != nil {
+		t.Fatalf("ObserveFileContentHash: %v", err)
+	}
+	if _, err := s.ObserveFileContentHash(ctx, "movies", "/media/movies/b.mkv", "hash-2"); err != nil {
+		t.Fatalf("ObserveFileContentHash: %v", err)
+	}
+	if _, err := s.ObserveFileContentHash(ctx, "tv", "/media/tv/c.mkv", "hash-3"); err != nil {
+		t.Fatalf("ObserveFileContentHash: %v", err)
+	}
+
+	paths, err := s.FilePathsForLibrary(ctx, "movies", "/media/movies")
+	if err != nil {
+		t.Fatalf("FilePathsForLibrary: %v", err)
+	}
+
+	slices.Sort(paths)
+	want := []string{"/media/movies/a.mkv", "/media/movies/b.mkv"}
+	if !slices.Equal(paths, want) {
+		t.Errorf("paths = %v, want %v", paths, want)
+	}
+}
+
+// TestFilePathsForLibrary_ScopesByPathPrefix guards a Reprocess-scoped scan
+// (whose Run target is a Library subdirectory, not the whole Library):
+// reconciliation must never see a sibling file outside the walked subtree.
+func TestFilePathsForLibrary_ScopesByPathPrefix(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+
+	if _, err := s.ObserveFileContentHash(ctx, "tv", "/media/tv/Show/S01/a.mkv", "hash-1"); err != nil {
+		t.Fatalf("ObserveFileContentHash: %v", err)
+	}
+	if _, err := s.ObserveFileContentHash(ctx, "tv", "/media/tv/Show/S02/b.mkv", "hash-2"); err != nil {
+		t.Fatalf("ObserveFileContentHash: %v", err)
+	}
+
+	paths, err := s.FilePathsForLibrary(ctx, "tv", "/media/tv/Show/S01")
+	if err != nil {
+		t.Fatalf("FilePathsForLibrary: %v", err)
+	}
+
+	want := []string{"/media/tv/Show/S01/a.mkv"}
+	if !slices.Equal(paths, want) {
+		t.Errorf("paths = %v, want %v (S02's file must not leak into an S01-scoped diff)", paths, want)
+	}
+}
+
+func TestFilePathsForLibrary_NoTrackedFilesReturnsEmpty(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+
+	paths, err := s.FilePathsForLibrary(ctx, "movies", "/media/movies")
+	if err != nil {
+		t.Fatalf("FilePathsForLibrary: %v", err)
+	}
+	if len(paths) != 0 {
+		t.Errorf("paths = %v, want empty", paths)
+	}
+}
+
+func TestDeleteFile_RemovesRowAndCascadesLanguageStates(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "sublime.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	ctx := context.Background()
+	en := mustLang(t, "en")
+
+	file, err := s.ObserveFileContentHash(ctx, "movies", "/media/movies/a.mkv", "hash-1")
+	if err != nil {
+		t.Fatalf("ObserveFileContentHash: %v", err)
+	}
+	if err := s.EnsureLanguage(ctx, file.ID, en); err != nil {
+		t.Fatalf("EnsureLanguage: %v", err)
+	}
+
+	deleted, err := s.DeleteFile(ctx, "movies", "/media/movies/a.mkv")
+	if err != nil {
+		t.Fatalf("DeleteFile: %v", err)
+	}
+	if !deleted {
+		t.Error("deleted = false, want true")
+	}
+
+	if _, found, err := s.GetFile(ctx, "movies", "/media/movies/a.mkv"); err != nil || found {
+		t.Errorf("GetFile after DeleteFile: found=%v err=%v, want found=false", found, err)
+	}
+
+	// A second raw connection to the same file confirms ON DELETE CASCADE
+	// actually fired, not just that files-first queries can't see the row.
+	raw, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("opening raw connection: %v", err)
+	}
+	defer func() { _ = raw.Close() }()
+
+	var count int
+	if err := raw.QueryRowContext(ctx, `SELECT COUNT(*) FROM file_language_states WHERE file_id = ?`, file.ID).Scan(&count); err != nil {
+		t.Fatalf("counting language states: %v", err)
+	}
+	if count != 0 {
+		t.Errorf("file_language_states rows remaining for deleted file_id %d = %d, want 0", file.ID, count)
+	}
+}
+
+func TestDeleteFile_AlreadyGoneIsSilentNoOp(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+
+	deleted, err := s.DeleteFile(ctx, "movies", "/media/movies/never-existed.mkv")
+	if err != nil {
+		t.Fatalf("DeleteFile: %v", err)
+	}
+	if deleted {
+		t.Error("deleted = true, want false for a path that was never tracked")
+	}
+}
+
+func TestDeleteFile_ScopesByLibraryName(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+
+	if _, err := s.ObserveFileContentHash(ctx, "movies", "/shared/a.mkv", "hash-1"); err != nil {
+		t.Fatalf("ObserveFileContentHash: %v", err)
+	}
+	if _, err := s.ObserveFileContentHash(ctx, "tv", "/shared/a.mkv", "hash-1"); err != nil {
+		t.Fatalf("ObserveFileContentHash: %v", err)
+	}
+
+	deleted, err := s.DeleteFile(ctx, "movies", "/shared/a.mkv")
+	if err != nil {
+		t.Fatalf("DeleteFile: %v", err)
+	}
+	if !deleted {
+		t.Error("deleted = false, want true")
+	}
+
+	if _, found, err := s.GetFile(ctx, "tv", "/shared/a.mkv"); err != nil || !found {
+		t.Errorf("tv library's file wrongly affected: found=%v err=%v, want found=true", found, err)
 	}
 }

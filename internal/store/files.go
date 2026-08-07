@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -289,6 +290,48 @@ func (s *Store) UpdateContentHash(ctx context.Context, fileID int64, contentHash
 		return ErrFileNotFound
 	}
 	return nil
+}
+
+// FilePathsForLibrary returns every tracked path within libraryName that is pathPrefix or a descendant of it — a lean alternative to ListFiles for reconciliation's disk-vs-store diff, scoped to whatever subtree was actually walked (a Reprocess target may be a Library subdirectory, not the whole Library).
+func (s *Store) FilePathsForLibrary(ctx context.Context, libraryName, pathPrefix string) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT path FROM files WHERE library_name = ? AND (path = ? OR path LIKE ? ESCAPE '\')`,
+		libraryName, pathPrefix, escapeLike(pathPrefix)+string(filepath.Separator)+"%",
+	)
+	if err != nil {
+		return nil, fmt.Errorf("querying file paths: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var paths []string
+	for rows.Next() {
+		var path string
+		if err := rows.Scan(&path); err != nil {
+			return nil, fmt.Errorf("scanning file path: %w", err)
+		}
+		paths = append(paths, path)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterating file paths: %w", err)
+	}
+	return paths, nil
+}
+
+// DeleteFile removes libraryName's file row at path, cascading to its language states; an already-gone path is a silent no-op (false, nil), not an error.
+func (s *Store) DeleteFile(ctx context.Context, libraryName, path string) (bool, error) {
+	res, err := s.db.ExecContext(ctx,
+		`DELETE FROM files WHERE library_name = ? AND path = ?`,
+		libraryName, path,
+	)
+	if err != nil {
+		return false, fmt.Errorf("deleting file: %w", err)
+	}
+
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("reading rows affected: %w", err)
+	}
+	return n > 0, nil
 }
 
 // EnsureLanguage guarantees fileID has a row for lang, inserting one as

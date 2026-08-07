@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io/fs"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sync"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/aaronkyriesenbach/sublime/internal/domain"
 	"github.com/aaronkyriesenbach/sublime/internal/pipeline"
+	"github.com/aaronkyriesenbach/sublime/internal/strip"
 )
 
 // defaultDebounceInterval is how long Watcher waits after the last fsnotify
@@ -54,6 +56,14 @@ type Watcher struct {
 // cancelled or the watcher hits an unrecoverable error, and always returns a
 // non-nil error in that case (ctx.Err() in the common case).
 func (w *Watcher) Start(ctx context.Context) error {
+	removed, err := strip.CleanStrayTempFiles(w.Library.Path)
+	if err != nil {
+		return fmt.Errorf("trigger: cleaning stray temp files for library %q: %w", w.Library.Name, err)
+	}
+	if removed > 0 {
+		w.logger().Info("cleaned stray temp files", "library", w.Library.Name, "path", w.Library.Path, "removed", removed)
+	}
+
 	if _, err := w.Pipeline.Run(ctx, w.Library); err != nil {
 		return fmt.Errorf("trigger: initial scan of library %q: %w", w.Library.Name, err)
 	}
@@ -75,6 +85,13 @@ func (w *Watcher) Start(ctx context.Context) error {
 	})
 	defer d.Stop()
 
+	rd := newDebouncer(w.debounceInterval(), func(path string) {
+		if err := w.Pipeline.RemoveFile(ctx, w.Library, path); err != nil && w.OnRunError != nil {
+			w.OnRunError(path, err)
+		}
+	})
+	defer rd.Stop()
+
 	if w.OnWatching != nil {
 		w.OnWatching()
 	}
@@ -87,7 +104,7 @@ func (w *Watcher) Start(ctx context.Context) error {
 			if !ok {
 				return nil
 			}
-			w.handleEvent(fsw, event, d)
+			w.handleEvent(fsw, event, d, rd)
 		case err, ok := <-fsw.Errors:
 			if !ok {
 				return nil
@@ -106,16 +123,28 @@ func (w *Watcher) debounceInterval() time.Duration {
 	return defaultDebounceInterval
 }
 
-// handleEvent reacts to a single fsnotify event: newly created directories
-// are added to the watch (fsnotify only watches directories
-// non-recursively), and video file creates/writes are scheduled for
-// (debounced) pipeline processing.
-func (w *Watcher) handleEvent(fsw *fsnotify.Watcher, event fsnotify.Event, d *debouncer) {
+// logger returns w.Pipeline.Logger, or slog.Default() if it isn't set.
+func (w *Watcher) logger() *slog.Logger {
+	if w.Pipeline.Logger != nil {
+		return w.Pipeline.Logger
+	}
+	return slog.Default()
+}
+
+// handleEvent reacts to one fsnotify event: new directories are watched, video creates/writes are debounced into registration, and video removes/renames-away are debounced into removal — a rename fires Op Rename (not Op Remove) at the old path, so both mean "gone from here" (docs/adr/0013).
+func (w *Watcher) handleEvent(fsw *fsnotify.Watcher, event fsnotify.Event, d, rd *debouncer) {
 	if event.Has(fsnotify.Create) {
 		if info, err := os.Stat(event.Name); err == nil && info.IsDir() {
 			_ = addRecursive(fsw, event.Name)
 			return
 		}
+	}
+
+	if event.Has(fsnotify.Remove) || event.Has(fsnotify.Rename) {
+		if pipeline.IsVideoFile(event.Name) {
+			rd.Schedule(event.Name)
+		}
+		return
 	}
 
 	if !event.Has(fsnotify.Create) && !event.Has(fsnotify.Write) {

@@ -297,6 +297,146 @@ func TestPipeline_RunFileRegistersOnlyTheGivenFile(t *testing.T) {
 	}
 }
 
+// TestPipeline_RunFile_DoesNotReconcileOtherTrackedFiles guards runFiles'
+// walkErrCh-gating: RunFile only ever sees the one path it's given, so it
+// must never treat every other tracked file in the Library as Removed.
+func TestPipeline_RunFile_DoesNotReconcileOtherTrackedFiles(t *testing.T) {
+	libDir := t.TempDir()
+	video1 := filepath.Join(libDir, "Movie.One.2020.HDTV.x264-GRP.mp4")
+	video2 := filepath.Join(libDir, "Movie.Two.2021.HDTV.x264-GRP.mp4")
+	writeVideoFixture(t, video1)
+	writeVideoFixture(t, video2)
+
+	st := openTestStore(t)
+	lib := domain.Library{
+		Name:       "test-library",
+		Path:       libDir,
+		Languages:  []language.Tag{language.English},
+		StripScope: domain.StripScopeAll,
+	}
+	p := &pipeline.Pipeline{Store: st}
+
+	ctx := context.Background()
+	if _, err := p.Run(ctx, lib); err != nil {
+		t.Fatalf("initial Run: %v", err)
+	}
+
+	// RunFile re-registers only video1; video2 was never mentioned in this
+	// call, but must remain tracked — RunFile isn't a Library scan.
+	result, err := p.RunFile(ctx, lib, video1)
+	if err != nil {
+		t.Fatalf("RunFile: %v", err)
+	}
+	if result.Removed != 0 {
+		t.Errorf("Removed = %d, want 0 (RunFile must never reconcile)", result.Removed)
+	}
+
+	if _, found, err := st.GetFile(ctx, lib.Name, video2); err != nil || !found {
+		t.Errorf("video2 wrongly treated as Removed by RunFile: found=%v err=%v", found, err)
+	}
+}
+
+// TestPipeline_Run_ReconcilesFileRemovedFromDisk guards the reconciliation
+// safety net (CONTEXT.md's Removed entry): a Library scan must delete the
+// row for a previously tracked file no longer present on disk, e.g. one
+// deleted while nothing was watching.
+func TestPipeline_Run_ReconcilesFileRemovedFromDisk(t *testing.T) {
+	libDir := t.TempDir()
+	video1 := filepath.Join(libDir, "Movie.One.2020.HDTV.x264-GRP.mp4")
+	video2 := filepath.Join(libDir, "Movie.Two.2021.HDTV.x264-GRP.mp4")
+	writeVideoFixture(t, video1)
+	writeVideoFixture(t, video2)
+
+	st := openTestStore(t)
+	lib := domain.Library{
+		Name:       "test-library",
+		Path:       libDir,
+		Languages:  []language.Tag{language.English},
+		StripScope: domain.StripScopeAll,
+	}
+
+	var logBuf bytes.Buffer
+	p := &pipeline.Pipeline{Store: st, Logger: slog.New(slog.NewTextHandler(&logBuf, nil))}
+
+	ctx := context.Background()
+	if _, err := p.Run(ctx, lib); err != nil {
+		t.Fatalf("initial Run: %v", err)
+	}
+
+	if err := os.Remove(video2); err != nil {
+		t.Fatalf("removing video2 fixture: %v", err)
+	}
+
+	result, err := p.Run(ctx, lib)
+	if err != nil {
+		t.Fatalf("second Run: %v", err)
+	}
+
+	if result.Removed != 1 {
+		t.Errorf("Removed = %d, want 1", result.Removed)
+	}
+	if _, found, err := st.GetFile(ctx, lib.Name, video2); err != nil || found {
+		t.Errorf("video2 still tracked after removal: found=%v err=%v", found, err)
+	}
+	if _, found, err := st.GetFile(ctx, lib.Name, video1); err != nil || !found {
+		t.Errorf("video1 wrongly untracked: found=%v err=%v", found, err)
+	}
+	if got := strings.Count(logBuf.String(), "file removed"); got != 1 {
+		t.Errorf(`"file removed" count = %d, want 1; log output:\n%s`, got, logBuf.String())
+	}
+}
+
+func TestPipeline_RemoveFile_DeletesRowAndLogsOnce(t *testing.T) {
+	libDir := t.TempDir()
+	videoPath := filepath.Join(libDir, "Test.Movie.2024.HDTV.x264-FAKEGROUP.mp4")
+	writeVideoFixture(t, videoPath)
+
+	st := openTestStore(t)
+	lib := domain.Library{
+		Name:       "test-library",
+		Path:       libDir,
+		Languages:  []language.Tag{language.English, language.Spanish},
+		StripScope: domain.StripScopeAll,
+	}
+
+	var logBuf bytes.Buffer
+	p := &pipeline.Pipeline{Store: st, Logger: slog.New(slog.NewTextHandler(&logBuf, nil))}
+
+	ctx := context.Background()
+	if _, err := p.Run(ctx, lib); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	logBuf.Reset()
+
+	if err := p.RemoveFile(ctx, lib, videoPath); err != nil {
+		t.Fatalf("RemoveFile: %v", err)
+	}
+
+	if _, found, err := st.GetFile(ctx, lib.Name, videoPath); err != nil || found {
+		t.Errorf("GetFile after RemoveFile: found=%v err=%v, want found=false", found, err)
+	}
+	if got := strings.Count(logBuf.String(), "file removed"); got != 1 {
+		t.Errorf(`"file removed" count = %d, want 1 (once per file, not per language); log output:\n%s`, got, logBuf.String())
+	}
+}
+
+func TestPipeline_RemoveFile_AlreadyGoneDoesNotLog(t *testing.T) {
+	st := openTestStore(t)
+	lib := domain.Library{Name: "test-library", Path: t.TempDir(), Languages: []language.Tag{language.English}}
+
+	var logBuf bytes.Buffer
+	p := &pipeline.Pipeline{Store: st, Logger: slog.New(slog.NewTextHandler(&logBuf, nil))}
+
+	ctx := context.Background()
+	if err := p.RemoveFile(ctx, lib, filepath.Join(lib.Path, "never-existed.mkv")); err != nil {
+		t.Fatalf("RemoveFile: %v", err)
+	}
+
+	if logBuf.Len() != 0 {
+		t.Errorf("expected no log output for an already-gone path, got:\n%s", logBuf.String())
+	}
+}
+
 // TestPipeline_ChangedFileLogsFileChangedAndResetsToPending guards the
 // Changed half of the classification for the bulk-scan entrypoint: an
 // already-tracked file whose Content Hash differs from its last-recorded
