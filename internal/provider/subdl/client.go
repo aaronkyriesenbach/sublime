@@ -82,9 +82,11 @@ func (c *client) getJSON(ctx context.Context, path string, out any) error {
 
 // getRaw issues a GET request for path (relative to downloadBaseURL,
 // dl.subdl.com by default -- not baseURL, the JSON search host) through
-// the Pacer and returns its raw response body -- used for SubDL's
-// download endpoint, which returns subtitle bytes directly rather than
-// JSON.
+// the Pacer and returns its raw response body, unmodified -- SubDL's
+// download endpoint's regular-listing shape actually returns a zip
+// archive despite its own docs describing it as raw subtitle bytes;
+// unzipping that response is Provider.Download's job (subdl.go's
+// extractSubtitleFromZip), not this transport-level method's (issue #80).
 func (c *client) getRaw(ctx context.Context, path string) ([]byte, error) {
 	var data []byte
 	err := c.pacer.Do(ctx, func(ctx context.Context) (retry.Outcome, error) {

@@ -29,8 +29,14 @@ since that coincides with the true episode number only when a pack's files
 are contiguous and unshifted by non-episode content — which real packs
 violate (Andor's own bonus "07 Announcement" featurette is interleaved
 between real episodes 6 and 8). The pack's outer `full_season: true` item is
-never itself turned into a Candidate — only entries resolved this way are —
-so no zip-archive download/extraction path is needed anywhere in Sublime.
+never itself turned into a Candidate — only entries resolved this way are.
+
+(Correction, issue #80/ADR 0012: this originally also claimed "so no
+zip-archive download/extraction path is needed anywhere in Sublime" — that
+turned out to be false. SubDL's regular-listing download URL shape returns
+a zip archive regardless of whether the Candidate came from this
+`unpack_files` path or the plain `subtitles[]` listing; see ADR 0012 for
+the entry-selection rule extraction requires.)
 
 **Considered options:**
 

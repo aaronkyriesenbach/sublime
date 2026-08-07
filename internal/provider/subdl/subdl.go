@@ -7,7 +7,7 @@
 // This package covers the happy path (issue #69): mapping a provider.Query
 // to SubDL's /subtitles search params, converting results into
 // domain.Candidates via the shared cosmetics parser
-// (internal/provider.ParseCosmetics), and downloading a Candidate's raw
+// (internal/provider.ParseCosmetics), and downloading a Candidate's
 // subtitle bytes via either SubDL's anonymous per-IP path or its
 // authenticated/paid path, selected by Config.Paid alone (see ADR 0006) —
 // plus quota-exhaustion detection and Provider Suspension (issue #70, ADR
@@ -29,15 +29,27 @@
 // internal/media.Classify, never the entries' own season/episode wire
 // fields (issue #79, ADR 0011); the pack's own whole-archive item is never
 // itself a Candidate.
+//
+// Download's response is sniffed for a zip archive rather than trusted
+// raw off either download URL shape (issue #80, ADR 0012): when zipped,
+// extractSubtitleFromZip resolves the one correct entry, using
+// media.Classify for a TV candidate and extension-filtering alone for a
+// movie candidate, erroring rather than guessing if it can't identify
+// exactly one.
+// itself a Candidate.
 package subdl
 
 import (
+	"archive/zip"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/url"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -382,6 +394,80 @@ func (p *Provider) Download(ctx context.Context, candidate domain.Candidate) ([]
 			}
 		}
 		return nil, fmt.Errorf("subdl: download: %w", err)
+	}
+
+	if !isZipData(data) {
+		return data, nil
+	}
+	subtitle, err := extractSubtitleFromZip(data, candidate)
+	if err != nil {
+		return nil, fmt.Errorf("subdl: download: %w", err)
+	}
+	return subtitle, nil
+}
+
+// zipMagic is the zip local-file-header signature: sniffed from the
+// response's own bytes rather than trusted from URL shape (issue #80).
+var zipMagic = []byte("PK\x03\x04")
+
+func isZipData(data []byte) bool {
+	return bytes.HasPrefix(data, zipMagic)
+}
+
+// extractSubtitleFromZip resolves the one correct subtitle out of a
+// zip-shape download response's entries: filtered to .srt, then for a TV
+// candidate (Episode != 0) narrowed to the entry media.Classify resolves
+// to candidate's Season/Episode (mirroring ADR 0011's refusal to trust
+// wire fields); a movie candidate has no such signal, so its sole
+// remaining .srt entry is the answer. Zero or >1 matches is a hard error
+// — SubDL's zip contents are never guessed at (issue #80).
+func extractSubtitleFromZip(data []byte, candidate domain.Candidate) ([]byte, error) {
+	r, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		return nil, fmt.Errorf("reading zip: %w", err)
+	}
+
+	var srtFiles []*zip.File
+	for _, f := range r.File {
+		if strings.EqualFold(filepath.Ext(f.Name), ".srt") {
+			srtFiles = append(srtFiles, f)
+		}
+	}
+
+	matches := srtFiles
+	if candidate.Episode != 0 {
+		matches = nil
+		for _, f := range srtFiles {
+			c := media.Classify(f.Name)
+			if c.Type == media.Episode && c.Season == candidate.Season && c.Episode == candidate.Episode {
+				matches = append(matches, f)
+			}
+		}
+	}
+
+	if len(matches) != 1 {
+		return nil, fmt.Errorf("zip contained %d matching .srt entries (want exactly 1) among %v", len(matches), zipEntryNames(r.File))
+	}
+	return readZipFile(matches[0])
+}
+
+func zipEntryNames(files []*zip.File) []string {
+	names := make([]string, len(files))
+	for i, f := range files {
+		names[i] = f.Name
+	}
+	return names
+}
+
+func readZipFile(f *zip.File) ([]byte, error) {
+	rc, err := f.Open()
+	if err != nil {
+		return nil, fmt.Errorf("opening zip entry %q: %w", f.Name, err)
+	}
+	defer func() { _ = rc.Close() }()
+	data, err := io.ReadAll(rc)
+	if err != nil {
+		return nil, fmt.Errorf("reading zip entry %q: %w", f.Name, err)
 	}
 	return data, nil
 }
