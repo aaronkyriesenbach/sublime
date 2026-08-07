@@ -235,6 +235,9 @@ type RegistrationResult struct {
 	// from its last-recorded value, or that were targeted by a forced
 	// reprocess request.
 	Changed int
+
+	// Removed counts files no longer found on disk by a full Library scan (Run); always zero for RunFile.
+	Removed int
 }
 
 // Run registers every video file in lib, classifying each as Found or
@@ -247,6 +250,19 @@ type RegistrationResult struct {
 func (p *Pipeline) Run(ctx context.Context, lib domain.Library, opts ...RunOption) (RegistrationResult, error) {
 	paths, walkErrCh := p.scanLibraryStream(ctx, lib.Path)
 	return p.runFiles(ctx, lib, paths, walkErrCh, opts...)
+}
+
+// RemoveFile deletes videoPath's Store row (cascading to its language states) and logs "file removed" if a row existed.
+// Called by both live fsnotify handling and Run's reconciliation; an already-gone path is a silent no-op, not an error.
+func (p *Pipeline) RemoveFile(ctx context.Context, lib domain.Library, videoPath string) error {
+	deleted, err := p.Store.DeleteFile(ctx, lib.Name, videoPath)
+	if err != nil {
+		return fmt.Errorf("pipeline: removing file %q: %w", videoPath, err)
+	}
+	if deleted {
+		p.logger().Info("file removed", "library", lib.Name, "path", videoPath)
+	}
+	return nil
 }
 
 // RunFile registers a single video file within lib for each of
@@ -281,6 +297,7 @@ func (p *Pipeline) runFiles(
 	}
 
 	var result RegistrationResult
+	seen := make(map[string]struct{})
 
 scan:
 	for {
@@ -290,6 +307,7 @@ scan:
 				break scan
 			}
 			result.FilesScanned++
+			seen[videoPath] = struct{}{}
 
 			_, classification, err := p.registerFile(ctx, lib, videoPath, cfg.force)
 			if err != nil {
@@ -320,7 +338,37 @@ scan:
 		return result, ctx.Err()
 	}
 
+	// Only Run (walkErrCh non-nil) reconciles — RunFile's single path isn't the whole Library, and an errored walk already returned above.
+	if walkErrCh != nil {
+		removed, err := p.reconcileRemovals(ctx, lib, seen)
+		if err != nil {
+			return result, err
+		}
+		result.Removed = removed
+	}
+
 	return result, nil
+}
+
+// reconcileRemovals deletes tracked paths under lib.Name absent from seen — files removed while nothing was
+// watching (downtime, a missed fsnotify event), not caught live by Watcher's own Remove/Rename handling.
+func (p *Pipeline) reconcileRemovals(ctx context.Context, lib domain.Library, seen map[string]struct{}) (int, error) {
+	tracked, err := p.Store.FilePathsForLibrary(ctx, lib.Name, lib.Path)
+	if err != nil {
+		return 0, fmt.Errorf("listing tracked files for reconciliation: %w", err)
+	}
+
+	removed := 0
+	for _, path := range tracked {
+		if _, ok := seen[path]; ok {
+			continue
+		}
+		if err := p.RemoveFile(ctx, lib, path); err != nil {
+			return removed, fmt.Errorf("reconciling removed file %q: %w", path, err)
+		}
+		removed++
+	}
+	return removed, nil
 }
 
 // IsVideoFile reports whether path is a recognized-extension video file that isn't one of Strip's own stray remux temp files (strip.IsStrayTempFile).

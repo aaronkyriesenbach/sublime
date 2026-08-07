@@ -173,6 +173,13 @@ func TestReprocess_DirectoryForcesOnlyFilesUnderIt(t *testing.T) {
 		t.Fatalf("Reprocess: %v", err)
 	}
 
+	// Guards a real regression: a directory-scoped Reprocess walks only
+	// subDir, and reconciliation must scope its disk-vs-store diff to that
+	// same subtree — not treat rootVideo, elsewhere in the Library, as Removed.
+	if _, found, err := st.GetFile(ctx, lib.Name, rootVideo); err != nil || !found {
+		t.Errorf("rootVideo wrongly untracked after a subdir-scoped Reprocess: found=%v err=%v", found, err)
+	}
+
 	pairs, err := st.PendingPairs(ctx)
 	if err != nil {
 		t.Fatalf("PendingPairs: %v", err)

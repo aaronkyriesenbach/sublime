@@ -72,6 +72,10 @@ _Avoid_: Discovered, scanned, indexed
 The moment an already-tracked file's Content Hash is observed to differ from its last-recorded value (an external edit, e.g. a re-encode), or a manual reprocess request targets it — resetting its existing Sync Statuses back to Pending in place. Distinct from Found: a Changed file was already known to Sublime.
 _Avoid_: Modified, updated, rescanned
 
+**Removed**:
+The moment a tracked file is observed to no longer exist — either a live filesystem delete/rename-away event, or a Library scan finding a previously tracked path absent after a fully successful walk — deleting its file row and, by cascade, every one of its language states. Logged once per file, not per language. A rename is not distinguished from a deletion: the file at the old path is Removed, and if a file appears at a new path it is Found there as an unrelated row, with no Content Hash or prior Sync Status carried across — see docs/adr/0013-rename-is-removed-plus-found-not-tracked.md.
+_Avoid_: Deleted (reserve for a possible future operator-initiated destructive action, distinct from this passive observation), Missing, Vanished
+
 **Pending**:
 The Sync Status of a (file, language) pair that has been Found (or reset by a Changed event) but not yet picked up by a worker. Counted for every tracked file regardless of how large the backlog is — not bounded by worker count.
 _Avoid_: Queued, waiting, new
