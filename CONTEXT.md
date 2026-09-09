@@ -89,9 +89,13 @@ The Sync Status of a (file, language) pair whose subtitle is up to date with the
 _Avoid_: Done, complete
 
 **Failed** (Sync Status):
-The Sync Status of a (file, language) pair whose most recent attempt did not produce a Synced subtitle, paired with a failure reason (no candidate cleared the scoring cutoff, retrieval failed, Sync failed, an implausible Sync, or an internal error). Not retried until a Changed event resets it.
+The Sync Status of a (file, language) pair whose most recent attempt did not produce a Synced subtitle, paired with a failure reason (no candidate cleared the scoring cutoff, retrieval failed, Sync failed, an implausible Candidate, an implausible Sync, or an internal error). Not retried until a Changed event resets it.
 _Avoid_: Error, broken
+
+**Implausible Candidate** (Failed reason: `implausible_candidate`):
+A Candidate that is provably the wrong cut/edit of the video, caught either before Sync (a gross mismatch between the downloaded Candidate's own last-cue timestamp and the video's real runtime) or after Sync (a large but internally-consistent whole-file shift, distinct from Implausible Sync's segment-to-segment variance). Both checks answer the same question — is this the right Candidate, not just a well-scored one — just at different pipeline stages, so they share one reason distinct from Implausible Sync's alignment-quality question. Like a no-candidate miss, an Implausible Candidate is a soft miss: same Provider-Chain-advance retry semantics as Implausible Sync (below), no same-Provider multi-candidate fallback.
+_Avoid_: Implausible Sync (reserved for the Sync Engine's alignment producing internally inconsistent output, not a wrong Candidate)
 
 **Implausible Sync** (Failed reason: `implausible_sync`):
 A Sync that completed without the Sync Engine itself erroring, but whose result fails Sublime's own post-Sync plausibility check (e.g. wildly inconsistent segment-to-segment shifts) — distinct from Sync failed, which means the Sync Engine itself reported an error. Like a no-candidate miss, an Implausible Sync is a soft miss: the (file, language) pair is retried against the next Provider/Tier in its Provider Chain rather than terminally Failed on the spot, and only becomes the pair's terminal Failed reason if the whole chain exhausts with at least one Implausible Sync among its misses (masking it behind `no_candidate` would hide that a real Candidate existed and produced an unusable Sync).
-_Avoid_: Sync failed (reserved for the Sync Engine itself erroring)
+_Avoid_: Sync failed (reserved for the Sync Engine itself erroring), Implausible Candidate (reserved for a wrong Candidate, not a bad alignment)
