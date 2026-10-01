@@ -25,16 +25,24 @@ A subtitle result returned by a Provider search, not yet chosen. Candidates are 
 _Avoid_: Result, match (as a noun — Match is reserved for a scored attribute)
 
 **Provider**:
-An external subtitle source Sublime can query for Candidates (e.g., OpenSubtitles). Each Provider owns its own rate limit and derives whatever hash or query key it needs from the video internally; Sublime supports one Provider in v1 but is built to support several.
+A source Sublime obtains a subtitle from for a (file, language) pair — either an external service it queries for Candidates (e.g., OpenSubtitles) or a speech-recognition source that produces a Generated Subtitle from the video's own audio. Providers of either kind sit in the Provider Chain on equal footing: their order expresses operator preference, not a fixed quality ranking. Each Provider owns its own rate limit and derives whatever hash or query key it needs from the video internally; Sublime supports one Provider in v1 but is built to support several.
 _Avoid_: Source, backend
 
+**Generated Subtitle**:
+A subtitle Sublime produces by transcribing a video's own audio rather than retrieving it from an external service. Only ever produced in the language the audio is spoken in — never translated into another. Carries a Marker like any other Sublime-produced subtitle.
+_Avoid_: AI subtitle, auto-subtitle, transcript
+
 **Suspended**:
-A time-bounded state of a single Provider — not a Sync Status of any (file, language) pair — entered when the Provider reports its request quota is exhausted, and lasting until the Provider-reported (or, failing that, a conservative default) resume time. While Suspended, no further Search or Download calls are made against that Provider; every (file, language) pair that would otherwise be attempted is left Pending rather than marked Failed, since the Provider's unavailability says nothing about whether any individual file can be synced. Scoped to the one Provider that reported exhaustion — other Providers are unaffected. Distinct from Failed: Suspended is an environmental, self-clearing condition owned by the Provider, not a per-file outcome owned by the state store.
+A time-bounded state of a single Provider — not a Sync Status of any (file, language) pair — entered when the Provider reports its request quota is exhausted (Quota Exhausted) or cannot be reached at all (Unavailable), and lasting until the Provider-reported (or, failing that, a conservative default) resume time. While Suspended, no further Search or Download calls are made against that Provider; every (file, language) pair that would otherwise be attempted is left Pending rather than marked Failed, since the Provider's unavailability says nothing about whether any individual file can be synced. Scoped to the one Provider that entered Suspension — other Providers are unaffected. Distinct from Failed: Suspended is an environmental, self-clearing condition owned by the Provider, not a per-file outcome owned by the state store.
 _Avoid_: Paused (used informally above, but Suspended is the canonical term), rate-limited, blocked
 
 **Quota Exhausted**:
 The cause recorded for a Provider entering Suspended: it has used its full allotment of a rate-limited operation (e.g. OpenSubtitles' 24h download quota) and been told to wait until a reset time. Distinct from ordinary throttling (a 429/5xx response, handled by adaptive backoff on individual requests) — Quota Exhausted is a hard stop with a known-ish resume time, not a rate to slow down.
 _Avoid_: Rate limited, throttled
+
+**Unavailable**:
+The cause recorded for a Provider entering Suspended when it cannot be reached at all — e.g. a locally hosted speech-recognition service that is down or restarting — as opposed to reachable but out of quota. No Provider-reported resume time exists, so the conservative default applies. Distinct from a single failed request against a reachable Provider.
+_Avoid_: Down, offline
 
 **Trigger**:
 The mechanism by which a video file enters the pipeline's Pending state: an initial Library scan, a live fsnotify watch over the Library's tree, or a manual reprocess request. A Trigger only registers Found/Changed files and fans out Pending Sync Statuses for them — it never itself claims a (file, language) pair or calls a Provider; that's the Dispatcher's job.
@@ -57,7 +65,7 @@ The tool Sublime uses to perform Sync (e.g., alass). Swappable independently of 
 _Avoid_: Aligner, sync tool
 
 **Sync**:
-Actively re-timing a retrieved subtitle's timestamps to align with a video's actual audio, using audio-based alignment — not merely placing a file next to the video. Always performed, even after a successful hash match, since a claimed match can still be mistimed.
+Actively re-timing a retrieved subtitle's timestamps to align with a video's actual audio, using audio-based alignment — not merely placing a file next to the video. Always performed on a retrieved subtitle, even after a successful hash match, since a claimed match can still be mistimed; never performed on a Generated Subtitle, whose timing is already derived from the video's own audio.
 _Avoid_: Match, align (as a standalone term — use Sync)
 
 **Sync Status**:
@@ -89,7 +97,7 @@ The Sync Status of a (file, language) pair whose subtitle is up to date with the
 _Avoid_: Done, complete
 
 **Failed** (Sync Status):
-The Sync Status of a (file, language) pair whose most recent attempt did not produce a Synced subtitle, paired with a failure reason (no candidate cleared the scoring cutoff, retrieval failed, Sync failed, an implausible Candidate, an implausible Sync, or an internal error). Not retried until a Changed event resets it.
+The Sync Status of a (file, language) pair whose most recent attempt did not produce a Synced subtitle, paired with a failure reason (no candidate cleared the scoring cutoff, or no Provider in the chain could supply a subtitle at all; retrieval failed, Sync failed, an implausible Candidate, an implausible Sync, or an internal error). Not retried until a Changed event resets it.
 _Avoid_: Error, broken
 
 **Implausible Candidate** (Failed reason: `implausible_candidate`):
