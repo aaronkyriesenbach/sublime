@@ -41,6 +41,24 @@ type token struct {
 	End   float64 `json:"end"`
 }
 
+// withWordsAtSegmentStart returns the segment with its token times shifted
+// so the first token starts where the segment does. With --vad whisper.cpp
+// maps segment times back to the original timeline but leaves token times
+// on the shortened one (whisper.cpp#3174), so only the spacing between a
+// segment's tokens can be trusted, not their position.
+func (s segment) withWordsAtSegmentStart() segment {
+	if len(s.Words) == 0 {
+		return s
+	}
+	shift := s.Start - s.Words[0].Start
+	words := make([]token, len(s.Words))
+	for i, w := range s.Words {
+		words[i] = token{Text: w.Text, Start: w.Start + shift, End: w.End + shift}
+	}
+	s.Words = words
+	return s
+}
+
 // sidecarError is a non-2xx answer from the sidecar. Receiving one proves
 // the sidecar is reachable, so it is a request failure, never an outage.
 type sidecarError struct {
@@ -74,6 +92,9 @@ func (c *client) transcribe(ctx context.Context, audio []byte, languageCode stri
 		"response_format": "verbose_json",
 		"language":        languageCode,
 		"translate":       "false",
+		// Without it a server running --vad answers a chunk with no speech
+		// with a 500 instead of an empty transcript.
+		"no_language_probabilities": "true",
 	}
 	if temperature > 0 {
 		fields["temperature"] = strconv.FormatFloat(temperature, 'f', -1, 64)
@@ -81,6 +102,9 @@ func (c *client) transcribe(ctx context.Context, audio []byte, languageCode stri
 	parsed, err := c.inference(ctx, audio, fields)
 	if err != nil {
 		return nil, err
+	}
+	for i := range parsed.Segments {
+		parsed.Segments[i] = parsed.Segments[i].withWordsAtSegmentStart()
 	}
 	return parsed.Segments, nil
 }

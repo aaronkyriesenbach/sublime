@@ -522,6 +522,7 @@ func TestSearch_DetectionResponseShapes(t *testing.T) {
 		{name: "detected_language code", body: `{"detected_language":"en","detected_language_probability":0.97}`, want: true},
 		{name: "language full name", body: `{"language":"english"}`, want: true},
 		{name: "detected_language full name", body: `{"detected_language":"English"}`, want: true},
+		{name: "real server shape", body: `{"text":"","language":"english"}`, want: true},
 		{name: "other full name", body: `{"detected_language":"japanese","language":"ja"}`, want: false},
 	}
 	for _, tc := range tests {
