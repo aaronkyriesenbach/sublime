@@ -114,10 +114,11 @@ func (p *Pipeline) markFailed(
 	videoPath string,
 	lang language.Tag,
 	fileID int64,
+	expectedHash string,
 	reason domain.FailureReason,
 	cause error,
 ) error {
-	if err := p.Store.MarkFailed(ctx, fileID, lang, reason); err != nil {
+	if err := p.Store.MarkFailed(ctx, fileID, expectedHash, lang, reason); err != nil {
 		return err
 	}
 	p.logStatusChange(ctx, lib, videoPath, lang, domain.StatusInProgress, domain.StatusFailed, reason, cause)
@@ -138,8 +139,9 @@ func (p *Pipeline) markPending(
 	videoPath string,
 	lang language.Tag,
 	fileID int64,
+	expectedHash string,
 ) error {
-	if err := p.Store.ResetLanguageToPending(ctx, fileID, lang); err != nil {
+	if err := p.Store.ResetLanguageToPending(ctx, fileID, expectedHash, lang); err != nil {
 		return err
 	}
 	p.logStatusChange(ctx, lib, videoPath, lang, domain.StatusInProgress, domain.StatusPending, domain.FailureNone, nil)
@@ -191,7 +193,9 @@ type ProcessOutcome int
 const (
 	// OutcomeSynced means a new sidecar was written.
 	OutcomeSynced ProcessOutcome = iota
-	// OutcomeSkipped means a valid Marker already existed or the claim was lost.
+	// OutcomeSkipped means a valid Marker already existed, the claim was
+	// lost, or the result was discarded because the file's Content Hash
+	// changed while the pair was being processed (the pair is Pending again).
 	OutcomeSkipped
 	// OutcomeNoCandidateMiss means Search found no Candidate clearing the
 	// scoring cutoff. The pair has been reset to Pending via
@@ -512,7 +516,24 @@ func (p *Pipeline) registerFile(ctx context.Context, lib domain.Library, videoPa
 // docs/adr/0004-decouple-trigger-and-dispatcher.md.
 func (p *Pipeline) ProcessPending(ctx context.Context, lib domain.Library, fileID int64, contentHash, videoPath string, lang language.Tag, force bool, providerName string) ProcessResult {
 	file := domain.File{ID: fileID, LibraryName: lib.Name, Path: videoPath, ContentHash: contentHash}
-	return p.processFile(ctx, lib, file, videoPath, lang, force, providerName)
+	result := p.processFile(ctx, lib, file, videoPath, lang, force, providerName)
+
+	// A store write fenced on the Content Hash failed because a Changed event
+	// reset the pair mid-flight; the pair is already Pending for the new
+	// content, so the stale outcome is dropped rather than reported as a
+	// processing failure.
+	var stale *store.StaleContentHashError
+	if errors.As(result.Err, &stale) {
+		p.logger().Warn("discarding stale result: content hash changed while processing",
+			"library", lib.Name,
+			"path", videoPath,
+			"language", lang.String(),
+			"expected_hash", stale.Expected,
+			"current_hash", stale.Current,
+		)
+		return ProcessResult{Outcome: OutcomeSkipped}
+	}
+	return result
 }
 
 // processFile handles a single (video, language) pair: gate check, search,
@@ -541,7 +562,7 @@ func (p *Pipeline) processFile(
 			return ProcessResult{Outcome: OutcomeFailed, Err: fmt.Errorf("checking marker gate: %w", err)}
 		}
 		if !needsFetch {
-			if err := p.Store.MarkSynced(ctx, file.ID, lang); err != nil {
+			if err := p.Store.MarkSynced(ctx, file.ID, string(hash), lang); err != nil {
 				p.logger().Error("marking already-synced file failed", "library", lib.Name, "path", videoPath, "language", lang.String(), "error", err)
 				return ProcessResult{Outcome: OutcomeFailed, Err: fmt.Errorf("marking already-synced file: %w", err)}
 			}
@@ -569,12 +590,12 @@ func (p *Pipeline) processFile(
 	if err != nil {
 		var quotaErr *provider.QuotaExhaustedError
 		if errors.As(err, &quotaErr) {
-			if pendingErr := p.markPending(ctx, lib, videoPath, lang, file.ID); pendingErr != nil {
+			if pendingErr := p.markPending(ctx, lib, videoPath, lang, file.ID, string(hash)); pendingErr != nil {
 				return ProcessResult{Outcome: OutcomeFailed, Err: errors.Join(err, pendingErr)}
 			}
 			return ProcessResult{Outcome: OutcomePending}
 		}
-		if markErr := p.markFailed(ctx, lib, videoPath, lang, file.ID, domain.FailureRetrievalFailed, err); markErr != nil {
+		if markErr := p.markFailed(ctx, lib, videoPath, lang, file.ID, string(hash), domain.FailureRetrievalFailed, err); markErr != nil {
 			return ProcessResult{Outcome: OutcomeFailed, Err: errors.Join(err, markErr)}
 		}
 		return ProcessResult{Outcome: OutcomeFailed, Err: fmt.Errorf("searching provider: %w", err)}
@@ -583,7 +604,7 @@ func (p *Pipeline) processFile(
 
 	info, parseErr := scoring.Parse(filepath.Base(videoPath))
 	if parseErr != nil {
-		if markErr := p.markFailed(ctx, lib, videoPath, lang, file.ID, domain.FailureInternalError, parseErr); markErr != nil {
+		if markErr := p.markFailed(ctx, lib, videoPath, lang, file.ID, string(hash), domain.FailureInternalError, parseErr); markErr != nil {
 			return ProcessResult{Outcome: OutcomeFailed, Err: errors.Join(parseErr, markErr)}
 		}
 		return ProcessResult{Outcome: OutcomeFailed, Err: fmt.Errorf("parsing video filename: %w", parseErr)}
@@ -596,7 +617,7 @@ func (p *Pipeline) processFile(
 				"top_title", topMiss.Title, "top_year", topMiss.Year, "top_season", topMiss.Season, "top_episode", topMiss.Episode,
 				"score", score, "cutoff", cutoff)
 		}
-		if err := p.Store.RecordProviderMiss(ctx, file.ID, lang, providerName); err != nil {
+		if err := p.Store.RecordProviderMiss(ctx, file.ID, string(hash), lang, providerName); err != nil {
 			return ProcessResult{Outcome: OutcomeFailed, Err: fmt.Errorf("recording provider miss: %w", err)}
 		}
 		p.logStatusChange(ctx, lib, videoPath, lang, domain.StatusInProgress, domain.StatusPending, domain.FailureNone, nil)
@@ -607,12 +628,12 @@ func (p *Pipeline) processFile(
 	if err != nil {
 		var quotaErr *provider.QuotaExhaustedError
 		if errors.As(err, &quotaErr) {
-			if pendingErr := p.markPending(ctx, lib, videoPath, lang, file.ID); pendingErr != nil {
+			if pendingErr := p.markPending(ctx, lib, videoPath, lang, file.ID, string(hash)); pendingErr != nil {
 				return ProcessResult{Outcome: OutcomeFailed, Err: errors.Join(err, pendingErr)}
 			}
 			return ProcessResult{Outcome: OutcomePending}
 		}
-		if markErr := p.markFailed(ctx, lib, videoPath, lang, file.ID, domain.FailureRetrievalFailed, err); markErr != nil {
+		if markErr := p.markFailed(ctx, lib, videoPath, lang, file.ID, string(hash), domain.FailureRetrievalFailed, err); markErr != nil {
 			return ProcessResult{Outcome: OutcomeFailed, Err: errors.Join(err, markErr)}
 		}
 		return ProcessResult{Outcome: OutcomeFailed, Err: fmt.Errorf("downloading candidate: %w", err)}
@@ -622,7 +643,7 @@ func (p *Pipeline) processFile(
 	if !p.skipsSync() {
 		syncedContent, err = p.syncSubtitle(ctx, videoPath, subtitleContent)
 		if err != nil {
-			if markErr := p.markFailed(ctx, lib, videoPath, lang, file.ID, domain.FailureSyncFailed, err); markErr != nil {
+			if markErr := p.markFailed(ctx, lib, videoPath, lang, file.ID, string(hash), domain.FailureSyncFailed, err); markErr != nil {
 				return ProcessResult{Outcome: OutcomeFailed, Err: errors.Join(err, markErr)}
 			}
 			return ProcessResult{Outcome: OutcomeFailed, Err: fmt.Errorf("syncing subtitle: %w", err)}
@@ -633,7 +654,7 @@ func (p *Pipeline) processFile(
 	codec, ok := marker.CodecFor(sidecarExt)
 	if !ok {
 		noCodecErr := fmt.Errorf("no marker codec for %s", sidecarExt)
-		if markErr := p.markFailed(ctx, lib, videoPath, lang, file.ID, domain.FailureInternalError, noCodecErr); markErr != nil {
+		if markErr := p.markFailed(ctx, lib, videoPath, lang, file.ID, string(hash), domain.FailureInternalError, noCodecErr); markErr != nil {
 			return ProcessResult{Outcome: OutcomeFailed, Err: markErr}
 		}
 		return ProcessResult{Outcome: OutcomeFailed, Err: noCodecErr}
@@ -641,7 +662,7 @@ func (p *Pipeline) processFile(
 
 	removedStreams, err := p.Stripper.StripEmbedded(ctx, videoPath, lib.StripScope, lang)
 	if err != nil {
-		if markErr := p.markFailed(ctx, lib, videoPath, lang, file.ID, domain.FailureInternalError, err); markErr != nil {
+		if markErr := p.markFailed(ctx, lib, videoPath, lang, file.ID, string(hash), domain.FailureInternalError, err); markErr != nil {
 			return ProcessResult{Outcome: OutcomeFailed, Err: errors.Join(err, markErr)}
 		}
 		return ProcessResult{Outcome: OutcomeFailed, Err: fmt.Errorf("stripping embedded streams: %w", err)}
@@ -652,34 +673,37 @@ func (p *Pipeline) processFile(
 	if len(removedStreams) > 0 {
 		correctedHash, err := media.ComputeContentHash(videoPath)
 		if err != nil {
-			if markErr := p.markFailed(ctx, lib, videoPath, lang, file.ID, domain.FailureInternalError, err); markErr != nil {
+			if markErr := p.markFailed(ctx, lib, videoPath, lang, file.ID, string(hash), domain.FailureInternalError, err); markErr != nil {
 				return ProcessResult{Outcome: OutcomeFailed, Err: errors.Join(err, markErr)}
 			}
 			return ProcessResult{Outcome: OutcomeFailed, Err: fmt.Errorf("recomputing content hash after strip: %w", err)}
 		}
-		hash = correctedHash
 
-		if err := p.Store.UpdateContentHash(ctx, file.ID, string(hash)); err != nil {
+		// The fence moves to the post-Strip hash only once the store accepts
+		// it: that is how a hash this worker changed itself is told apart
+		// from one changed by someone else.
+		if err := p.Store.UpdateContentHash(ctx, file.ID, string(hash), string(correctedHash)); err != nil {
 			return ProcessResult{Outcome: OutcomeFailed, Err: fmt.Errorf("recording corrected content hash: %w", err)}
 		}
+		hash = correctedHash
 	}
 
 	markedContent, err := codec.Write(syncedContent, marker.Marker{ContentHash: hash})
 	if err != nil {
-		if markErr := p.markFailed(ctx, lib, videoPath, lang, file.ID, domain.FailureInternalError, err); markErr != nil {
+		if markErr := p.markFailed(ctx, lib, videoPath, lang, file.ID, string(hash), domain.FailureInternalError, err); markErr != nil {
 			return ProcessResult{Outcome: OutcomeFailed, Err: errors.Join(err, markErr)}
 		}
 		return ProcessResult{Outcome: OutcomeFailed, Err: fmt.Errorf("embedding marker: %w", err)}
 	}
 
 	if _, err := p.Stripper.Swap(ctx, videoPath, lang, lib.StripScope, hash, sidecarExt, markedContent); err != nil {
-		if markErr := p.markFailed(ctx, lib, videoPath, lang, file.ID, domain.FailureInternalError, err); markErr != nil {
+		if markErr := p.markFailed(ctx, lib, videoPath, lang, file.ID, string(hash), domain.FailureInternalError, err); markErr != nil {
 			return ProcessResult{Outcome: OutcomeFailed, Err: errors.Join(err, markErr)}
 		}
 		return ProcessResult{Outcome: OutcomeFailed, Err: fmt.Errorf("swapping sidecar: %w", err)}
 	}
 
-	if err := p.Store.MarkSynced(ctx, file.ID, lang); err != nil {
+	if err := p.Store.MarkSynced(ctx, file.ID, string(hash), lang); err != nil {
 		p.logger().Error("marking synced failed", "library", lib.Name, "path", videoPath, "language", lang.String(), "error", err)
 		return ProcessResult{Outcome: OutcomeFailed, Err: fmt.Errorf("marking synced: %w", err)}
 	}

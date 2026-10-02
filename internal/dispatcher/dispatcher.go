@@ -257,10 +257,7 @@ func (d *Dispatcher) runOnceLegacyMode(ctx context.Context, pairs []store.Pendin
 			// A no-candidate miss here is terminal (single provider = exhausted).
 			result := d.Pipeline.ProcessPending(ctx, lib, pair.FileID, pair.ContentHash, pair.Path, pair.Language, pair.Force, "default")
 			if result.Outcome == pipeline.OutcomeNoCandidateMiss {
-				if err := d.Store.MarkFailed(ctx, pair.FileID, pair.Language, domain.FailureNoCandidate); err != nil {
-					d.logger().Error("dispatcher: marking failed after provider exhaustion",
-						"library", lib.Name, "path", pair.Path, "language", pair.Language.String(), "error", err)
-				}
+				d.markNoCandidate(ctx, lib, pair)
 			} else if result.Err != nil {
 				d.logger().Error("dispatcher: processing pending pair failed",
 					"library", lib.Name, "path", pair.Path, "language", pair.Language.String(), "error", result.Err)
@@ -324,10 +321,7 @@ func (d *Dispatcher) runOnceChainMode(ctx context.Context, pairs []store.Pending
 					result := p.ProcessPending(ctx, lib, pair.FileID, pair.ContentHash, pair.Path, pair.Language, pair.Force, name)
 					if result.Outcome == pipeline.OutcomeNoCandidateMiss {
 						if d.allProvidersAttempted(ctx, pair.FileID, pair.Language) {
-							if err := d.Store.MarkFailed(ctx, pair.FileID, pair.Language, domain.FailureNoCandidate); err != nil {
-								d.logger().Error("dispatcher: marking failed after provider exhaustion",
-									"library", lib.Name, "path", pair.Path, "language", pair.Language.String(), "error", err)
-							}
+							d.markNoCandidate(ctx, lib, pair)
 						}
 					} else if result.Err != nil {
 						d.logger().Error("dispatcher: processing pending pair failed",
@@ -456,10 +450,7 @@ pairLoop:
 						result := p.ProcessPending(ctx, lib, pair.FileID, pair.ContentHash, pair.Path, pair.Language, pair.Force, name)
 						if result.Outcome == pipeline.OutcomeNoCandidateMiss {
 							if d.allProvidersAttempted(ctx, pair.FileID, pair.Language) {
-								if err := d.Store.MarkFailed(ctx, pair.FileID, pair.Language, domain.FailureNoCandidate); err != nil {
-									d.logger().Error("dispatcher: marking failed after provider exhaustion",
-										"library", lib.Name, "path", pair.Path, "language", pair.Language.String(), "error", err)
-								}
+								d.markNoCandidate(ctx, lib, pair)
 							}
 						} else if result.Err != nil {
 							d.logger().Error("dispatcher: processing pending pair failed",
@@ -480,6 +471,23 @@ pairLoop:
 
 	wg.Wait()
 	return ctx.Err()
+}
+
+// markNoCandidate lands pair on Failed(no_candidate) after every Provider has
+// missed. The write is fenced on the Content Hash the pair was claimed with, so
+// a Changed event during the pass leaves the fresh Pending row alone.
+func (d *Dispatcher) markNoCandidate(ctx context.Context, lib domain.Library, pair store.PendingPair) {
+	err := d.Store.MarkFailed(ctx, pair.FileID, pair.ContentHash, pair.Language, domain.FailureNoCandidate)
+	var stale *store.StaleContentHashError
+	switch {
+	case errors.As(err, &stale):
+		d.logger().Warn("dispatcher: discarding stale no_candidate result: content hash changed while processing",
+			"library", lib.Name, "path", pair.Path, "language", pair.Language.String(),
+			"expected_hash", stale.Expected, "current_hash", stale.Current)
+	case err != nil:
+		d.logger().Error("dispatcher: marking failed after provider exhaustion",
+			"library", lib.Name, "path", pair.Path, "language", pair.Language.String(), "error", err)
+	}
 }
 
 // Run wraps RunOnce in a fixed polling-interval loop: it runs one pass

@@ -83,7 +83,7 @@ func dispatchPending(t *testing.T, ctx context.Context, p *pipeline.Pipeline, st
 		// For single-provider tests, a no-candidate miss means exhaustion:
 		// mark failed and log through p.Logger to match real Dispatcher behavior.
 		if result.Outcome == pipeline.OutcomeNoCandidateMiss {
-			if err := st.MarkFailed(ctx, pair.FileID, pair.Language, domain.FailureNoCandidate); err != nil {
+			if err := st.MarkFailed(ctx, pair.FileID, pair.ContentHash, pair.Language, domain.FailureNoCandidate); err != nil {
 				t.Fatalf("MarkFailed: %v", err)
 			}
 			if p.Logger != nil {

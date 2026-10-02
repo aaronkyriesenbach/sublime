@@ -90,7 +90,7 @@ func TestLibraries_ReflectsStoreCounts(t *testing.T) {
 	if err := st.EnsureLanguage(ctx, f.ID, en); err != nil {
 		t.Fatalf("EnsureLanguage: %v", err)
 	}
-	if err := st.MarkSynced(ctx, f.ID, en); err != nil {
+	if err := st.MarkSynced(ctx, f.ID, f.ContentHash, en); err != nil {
 		t.Fatalf("MarkSynced: %v", err)
 	}
 

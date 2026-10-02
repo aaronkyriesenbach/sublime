@@ -1544,3 +1544,64 @@ func TestDispatcher_ChainOfNeverSyncedAndOrdinaryFullMissLandsOnNoCandidate(t *t
 		t.Fatalf("state = %v/%v, want Failed/no_candidate", state.Status, state.FailureReason)
 	}
 }
+
+// TestDispatcher_ChangedEventDuringProcessingLeavesPairPending guards that a
+// Changed event arriving while a worker is mid-pair isn't overwritten by the
+// pass's no_candidate landing, which was computed against the old content.
+func TestDispatcher_ChangedEventDuringProcessingLeavesPairPending(t *testing.T) {
+	libDir := t.TempDir()
+	videoPath := filepath.Join(libDir, "Test.Movie.2024.HDTV.x264-FAKEGROUP.mp4")
+	if err := os.WriteFile(videoPath, []byte("original video bytes"), 0o644); err != nil {
+		t.Fatalf("writing video: %v", err)
+	}
+
+	st := openTestStore(t)
+	lib := domain.Library{
+		Name:       "test-library",
+		Path:       libDir,
+		Languages:  []language.Tag{language.English},
+		StripScope: domain.StripScopeAll,
+	}
+
+	ctx := context.Background()
+	var p *pipeline.Pipeline
+	p = &pipeline.Pipeline{
+		Store: st,
+		Provider: &provider.Fake{
+			SearchFunc: func(context.Context, provider.Query) ([]domain.Candidate, error) {
+				if err := os.WriteFile(videoPath, []byte("replaced video bytes, different length"), 0o644); err != nil {
+					t.Errorf("replacing video: %v", err)
+				}
+				if _, err := p.RunFile(ctx, lib, videoPath); err != nil {
+					t.Errorf("RunFile for Changed event: %v", err)
+				}
+				return nil, nil
+			},
+		},
+		SyncEngine: &syncengine.FakeSyncEngine{},
+		Stripper:   &pipeline.FakeStripper{},
+	}
+	if _, err := p.Run(ctx, lib); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	d := &dispatcher.Dispatcher{
+		ProviderTiers: []dispatcher.ProviderTier{{
+			Providers: []dispatcher.ProviderEntry{{Name: "provider", Pipeline: p, WorkerCount: 1}},
+		}},
+		Store:     st,
+		Libraries: []domain.Library{lib},
+	}
+	if err := d.RunOnce(ctx); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+
+	file, found, err := st.GetFile(ctx, lib.Name, videoPath)
+	if err != nil || !found {
+		t.Fatalf("GetFile: found=%v err=%v", found, err)
+	}
+	state := file.Languages[0]
+	if state.Status != domain.StatusPending || state.FailureReason != domain.FailureNone || len(state.Attempted) != 0 {
+		t.Errorf("language state = %+v, want the fresh Pending row left intact", state)
+	}
+}

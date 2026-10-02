@@ -38,7 +38,7 @@ func TestStatus_UnscopedReturnsAllLibrarySummariesOnly(t *testing.T) {
 	if err := st.EnsureLanguage(ctx, f.ID, en); err != nil {
 		t.Fatalf("EnsureLanguage: %v", err)
 	}
-	if err := st.MarkFailed(ctx, f.ID, en, domain.FailureNoCandidate); err != nil {
+	if err := st.MarkFailed(ctx, f.ID, f.ContentHash, en, domain.FailureNoCandidate); err != nil {
 		t.Fatalf("MarkFailed: %v", err)
 	}
 
@@ -131,7 +131,7 @@ func TestStatus_ScopedByLibraryDefaultsToPendingAndFailed(t *testing.T) {
 	if err := st.EnsureLanguage(ctx, synced.ID, en); err != nil {
 		t.Fatalf("EnsureLanguage: %v", err)
 	}
-	if err := st.MarkSynced(ctx, synced.ID, en); err != nil {
+	if err := st.MarkSynced(ctx, synced.ID, synced.ContentHash, en); err != nil {
 		t.Fatalf("MarkSynced: %v", err)
 	}
 
@@ -142,7 +142,7 @@ func TestStatus_ScopedByLibraryDefaultsToPendingAndFailed(t *testing.T) {
 	if err := st.EnsureLanguage(ctx, failed.ID, en); err != nil {
 		t.Fatalf("EnsureLanguage: %v", err)
 	}
-	if err := st.MarkFailed(ctx, failed.ID, en, domain.FailureSyncFailed); err != nil {
+	if err := st.MarkFailed(ctx, failed.ID, failed.ContentHash, en, domain.FailureSyncFailed); err != nil {
 		t.Fatalf("MarkFailed: %v", err)
 	}
 
@@ -230,7 +230,7 @@ func TestStatus_LanguageStateSurfacesAttemptedProviders(t *testing.T) {
 	if err := st.EnsureLanguage(ctx, file.ID, en); err != nil {
 		t.Fatalf("EnsureLanguage: %v", err)
 	}
-	if err := st.RecordProviderMiss(ctx, file.ID, en, "opensubtitles"); err != nil {
+	if err := st.RecordProviderMiss(ctx, file.ID, file.ContentHash, en, "opensubtitles"); err != nil {
 		t.Fatalf("RecordProviderMiss: %v", err)
 	}
 
@@ -270,7 +270,7 @@ func TestStatus_StateAllIncludesSyncedFiles(t *testing.T) {
 	if err := st.EnsureLanguage(ctx, synced.ID, en); err != nil {
 		t.Fatalf("EnsureLanguage: %v", err)
 	}
-	if err := st.MarkSynced(ctx, synced.ID, en); err != nil {
+	if err := st.MarkSynced(ctx, synced.ID, synced.ContentHash, en); err != nil {
 		t.Fatalf("MarkSynced: %v", err)
 	}
 
