@@ -120,6 +120,25 @@ func TestDownload_AsksSidecarForNoLanguageProbabilities(t *testing.T) {
 	}
 }
 
+func TestDownload_AsksSidecarNotToCarryTextContextBetweenWindows(t *testing.T) {
+	server := newFakeWhisperServer(t, sampleResponse(t))
+	p := newProvider(t, server, longVideo(at(5, 0)), nil)
+
+	if _, err := download(t, p); err != nil {
+		t.Fatalf("Download: %v", err)
+	}
+
+	reqs := server.Requests()
+	if len(reqs) == 0 {
+		t.Fatal("sidecar saw no requests")
+	}
+	for i, req := range reqs {
+		if got := req.Fields["max_context"]; got != "0" {
+			t.Errorf("request %d max_context = %q, want %q so one hallucination cannot repeat across windows", i+1, got, "0")
+		}
+	}
+}
+
 func TestDownload_SpeechlessChunkAnsweredWithEmptySegmentsIsNotAFailure(t *testing.T) {
 	audio := longVideo(at(25, 0))
 	server := newFakeWhisperServer(t, nil)

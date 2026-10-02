@@ -95,6 +95,11 @@ func (c *client) transcribe(ctx context.Context, audio []byte, languageCode stri
 		// Without it a server running --vad answers a chunk with no speech
 		// with a 500 instead of an empty transcript.
 		"no_language_probabilities": "true",
+		// Carrying text from one 30 s window into the next lets a single
+		// hallucination ("The End" over music) repeat for the rest of the
+		// chunk. On real TV audio this took recall from 0.56 to 0.88 on a
+		// chunk that otherwise looped 369 times.
+		"max_context": "0",
 	}
 	if temperature > 0 {
 		fields["temperature"] = strconv.FormatFloat(temperature, 'f', -1, 64)
