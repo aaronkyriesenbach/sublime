@@ -35,8 +35,10 @@ services:
     command:
       - |
         set -e
-        [ -f ggml-small-q5_1.bin ] || curl -fL -o ggml-small-q5_1.bin https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small-q5_1.bin
-        [ -f ggml-silero-v5.1.2.bin ] || curl -fL -o ggml-silero-v5.1.2.bin https://huggingface.co/ggml-org/whisper-vad/resolve/main/ggml-silero-v5.1.2.bin
+        [ -f ggml-small-q5_1.bin ] || curl -fL -o ggml-small-q5_1.bin \
+          https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small-q5_1.bin
+        [ -f ggml-silero-v5.1.2.bin ] || curl -fL -o ggml-silero-v5.1.2.bin \
+          https://huggingface.co/ggml-org/whisper-vad/resolve/main/ggml-silero-v5.1.2.bin
 
   whisper:
     profiles: [whisper]
@@ -61,8 +63,9 @@ services:
       # Without it a request with no speech (long credits) can fail with 500
       # when --vad is on.
       - -nlp
-      # Optional, about 25% faster and fewer repeated-line loops. Uncomment
-      # both lines to enable; see docs/whisper.md.
+      # Optional and off by default: several times faster, but it drops speech
+      # that sits under music or effects. Only for clean, speech-only audio;
+      # uncomment both lines to enable (see docs/whisper.md).
       # - --vad
       # - --vad-model
       # - /models/ggml-silero-v5.1.2.bin

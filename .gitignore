@@ -3,3 +3,8 @@
 *.test
 *.out
 .env
+/config.yaml
+/data/
+/whisper-models/
+/movies/
+/tv/
