@@ -94,7 +94,7 @@ func TestObserveFileContentHash_SameHashLeavesLanguageStatesUntouched(t *testing
 	if err := s.EnsureLanguage(ctx, file.ID, en); err != nil {
 		t.Fatalf("EnsureLanguage returned error: %v", err)
 	}
-	if err := s.MarkSynced(ctx, file.ID, en); err != nil {
+	if err := s.MarkSynced(ctx, file.ID, file.ContentHash, en); err != nil {
 		t.Fatalf("MarkSynced returned error: %v", err)
 	}
 
@@ -130,10 +130,10 @@ func TestObserveFileContentHash_HashChangeResetsLanguageStatesInPlace(t *testing
 	if err := s.EnsureLanguage(ctx, file.ID, pt); err != nil {
 		t.Fatalf("EnsureLanguage(pt-BR) returned error: %v", err)
 	}
-	if err := s.MarkSynced(ctx, file.ID, en); err != nil {
+	if err := s.MarkSynced(ctx, file.ID, file.ContentHash, en); err != nil {
 		t.Fatalf("MarkSynced returned error: %v", err)
 	}
-	if err := s.MarkFailed(ctx, file.ID, pt, domain.FailureNoCandidate); err != nil {
+	if err := s.MarkFailed(ctx, file.ID, file.ContentHash, pt, domain.FailureNoCandidate); err != nil {
 		t.Fatalf("MarkFailed returned error: %v", err)
 	}
 
@@ -242,10 +242,10 @@ func TestResetToPending_ResetsExistingLanguageStatesRegardlessOfContentHash(t *t
 	if err := s.EnsureLanguage(ctx, file.ID, pt); err != nil {
 		t.Fatalf("EnsureLanguage(pt-BR) returned error: %v", err)
 	}
-	if err := s.MarkSynced(ctx, file.ID, en); err != nil {
+	if err := s.MarkSynced(ctx, file.ID, file.ContentHash, en); err != nil {
 		t.Fatalf("MarkSynced returned error: %v", err)
 	}
-	if err := s.MarkFailed(ctx, file.ID, pt, domain.FailureNoCandidate); err != nil {
+	if err := s.MarkFailed(ctx, file.ID, file.ContentHash, pt, domain.FailureNoCandidate); err != nil {
 		t.Fatalf("MarkFailed returned error: %v", err)
 	}
 
@@ -291,16 +291,16 @@ func TestResetLanguageToPending_ResetsOnlyTheGivenLanguage(t *testing.T) {
 	if err := s.EnsureLanguage(ctx, file.ID, pt); err != nil {
 		t.Fatalf("EnsureLanguage(pt-BR) returned error: %v", err)
 	}
-	if err := s.MarkFailed(ctx, file.ID, en, domain.FailureRetrievalFailed); err != nil {
+	if err := s.MarkFailed(ctx, file.ID, file.ContentHash, en, domain.FailureRetrievalFailed); err != nil {
 		t.Fatalf("MarkFailed(en) returned error: %v", err)
 	}
-	if err := s.MarkSynced(ctx, file.ID, pt); err != nil {
+	if err := s.MarkSynced(ctx, file.ID, file.ContentHash, pt); err != nil {
 		t.Fatalf("MarkSynced(pt-BR) returned error: %v", err)
 	}
 
 	// A quota-exhausted attempt on one language shouldn't touch the state
 	// of the file's other, unrelated languages.
-	if err := s.ResetLanguageToPending(ctx, file.ID, en); err != nil {
+	if err := s.ResetLanguageToPending(ctx, file.ID, file.ContentHash, en); err != nil {
 		t.Fatalf("ResetLanguageToPending returned error: %v", err)
 	}
 
@@ -343,7 +343,7 @@ func TestResetLanguageToPending_UnknownLanguageState(t *testing.T) {
 		t.Fatalf("ObserveFileContentHash returned error: %v", err)
 	}
 
-	err = s.ResetLanguageToPending(ctx, file.ID, en)
+	err = s.ResetLanguageToPending(ctx, file.ID, file.ContentHash, en)
 	if !errors.Is(err, store.ErrLanguageStateNotFound) {
 		t.Fatalf("expected ErrLanguageStateNotFound, got %v", err)
 	}
@@ -374,11 +374,11 @@ func TestUpdateContentHash_LeavesLanguageStatesUntouched(t *testing.T) {
 	if err := s.EnsureLanguage(ctx, file.ID, en); err != nil {
 		t.Fatalf("EnsureLanguage returned error: %v", err)
 	}
-	if err := s.MarkSynced(ctx, file.ID, en); err != nil {
+	if err := s.MarkSynced(ctx, file.ID, file.ContentHash, en); err != nil {
 		t.Fatalf("MarkSynced returned error: %v", err)
 	}
 
-	if err := s.UpdateContentHash(ctx, file.ID, "hash-corrected"); err != nil {
+	if err := s.UpdateContentHash(ctx, file.ID, "hash-1", "hash-corrected"); err != nil {
 		t.Fatalf("UpdateContentHash returned error: %v", err)
 	}
 
@@ -404,9 +404,127 @@ func TestUpdateContentHash_UnknownFile(t *testing.T) {
 	s := openTestStore(t)
 	ctx := context.Background()
 
-	err := s.UpdateContentHash(ctx, 12345, "hash-1")
+	err := s.UpdateContentHash(ctx, 12345, "hash-1", "hash-2")
 	if !errors.Is(err, store.ErrFileNotFound) {
 		t.Errorf("expected ErrFileNotFound, got %v", err)
+	}
+}
+
+// inProgressThenChanged claims a (file, "en") pair at hash-old, then simulates
+// a Changed event observed while the worker is still processing it, returning
+// the file as the stale worker saw it.
+func inProgressThenChanged(t *testing.T, s *store.Store) domain.File {
+	t.Helper()
+	ctx := context.Background()
+	en := mustLang(t, "en")
+
+	stale, err := s.ObserveFileContentHash(ctx, "movies", "/media/movies/a.mkv", "hash-old")
+	if err != nil {
+		t.Fatalf("ObserveFileContentHash returned error: %v", err)
+	}
+	if err := s.EnsureLanguage(ctx, stale.ID, en); err != nil {
+		t.Fatalf("EnsureLanguage returned error: %v", err)
+	}
+	if err := s.MarkInProgress(ctx, stale.ID, en); err != nil {
+		t.Fatalf("MarkInProgress returned error: %v", err)
+	}
+	if _, err := s.ObserveFileContentHash(ctx, "movies", "/media/movies/a.mkv", "hash-new"); err != nil {
+		t.Fatalf("ObserveFileContentHash (changed) returned error: %v", err)
+	}
+	return stale
+}
+
+func TestFencedTerminalWrites_DiscardedAfterChangedEvent(t *testing.T) {
+	en := mustLang(t, "en")
+
+	writes := map[string]func(s *store.Store, f domain.File) error{
+		"MarkSynced": func(s *store.Store, f domain.File) error {
+			return s.MarkSynced(context.Background(), f.ID, f.ContentHash, en)
+		},
+		"MarkFailed": func(s *store.Store, f domain.File) error {
+			return s.MarkFailed(context.Background(), f.ID, f.ContentHash, en, domain.FailureSyncFailed)
+		},
+		"RecordProviderMiss": func(s *store.Store, f domain.File) error {
+			return s.RecordProviderMiss(context.Background(), f.ID, f.ContentHash, en, "opensubtitles")
+		},
+		"ResetLanguageToPending": func(s *store.Store, f domain.File) error {
+			return s.ResetLanguageToPending(context.Background(), f.ID, f.ContentHash, en)
+		},
+		"UpdateContentHash": func(s *store.Store, f domain.File) error {
+			return s.UpdateContentHash(context.Background(), f.ID, f.ContentHash, "hash-post-strip")
+		},
+	}
+
+	for name, write := range writes {
+		t.Run(name, func(t *testing.T) {
+			s := openTestStore(t)
+			ctx := context.Background()
+			stale := inProgressThenChanged(t, s)
+
+			err := write(s, stale)
+			var staleErr *store.StaleContentHashError
+			if !errors.As(err, &staleErr) {
+				t.Fatalf("expected *StaleContentHashError, got %v", err)
+			}
+			if !errors.Is(err, store.ErrStaleContentHash) {
+				t.Errorf("expected errors.Is(err, ErrStaleContentHash), got %v", err)
+			}
+			if staleErr.Expected != "hash-old" || staleErr.Current != "hash-new" {
+				t.Errorf("expected hashes hash-old/hash-new, got %q/%q", staleErr.Expected, staleErr.Current)
+			}
+
+			got, ok, err := s.GetFile(ctx, "movies", "/media/movies/a.mkv")
+			if err != nil || !ok {
+				t.Fatalf("GetFile: ok=%v err=%v", ok, err)
+			}
+			if got.ContentHash != "hash-new" {
+				t.Errorf("expected content hash to stay %q, got %q", "hash-new", got.ContentHash)
+			}
+			state := got.Languages[0]
+			if state.Status != domain.StatusPending || state.FailureReason != domain.FailureNone || len(state.Attempted) != 0 {
+				t.Errorf("expected untouched fresh Pending row, got %+v", state)
+			}
+		})
+	}
+}
+
+func TestFencedTerminalWrites_LandWhenHashStillMatches(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	en := mustLang(t, "en")
+
+	file, err := s.ObserveFileContentHash(ctx, "movies", "/media/movies/a.mkv", "hash-1")
+	if err != nil {
+		t.Fatalf("ObserveFileContentHash returned error: %v", err)
+	}
+	if err := s.EnsureLanguage(ctx, file.ID, en); err != nil {
+		t.Fatalf("EnsureLanguage returned error: %v", err)
+	}
+	if err := s.MarkInProgress(ctx, file.ID, en); err != nil {
+		t.Fatalf("MarkInProgress returned error: %v", err)
+	}
+
+	// A worker that changes the hash itself (Strip) keeps ownership by
+	// passing the hash it just recorded to its later terminal write.
+	if err := s.UpdateContentHash(ctx, file.ID, "hash-1", "hash-post-strip"); err != nil {
+		t.Fatalf("UpdateContentHash returned error: %v", err)
+	}
+	if err := s.MarkSynced(ctx, file.ID, "hash-post-strip", en); err != nil {
+		t.Fatalf("MarkSynced with the worker's own post-Strip hash returned error: %v", err)
+	}
+
+	got, _, err := s.GetFile(ctx, "movies", "/media/movies/a.mkv")
+	if err != nil {
+		t.Fatalf("GetFile returned error: %v", err)
+	}
+	if got.Languages[0].Status != domain.StatusSynced {
+		t.Errorf("expected %q, got %q", domain.StatusSynced, got.Languages[0].Status)
+	}
+
+	// The pre-Strip hash no longer identifies this worker's work.
+	err = s.MarkFailed(ctx, file.ID, "hash-1", en, domain.FailureSyncFailed)
+	if !errors.Is(err, store.ErrStaleContentHash) {
+		t.Errorf("expected ErrStaleContentHash for the pre-Strip hash, got %v", err)
 	}
 }
 
@@ -453,7 +571,7 @@ func TestEnsureLanguage_DoesNotOverwriteExistingStatus(t *testing.T) {
 	if err := s.EnsureLanguage(ctx, file.ID, en); err != nil {
 		t.Fatalf("EnsureLanguage returned error: %v", err)
 	}
-	if err := s.MarkSynced(ctx, file.ID, en); err != nil {
+	if err := s.MarkSynced(ctx, file.ID, file.ContentHash, en); err != nil {
 		t.Fatalf("MarkSynced returned error: %v", err)
 	}
 
@@ -504,19 +622,19 @@ func TestStatusTransitions_PendingToSyncedToFailedToPending(t *testing.T) {
 	assertState(domain.StatusPending, domain.FailureNone)
 
 	// pending -> synced
-	if err := s.MarkSynced(ctx, file.ID, en); err != nil {
+	if err := s.MarkSynced(ctx, file.ID, file.ContentHash, en); err != nil {
 		t.Fatalf("MarkSynced returned error: %v", err)
 	}
 	assertState(domain.StatusSynced, domain.FailureNone)
 
 	// synced -> failed
-	if err := s.MarkFailed(ctx, file.ID, en, domain.FailureSyncFailed); err != nil {
+	if err := s.MarkFailed(ctx, file.ID, file.ContentHash, en, domain.FailureSyncFailed); err != nil {
 		t.Fatalf("MarkFailed returned error: %v", err)
 	}
 	assertState(domain.StatusFailed, domain.FailureSyncFailed)
 
 	// failed -> synced (a retry outside this store succeeded)
-	if err := s.MarkSynced(ctx, file.ID, en); err != nil {
+	if err := s.MarkSynced(ctx, file.ID, file.ContentHash, en); err != nil {
 		t.Fatalf("second MarkSynced returned error: %v", err)
 	}
 	assertState(domain.StatusSynced, domain.FailureNone)
@@ -538,7 +656,7 @@ func TestMarkSynced_UnknownLanguageState(t *testing.T) {
 		t.Fatalf("ObserveFileContentHash returned error: %v", err)
 	}
 
-	err = s.MarkSynced(ctx, file.ID, en)
+	err = s.MarkSynced(ctx, file.ID, file.ContentHash, en)
 	if !errors.Is(err, store.ErrLanguageStateNotFound) {
 		t.Fatalf("expected ErrLanguageStateNotFound, got %v", err)
 	}
@@ -554,7 +672,7 @@ func TestMarkFailed_UnknownLanguageState(t *testing.T) {
 		t.Fatalf("ObserveFileContentHash returned error: %v", err)
 	}
 
-	err = s.MarkFailed(ctx, file.ID, en, domain.FailureNoCandidate)
+	err = s.MarkFailed(ctx, file.ID, file.ContentHash, en, domain.FailureNoCandidate)
 	if !errors.Is(err, store.ErrLanguageStateNotFound) {
 		t.Fatalf("expected ErrLanguageStateNotFound, got %v", err)
 	}
@@ -573,10 +691,10 @@ func TestMarkFailed_RejectsInvalidReason(t *testing.T) {
 		t.Fatalf("EnsureLanguage returned error: %v", err)
 	}
 
-	if err := s.MarkFailed(ctx, file.ID, en, domain.FailureReason("not_a_real_reason")); err == nil {
+	if err := s.MarkFailed(ctx, file.ID, file.ContentHash, en, domain.FailureReason("not_a_real_reason")); err == nil {
 		t.Fatal("expected an error for an unrecognized failure reason, got nil")
 	}
-	if err := s.MarkFailed(ctx, file.ID, en, domain.FailureNone); err == nil {
+	if err := s.MarkFailed(ctx, file.ID, file.ContentHash, en, domain.FailureNone); err == nil {
 		t.Fatal("expected an error when passing FailureNone to MarkFailed, got nil")
 	}
 }
@@ -610,7 +728,7 @@ func TestMarkInProgress_TransitionsFromPendingAndBackToSyncedOrFailed(t *testing
 	}
 
 	// in_progress -> synced
-	if err := s.MarkSynced(ctx, file.ID, en); err != nil {
+	if err := s.MarkSynced(ctx, file.ID, file.ContentHash, en); err != nil {
 		t.Fatalf("MarkSynced returned error: %v", err)
 	}
 	got, _, err = s.GetFile(ctx, "movies", "/media/movies/a.mkv")
@@ -622,13 +740,13 @@ func TestMarkInProgress_TransitionsFromPendingAndBackToSyncedOrFailed(t *testing
 	}
 
 	// back to pending, then in_progress, then to failed
-	if err := s.ResetLanguageToPending(ctx, file.ID, en); err != nil {
+	if err := s.ResetLanguageToPending(ctx, file.ID, file.ContentHash, en); err != nil {
 		t.Fatalf("ResetLanguageToPending returned error: %v", err)
 	}
 	if err := s.MarkInProgress(ctx, file.ID, en); err != nil {
 		t.Fatalf("second MarkInProgress returned error: %v", err)
 	}
-	if err := s.MarkFailed(ctx, file.ID, en, domain.FailureRetrievalFailed); err != nil {
+	if err := s.MarkFailed(ctx, file.ID, file.ContentHash, en, domain.FailureRetrievalFailed); err != nil {
 		t.Fatalf("MarkFailed returned error: %v", err)
 	}
 	got, _, err = s.GetFile(ctx, "movies", "/media/movies/a.mkv")
@@ -707,7 +825,7 @@ func TestLibrarySummaries_CountsStatusesPerLibrary(t *testing.T) {
 	if err := s.EnsureLanguage(ctx, movieA.ID, en); err != nil {
 		t.Fatalf("EnsureLanguage: %v", err)
 	}
-	if err := s.MarkSynced(ctx, movieA.ID, en); err != nil {
+	if err := s.MarkSynced(ctx, movieA.ID, movieA.ContentHash, en); err != nil {
 		t.Fatalf("MarkSynced: %v", err)
 	}
 
@@ -718,7 +836,7 @@ func TestLibrarySummaries_CountsStatusesPerLibrary(t *testing.T) {
 	if err := s.EnsureLanguage(ctx, movieB.ID, en); err != nil {
 		t.Fatalf("EnsureLanguage: %v", err)
 	}
-	if err := s.MarkFailed(ctx, movieB.ID, en, domain.FailureNoCandidate); err != nil {
+	if err := s.MarkFailed(ctx, movieB.ID, movieB.ContentHash, en, domain.FailureNoCandidate); err != nil {
 		t.Fatalf("MarkFailed: %v", err)
 	}
 
@@ -794,7 +912,7 @@ func TestListFiles_DefaultFilterOmitsFullySyncedFiles(t *testing.T) {
 	if err := s.EnsureLanguage(ctx, synced.ID, en); err != nil {
 		t.Fatalf("EnsureLanguage: %v", err)
 	}
-	if err := s.MarkSynced(ctx, synced.ID, en); err != nil {
+	if err := s.MarkSynced(ctx, synced.ID, synced.ContentHash, en); err != nil {
 		t.Fatalf("MarkSynced: %v", err)
 	}
 
@@ -805,7 +923,7 @@ func TestListFiles_DefaultFilterOmitsFullySyncedFiles(t *testing.T) {
 	if err := s.EnsureLanguage(ctx, failed.ID, en); err != nil {
 		t.Fatalf("EnsureLanguage: %v", err)
 	}
-	if err := s.MarkFailed(ctx, failed.ID, en, domain.FailureRetrievalFailed); err != nil {
+	if err := s.MarkFailed(ctx, failed.ID, failed.ContentHash, en, domain.FailureRetrievalFailed); err != nil {
 		t.Fatalf("MarkFailed: %v", err)
 	}
 
@@ -871,7 +989,7 @@ func TestListFiles_StateAllIncludesSyncedFiles(t *testing.T) {
 	if err := s.EnsureLanguage(ctx, synced.ID, en); err != nil {
 		t.Fatalf("EnsureLanguage: %v", err)
 	}
-	if err := s.MarkSynced(ctx, synced.ID, en); err != nil {
+	if err := s.MarkSynced(ctx, synced.ID, synced.ContentHash, en); err != nil {
 		t.Fatalf("MarkSynced: %v", err)
 	}
 
@@ -1053,7 +1171,7 @@ func TestRecordProviderMiss_AppendsNameAndResetsToPendingNoFailureReason(t *test
 	// A no-candidate miss against a named Provider mirrors
 	// QuotaExhaustedError's existing handling: reset to pending, no failure
 	// reason recorded, per docs/adr/0008-tiered-provider-chain.md.
-	if err := s.RecordProviderMiss(ctx, file.ID, en, "opensubtitles"); err != nil {
+	if err := s.RecordProviderMiss(ctx, file.ID, file.ContentHash, en, "opensubtitles"); err != nil {
 		t.Fatalf("RecordProviderMiss returned error: %v", err)
 	}
 
@@ -1100,10 +1218,10 @@ func TestGetFile_SurfacesAttemptedProvidersOnLanguageState(t *testing.T) {
 		t.Errorf("Attempted = %v, want empty before any RecordProviderMiss", fresh.Languages[0].Attempted)
 	}
 
-	if err := s.RecordProviderMiss(ctx, file.ID, en, "opensubtitles"); err != nil {
+	if err := s.RecordProviderMiss(ctx, file.ID, file.ContentHash, en, "opensubtitles"); err != nil {
 		t.Fatalf("first RecordProviderMiss returned error: %v", err)
 	}
-	if err := s.RecordProviderMiss(ctx, file.ID, en, "subdl"); err != nil {
+	if err := s.RecordProviderMiss(ctx, file.ID, file.ContentHash, en, "subdl"); err != nil {
 		t.Fatalf("second RecordProviderMiss returned error: %v", err)
 	}
 
@@ -1129,7 +1247,7 @@ func TestListFiles_SurfacesAttemptedProvidersOnLanguageState(t *testing.T) {
 	if err := s.EnsureLanguage(ctx, file.ID, en); err != nil {
 		t.Fatalf("EnsureLanguage returned error: %v", err)
 	}
-	if err := s.RecordProviderMiss(ctx, file.ID, en, "opensubtitles"); err != nil {
+	if err := s.RecordProviderMiss(ctx, file.ID, file.ContentHash, en, "opensubtitles"); err != nil {
 		t.Fatalf("RecordProviderMiss returned error: %v", err)
 	}
 
@@ -1159,10 +1277,10 @@ func TestRecordProviderMiss_AccumulatesMultipleDistinctProviders(t *testing.T) {
 		t.Fatalf("EnsureLanguage returned error: %v", err)
 	}
 
-	if err := s.RecordProviderMiss(ctx, file.ID, en, "opensubtitles"); err != nil {
+	if err := s.RecordProviderMiss(ctx, file.ID, file.ContentHash, en, "opensubtitles"); err != nil {
 		t.Fatalf("first RecordProviderMiss returned error: %v", err)
 	}
-	if err := s.RecordProviderMiss(ctx, file.ID, en, "subdl"); err != nil {
+	if err := s.RecordProviderMiss(ctx, file.ID, file.ContentHash, en, "subdl"); err != nil {
 		t.Fatalf("second RecordProviderMiss returned error: %v", err)
 	}
 
@@ -1188,10 +1306,10 @@ func TestRecordProviderMiss_SameProviderTwiceDoesNotDuplicate(t *testing.T) {
 		t.Fatalf("EnsureLanguage returned error: %v", err)
 	}
 
-	if err := s.RecordProviderMiss(ctx, file.ID, en, "opensubtitles"); err != nil {
+	if err := s.RecordProviderMiss(ctx, file.ID, file.ContentHash, en, "opensubtitles"); err != nil {
 		t.Fatalf("first RecordProviderMiss returned error: %v", err)
 	}
-	if err := s.RecordProviderMiss(ctx, file.ID, en, "opensubtitles"); err != nil {
+	if err := s.RecordProviderMiss(ctx, file.ID, file.ContentHash, en, "opensubtitles"); err != nil {
 		t.Fatalf("second RecordProviderMiss returned error: %v", err)
 	}
 
@@ -1214,7 +1332,7 @@ func TestRecordProviderMiss_UnknownLanguageState(t *testing.T) {
 		t.Fatalf("ObserveFileContentHash returned error: %v", err)
 	}
 
-	err = s.RecordProviderMiss(ctx, file.ID, en, "opensubtitles")
+	err = s.RecordProviderMiss(ctx, file.ID, file.ContentHash, en, "opensubtitles")
 	if !errors.Is(err, store.ErrLanguageStateNotFound) {
 		t.Fatalf("expected ErrLanguageStateNotFound, got %v", err)
 	}
@@ -1270,7 +1388,7 @@ func TestObserveFileContentHash_HashChangeClearsAttemptedProviders(t *testing.T)
 	if err := s.EnsureLanguage(ctx, file.ID, en); err != nil {
 		t.Fatalf("EnsureLanguage returned error: %v", err)
 	}
-	if err := s.RecordProviderMiss(ctx, file.ID, en, "opensubtitles"); err != nil {
+	if err := s.RecordProviderMiss(ctx, file.ID, file.ContentHash, en, "opensubtitles"); err != nil {
 		t.Fatalf("RecordProviderMiss returned error: %v", err)
 	}
 
@@ -1301,7 +1419,7 @@ func TestResetToPending_ClearsAttemptedProviders(t *testing.T) {
 	if err := s.EnsureLanguage(ctx, file.ID, en); err != nil {
 		t.Fatalf("EnsureLanguage returned error: %v", err)
 	}
-	if err := s.RecordProviderMiss(ctx, file.ID, en, "opensubtitles"); err != nil {
+	if err := s.RecordProviderMiss(ctx, file.ID, file.ContentHash, en, "opensubtitles"); err != nil {
 		t.Fatalf("RecordProviderMiss returned error: %v", err)
 	}
 
@@ -1331,7 +1449,7 @@ func TestResetToPendingForced_ClearsAttemptedProviders(t *testing.T) {
 	if err := s.EnsureLanguage(ctx, file.ID, en); err != nil {
 		t.Fatalf("EnsureLanguage returned error: %v", err)
 	}
-	if err := s.RecordProviderMiss(ctx, file.ID, en, "opensubtitles"); err != nil {
+	if err := s.RecordProviderMiss(ctx, file.ID, file.ContentHash, en, "opensubtitles"); err != nil {
 		t.Fatalf("RecordProviderMiss returned error: %v", err)
 	}
 

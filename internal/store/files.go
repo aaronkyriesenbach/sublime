@@ -96,16 +96,9 @@ func (s *Store) ObserveFileHash(ctx context.Context, libraryName, path, contentH
 			); err != nil {
 				return fmt.Errorf("updating file content hash: %w", err)
 			}
-			// TODO(race): this reset is unconditional on the target rows'
-			// current status, so a Changed event for a file with a
-			// language pair currently In Progress resets it to Pending out
-			// from under the in-flight worker. That worker's eventual
-			// MarkSynced/MarkFailed (also unconditional) can then stomp
-			// this fresh Pending row with an outcome computed against the
-			// stale, pre-change content. Pre-existing, not introduced by
-			// Provider Suspension dispatch-gating — needs its own
-			// investigation (e.g. fencing the terminal-status writes on
-			// the Content Hash they were computed against).
+			// Resets In Progress rows too: the in-flight worker's terminal
+			// writes are fenced on the old Content Hash, so they can't
+			// overwrite this fresh Pending state.
 			if _, err := tx.ExecContext(ctx,
 				`UPDATE file_language_states SET status = ?, failure_reason = NULL, force = 0, attempted_providers = '', updated_at = ? WHERE file_id = ?`,
 				domain.StatusPending, now, id,
@@ -177,17 +170,24 @@ func (s *Store) ResetToPendingForced(ctx context.Context, fileID int64) error {
 // Hash. Unlike ResetToPending, which resets every language row for a file,
 // this is scoped to one language — a quota-exhausted attempt on one
 // language shouldn't reset the state of a file's other, unrelated
-// languages. It returns ErrLanguageStateNotFound if no such row exists;
-// callers must EnsureLanguage first.
-func (s *Store) ResetLanguageToPending(ctx context.Context, fileID int64, lang language.Tag) error {
-	res, err := s.db.ExecContext(ctx,
-		`UPDATE file_language_states SET status = ?, failure_reason = NULL, updated_at = ? WHERE file_id = ? AND language = ?`,
-		domain.StatusPending, nowString(), fileID, lang.String(),
-	)
-	if err != nil {
-		return fmt.Errorf("resetting language state to pending: %w", err)
-	}
-	return checkUpdated(res)
+// languages. It is fenced on expectedHash (see checkContentHashFence): if the
+// file's Content Hash has moved on, nothing is written and a
+// *StaleContentHashError is returned. It returns ErrLanguageStateNotFound if
+// no such row exists; callers must EnsureLanguage first.
+func (s *Store) ResetLanguageToPending(ctx context.Context, fileID int64, expectedHash string, lang language.Tag) error {
+	return s.withTx(ctx, func(tx *sql.Tx) error {
+		if err := checkContentHashFence(ctx, tx, fileID, expectedHash); err != nil {
+			return err
+		}
+		res, err := tx.ExecContext(ctx,
+			`UPDATE file_language_states SET status = ?, failure_reason = NULL, updated_at = ? WHERE file_id = ? AND language = ?`,
+			domain.StatusPending, nowString(), fileID, lang.String(),
+		)
+		if err != nil {
+			return fmt.Errorf("resetting language state to pending: %w", err)
+		}
+		return checkUpdated(res)
+	})
 }
 
 // RecordProviderMiss records that providerName searched this (file,
@@ -196,11 +196,17 @@ func (s *Store) ResetLanguageToPending(ctx context.Context, fileID int64, lang l
 // set (a no-op if already present) and resets the row to StatusPending with
 // no FailureReason, mirroring how a QuotaExhaustedError already avoids
 // marking Failed (see ResetLanguageToPending) rather than landing on Failed
-// immediately — see docs/adr/0008-tiered-provider-chain.md. It returns
+// immediately — see docs/adr/0008-tiered-provider-chain.md. It is fenced on
+// expectedHash (see checkContentHashFence): a miss computed against stale
+// content must not touch the fresh Pending row's attempted set. It returns
 // ErrLanguageStateNotFound if no such row exists; callers must
 // EnsureLanguage first.
-func (s *Store) RecordProviderMiss(ctx context.Context, fileID int64, lang language.Tag, providerName string) error {
+func (s *Store) RecordProviderMiss(ctx context.Context, fileID int64, expectedHash string, lang language.Tag, providerName string) error {
 	return s.withTx(ctx, func(tx *sql.Tx) error {
+		if err := checkContentHashFence(ctx, tx, fileID, expectedHash); err != nil {
+			return err
+		}
+
 		var attempted string
 		err := tx.QueryRowContext(ctx,
 			`SELECT attempted_providers FROM file_language_states WHERE file_id = ? AND language = ?`,
@@ -271,23 +277,49 @@ func addAttemptedProvider(raw, name string) string {
 // ObserveFileContentHash. Use this when Sublime's own Strip pass mutated
 // the video (changing its Content Hash) rather than an external content
 // change — the two intents are distinguished by which method is called,
-// not by inspecting the hash delta at each call site. Returns
-// ErrFileNotFound if fileID doesn't exist.
-func (s *Store) UpdateContentHash(ctx context.Context, fileID int64, contentHash string) error {
-	res, err := s.db.ExecContext(ctx,
-		`UPDATE files SET content_hash = ?, updated_at = ? WHERE id = ?`,
-		contentHash, nowString(), fileID,
-	)
-	if err != nil {
-		return fmt.Errorf("updating content hash: %w", err)
-	}
+// not by inspecting the hash delta at each call site.
+//
+// It is fenced on expectedHash — the hash the calling worker started from —
+// so that a concurrent Changed event isn't overwritten by the worker's own
+// post-Strip hash; on mismatch nothing is written and a
+// *StaleContentHashError is returned. A worker that succeeds here continues
+// as the owner of newHash and must pass it as expectedHash to its later
+// terminal writes. Returns ErrFileNotFound if fileID doesn't exist.
+func (s *Store) UpdateContentHash(ctx context.Context, fileID int64, expectedHash, newHash string) error {
+	return s.withTx(ctx, func(tx *sql.Tx) error {
+		if err := checkContentHashFence(ctx, tx, fileID, expectedHash); err != nil {
+			if errors.Is(err, ErrLanguageStateNotFound) {
+				return ErrFileNotFound
+			}
+			return err
+		}
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE files SET content_hash = ?, updated_at = ? WHERE id = ?`,
+			newHash, nowString(), fileID,
+		); err != nil {
+			return fmt.Errorf("updating content hash: %w", err)
+		}
+		return nil
+	})
+}
 
-	n, err := res.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("reading rows affected: %w", err)
+// checkContentHashFence returns a *StaleContentHashError unless fileID's
+// recorded Content Hash equals expectedHash, so a worker's terminal write only
+// lands if nothing else changed the file since the worker started. It returns
+// ErrLanguageStateNotFound if fileID has no file row (the row's language
+// states cascade away with it, which is what callers' unfenced writes
+// reported before).
+func checkContentHashFence(ctx context.Context, tx *sql.Tx, fileID int64, expectedHash string) error {
+	var current string
+	err := tx.QueryRowContext(ctx, `SELECT content_hash FROM files WHERE id = ?`, fileID).Scan(&current)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrLanguageStateNotFound
 	}
-	if n == 0 {
-		return ErrFileNotFound
+	if err != nil {
+		return fmt.Errorf("reading content hash: %w", err)
+	}
+	if current != expectedHash {
+		return &StaleContentHashError{Expected: expectedHash, Current: current}
 	}
 	return nil
 }
@@ -381,17 +413,24 @@ func (s *Store) GetFile(ctx context.Context, libraryName, path string) (domain.F
 }
 
 // MarkSynced sets fileID's language state to StatusSynced, clearing any
-// FailureReason. It returns ErrLanguageStateNotFound if no such row exists;
-// callers must EnsureLanguage first.
-func (s *Store) MarkSynced(ctx context.Context, fileID int64, lang language.Tag) error {
-	res, err := s.db.ExecContext(ctx,
-		`UPDATE file_language_states SET status = ?, failure_reason = NULL, updated_at = ? WHERE file_id = ? AND language = ?`,
-		domain.StatusSynced, nowString(), fileID, lang.String(),
-	)
-	if err != nil {
-		return fmt.Errorf("marking language state synced: %w", err)
-	}
-	return checkUpdated(res)
+// FailureReason. It is fenced on expectedHash (see checkContentHashFence):
+// if the file's Content Hash has moved on, nothing is written and a
+// *StaleContentHashError is returned. It returns ErrLanguageStateNotFound if
+// no such row exists; callers must EnsureLanguage first.
+func (s *Store) MarkSynced(ctx context.Context, fileID int64, expectedHash string, lang language.Tag) error {
+	return s.withTx(ctx, func(tx *sql.Tx) error {
+		if err := checkContentHashFence(ctx, tx, fileID, expectedHash); err != nil {
+			return err
+		}
+		res, err := tx.ExecContext(ctx,
+			`UPDATE file_language_states SET status = ?, failure_reason = NULL, updated_at = ? WHERE file_id = ? AND language = ?`,
+			domain.StatusSynced, nowString(), fileID, lang.String(),
+		)
+		if err != nil {
+			return fmt.Errorf("marking language state synced: %w", err)
+		}
+		return checkUpdated(res)
+	})
 }
 
 // MarkInProgress sets fileID's language state to StatusInProgress, clearing
@@ -420,20 +459,27 @@ func (s *Store) MarkInProgress(ctx context.Context, fileID int64, lang language.
 
 // MarkFailed sets fileID's language state to StatusFailed with reason. It
 // returns ErrLanguageStateNotFound if no such row exists; callers must
-// EnsureLanguage first.
-func (s *Store) MarkFailed(ctx context.Context, fileID int64, lang language.Tag, reason domain.FailureReason) error {
+// EnsureLanguage first. It is fenced on expectedHash (see
+// checkContentHashFence): if the file's Content Hash has moved on, nothing is
+// written and a *StaleContentHashError is returned.
+func (s *Store) MarkFailed(ctx context.Context, fileID int64, expectedHash string, lang language.Tag, reason domain.FailureReason) error {
 	if !validFailureReason(reason) {
 		return fmt.Errorf("invalid failure reason %q", reason)
 	}
 
-	res, err := s.db.ExecContext(ctx,
-		`UPDATE file_language_states SET status = ?, failure_reason = ?, updated_at = ? WHERE file_id = ? AND language = ?`,
-		domain.StatusFailed, reason, nowString(), fileID, lang.String(),
-	)
-	if err != nil {
-		return fmt.Errorf("marking language state failed: %w", err)
-	}
-	return checkUpdated(res)
+	return s.withTx(ctx, func(tx *sql.Tx) error {
+		if err := checkContentHashFence(ctx, tx, fileID, expectedHash); err != nil {
+			return err
+		}
+		res, err := tx.ExecContext(ctx,
+			`UPDATE file_language_states SET status = ?, failure_reason = ?, updated_at = ? WHERE file_id = ? AND language = ?`,
+			domain.StatusFailed, reason, nowString(), fileID, lang.String(),
+		)
+		if err != nil {
+			return fmt.Errorf("marking language state failed: %w", err)
+		}
+		return checkUpdated(res)
+	})
 }
 
 func validFailureReason(reason domain.FailureReason) bool {

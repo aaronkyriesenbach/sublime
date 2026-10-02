@@ -41,6 +41,32 @@ var ErrFileNotFound = errors.New("store: file not found")
 // same reaction from a caller (skip, don't treat as a processing failure).
 var ErrClaimLost = errors.New("store: claim lost, language state is no longer pending")
 
+// ErrStaleContentHash is matched (via errors.Is) by the *StaleContentHashError
+// a fenced write returns when the file's Content Hash no longer equals the
+// one the caller's work was computed against.
+var ErrStaleContentHash = errors.New("store: content hash changed since work began")
+
+// StaleContentHashError reports a fenced write that was discarded because the
+// file's recorded Content Hash differs from the one the caller started from —
+// a Changed event reset the pair while the caller was still working, so the
+// caller's outcome describes content that is no longer current.
+type StaleContentHashError struct {
+	// Expected is the Content Hash the caller's work was computed against.
+	Expected string
+
+	// Current is the Content Hash recorded in the store at write time.
+	Current string
+}
+
+func (e *StaleContentHashError) Error() string {
+	return fmt.Sprintf("store: content hash changed since work began (expected %s, current %s)", e.Expected, e.Current)
+}
+
+// Is makes errors.Is(err, ErrStaleContentHash) match a *StaleContentHashError.
+func (e *StaleContentHashError) Is(target error) bool {
+	return target == ErrStaleContentHash
+}
+
 // bootstrapSQL is Sublime's entire schema. There is no migration framework:
 // every statement uses IF NOT EXISTS so Open is safe to call against an
 // existing database file.
