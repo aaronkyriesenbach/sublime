@@ -1855,6 +1855,46 @@ func TestPipeline_NeverSyncedProviderSkipsSyncAndEndsSyncedWithMarker(t *testing
 	f.assertSyncedWithValidMarker(t)
 }
 
+func TestPipeline_DownloadMissRecordsProviderTriedAndWritesNothing(t *testing.T) {
+	f := newNeverSyncedFixture(t, true)
+	f.pipe.Provider = &provider.Fake{
+		SearchFunc: func(context.Context, provider.Query) ([]domain.Candidate, error) {
+			return []domain.Candidate{{ID: "candidate", Title: "Test Movie", Year: 2024, HashMatch: true}}, nil
+		},
+		DownloadFunc: func(context.Context, domain.Candidate) ([]byte, error) {
+			return nil, &provider.MissError{Cause: errors.New("transcript is degenerate")}
+		},
+	}
+	ctx := context.Background()
+	if _, err := f.pipe.Run(ctx, f.lib); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	file, _, err := f.st.GetFile(ctx, f.lib.Name, f.videoPath)
+	if err != nil {
+		t.Fatalf("GetFile: %v", err)
+	}
+
+	result := f.pipe.ProcessPending(ctx, f.lib, file.ID, file.ContentHash, f.videoPath, language.English, false, "whisper")
+
+	if result.Outcome != pipeline.OutcomeNoCandidateMiss {
+		t.Errorf("outcome = %v (err %v), want OutcomeNoCandidateMiss", result.Outcome, result.Err)
+	}
+	got, _, err := f.st.GetFile(ctx, f.lib.Name, f.videoPath)
+	if err != nil {
+		t.Fatalf("GetFile: %v", err)
+	}
+	state := got.Languages[0]
+	if state.Status != domain.StatusPending || state.FailureReason != domain.FailureNone {
+		t.Errorf("state = %q/%q, want pending with no failure reason", state.Status, state.FailureReason)
+	}
+	if !slices.Equal(state.Attempted, []string{"whisper"}) {
+		t.Errorf("attempted = %v, want [whisper]", state.Attempted)
+	}
+	if _, err := os.Stat(f.sidecar); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("sidecar stat error = %v, want it not to exist", err)
+	}
+}
+
 func TestPipeline_NeverSyncedProviderStillRebindsMarkerToPostStripHash(t *testing.T) {
 	f := newNeverSyncedFixture(t, true)
 	f.pipe.Stripper = &pipeline.FakeStripper{StripEmbeddedIndices: []int{2}}

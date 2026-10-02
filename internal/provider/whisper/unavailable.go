@@ -41,11 +41,11 @@ func (p *Provider) suspendedError() error {
 
 // transcribe sends audio to the sidecar for transcription, giving each
 // attempt at most timeout; see requestSidecar for how failures are handled.
-func (p *Provider) transcribe(ctx context.Context, audio []byte, languageCode string, timeout time.Duration) ([]segment, error) {
+func (p *Provider) transcribe(ctx context.Context, audio []byte, languageCode string, temperature float64, timeout time.Duration) ([]segment, error) {
 	return requestSidecar(ctx, p, func(ctx context.Context) ([]segment, error) {
 		ctx, cancel := context.WithTimeout(ctx, timeout)
 		defer cancel()
-		return p.client.transcribe(ctx, audio, languageCode)
+		return p.client.transcribe(ctx, audio, languageCode, temperature)
 	})
 }
 

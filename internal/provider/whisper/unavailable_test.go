@@ -251,11 +251,12 @@ func TestDownload_ReachableSidecarReturning5xxIsRetriedThenFailsWithoutSuspendin
 	if _, suspended := p.Suspension(); suspended {
 		t.Error("Suspension() = suspended by a reachable sidecar's 5xx, want not suspended")
 	}
-	if got := len(sidecar.Requests()); got != 4 {
-		t.Errorf("sidecar saw %d requests, want 4 (first try plus 3 retries)", got)
+	// Each of the chunk's 3 attempts is the first try plus 3 backed-off retries.
+	if got := len(sidecar.Requests()); got != 12 {
+		t.Errorf("sidecar saw %d requests, want 12", got)
 	}
-	if got := len(clock.Sleeps()); got != 3 {
-		t.Errorf("backed off %d times, want 3", got)
+	if got := len(clock.Sleeps()); got != 9 {
+		t.Errorf("backed off %d times, want 9", got)
 	}
 }
 

@@ -348,7 +348,7 @@ func TestDownload_SidecarErrorIsAnError(t *testing.T) {
 	}
 }
 
-func TestDownload_TranscriptWithNoSpeechIsAnError(t *testing.T) {
+func TestDownload_TranscriptWithNoSpeechIsAMiss(t *testing.T) {
 	audio := &audiosource.FakeSource{Streams: []audiosource.Stream{{Index: 1, Language: "eng"}}}
 	p := newProvider(t, newFakeWhisperServer(t, []byte(`{"segments":[]}`)), audio, nil)
 
@@ -356,9 +356,8 @@ func TestDownload_TranscriptWithNoSpeechIsAnError(t *testing.T) {
 	if err != nil || len(candidates) != 1 {
 		t.Fatalf("Search = %+v, %v; want exactly one candidate", candidates, err)
 	}
-	if _, err := p.Download(context.Background(), candidates[0]); err == nil {
-		t.Fatal("Download: want an error rather than an empty subtitle, got nil")
-	}
+	_, err = p.Download(context.Background(), candidates[0])
+	assertMiss(t, err)
 }
 
 func TestDownload_RejectsForeignCandidateID(t *testing.T) {
@@ -646,7 +645,7 @@ func TestDownload_MultiTrackPicksTheFirstTrackTaggedWithTheTarget(t *testing.T) 
 func TestDownload_TranscribesTheUntaggedStreamAcceptedByDetection(t *testing.T) {
 	audio := &audiosource.FakeSource{
 		Streams:       []audiosource.Stream{{Index: 1, Language: "jpn"}, {Index: 2}},
-		VideoDuration: time.Hour,
+		VideoDuration: 11 * time.Minute,
 	}
 	server := detectingServer(t, "en")
 	p := newProvider(t, server, audio, nil)
