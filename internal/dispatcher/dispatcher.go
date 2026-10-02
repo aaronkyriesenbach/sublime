@@ -94,6 +94,10 @@ type Dispatcher struct {
 	// Logger receives per-pass and per-pair error logging. Defaults to
 	// slog.Default() if nil.
 	Logger *slog.Logger
+
+	// state holds the per-Provider worker pools and in-flight tracking that
+	// live for the Dispatcher's lifetime, across every pass.
+	state poolState
 }
 
 func (d *Dispatcher) logger() *slog.Logger {
@@ -178,14 +182,104 @@ func (d *Dispatcher) allProvidersAttempted(ctx context.Context, fileID int64, la
 	return attemptedSet["default"]
 }
 
+// workerPool is one Provider's long-lived worker budget. It outlives every
+// dispatch pass so the Provider's in-flight count is bounded across passes,
+// not just within one.
+type workerPool struct {
+	entry ProviderEntry
+	sem   chan struct{}
+}
+
+func (p *workerPool) full() bool {
+	return len(p.sem) == cap(p.sem)
+}
+
+// inFlightKey identifies a (file, language) pair a worker is processing.
+type inFlightKey struct {
+	fileID int64
+	lang   string
+}
+
+// poolState holds everything that must persist across dispatch passes. It is
+// built lazily on the first pass because Dispatcher is configured by struct
+// literal.
+type poolState struct {
+	once sync.Once
+
+	// legacy is the single pool of legacy mode (Providers and ProviderTiers
+	// both empty).
+	legacy *workerPool
+	// chain holds one pool per Providers entry, in chain order.
+	chain []*workerPool
+	// tiers holds one pool per Provider, grouped by Tier, in chain order.
+	tiers [][]*workerPool
+
+	// wg tracks every worker goroutine across all passes.
+	wg sync.WaitGroup
+
+	mu       sync.Mutex
+	inFlight map[inFlightKey]struct{}
+}
+
+func (d *Dispatcher) initPools() {
+	d.state.once.Do(func() {
+		d.state.inFlight = make(map[inFlightKey]struct{})
+
+		newPool := func(entry ProviderEntry, share int) *workerPool {
+			wc := entry.WorkerCount
+			if wc <= 0 {
+				wc = runtime.NumCPU() / share
+				if wc < 1 {
+					wc = 1
+				}
+			}
+			return &workerPool{entry: entry, sem: make(chan struct{}, wc)}
+		}
+
+		switch {
+		case len(d.ProviderTiers) > 0:
+			total := 0
+			for _, tier := range d.ProviderTiers {
+				total += len(tier.Providers)
+			}
+			if total == 0 {
+				total = 1
+			}
+			d.state.tiers = make([][]*workerPool, len(d.ProviderTiers))
+			for i, tier := range d.ProviderTiers {
+				for _, entry := range tier.Providers {
+					d.state.tiers[i] = append(d.state.tiers[i], newPool(entry, total))
+				}
+			}
+		case len(d.Providers) > 0:
+			for _, entry := range d.Providers {
+				d.state.chain = append(d.state.chain, newPool(entry, len(d.Providers)))
+			}
+		default:
+			wc := d.Pipeline.WorkerCount
+			if wc <= 0 {
+				wc = runtime.NumCPU()
+			}
+			d.state.legacy = &workerPool{
+				entry: ProviderEntry{Name: "default", Pipeline: d.Pipeline},
+				sem:   make(chan struct{}, wc),
+			}
+		}
+	})
+}
+
 // RunOnce performs one deterministic dispatch pass: it snapshots every
 // (file, language) pair currently in StatusPending across every configured
 // Library (store.Store.PendingPairs), then processes that snapshot
 // concurrently. When Providers is set, each Provider gets its own worker
 // pool and the chain is walked in priority order to find the first
-// available Provider for each pair. It returns once every pair from that
-// snapshot has been processed (or ctx is cancelled) — it does not loop;
-// see Run for the production polling wrapper.
+// available Provider for each pair. It returns once every worker started by
+// the pass has finished (or ctx is cancelled) — it does not loop; see Run
+// for the production polling wrapper, which uses the non-blocking
+// dispatchPass instead.
+//
+// In legacy single-pipeline mode, RunOnce waits for worker capacity so the
+// whole snapshot is processed.
 //
 // A pair whose gate check finds an already-valid Marker never gets claimed
 // at all: it goes straight from Pending to Synced inside
@@ -195,6 +289,23 @@ func (d *Dispatcher) allProvidersAttempted(ctx context.Context, fileID int64, la
 // capacity is left Pending: it's neither claimed nor touched at all, and
 // is picked up automatically on a later poll once capacity frees up.
 func (d *Dispatcher) RunOnce(ctx context.Context) error {
+	err := d.dispatchPass(ctx, true)
+	d.state.wg.Wait()
+	if err != nil {
+		return err
+	}
+	return ctx.Err()
+}
+
+// dispatchPass snapshots the Pending pairs and hands each one to a worker
+// from the first eligible Provider's long-lived pool, then returns without
+// waiting for those workers: a long-running pair must not stop the next poll
+// from dispatching other pairs to Providers with spare capacity. Workers are
+// tracked in d.state.wg; waitForCapacity makes legacy mode block for a free
+// worker instead of leaving the pair Pending.
+func (d *Dispatcher) dispatchPass(ctx context.Context, waitForCapacity bool) error {
+	d.initPools()
+
 	pairs, err := d.Store.PendingPairs(ctx)
 	if err != nil {
 		return fmt.Errorf("dispatcher: listing pending pairs: %w", err)
@@ -207,27 +318,69 @@ func (d *Dispatcher) RunOnce(ctx context.Context) error {
 
 	// Tier mode: use tier-grouped provider pools (ADR 0008)
 	if len(d.ProviderTiers) > 0 {
-		return d.runOnceTierMode(ctx, pairs, librariesByName)
+		d.dispatchTierMode(ctx, pairs, librariesByName)
+		return nil
 	}
 
 	// Chain mode: use per-provider worker pools (flat chain, legacy)
 	if len(d.Providers) > 0 {
-		return d.runOnceChainMode(ctx, pairs, librariesByName)
+		d.dispatchChainMode(ctx, pairs, librariesByName)
+		return nil
 	}
 
 	// Legacy single-pipeline mode
-	return d.runOnceLegacyMode(ctx, pairs, librariesByName)
+	d.dispatchLegacyMode(ctx, pairs, librariesByName, waitForCapacity)
+	return nil
 }
 
-// runOnceLegacyMode handles the single-pipeline dispatch mode (Providers empty).
-func (d *Dispatcher) runOnceLegacyMode(ctx context.Context, pairs []store.PendingPair, librariesByName map[string]domain.Library) error {
-	workerCount := d.Pipeline.WorkerCount
-	if workerCount <= 0 {
-		workerCount = runtime.NumCPU()
+// beginPair records pair as in flight, returning false if a worker already
+// holds it. A pair stays Pending in the store until its worker's claim lands,
+// so without this a later pass could dispatch the same pair twice.
+func (d *Dispatcher) beginPair(pair store.PendingPair) bool {
+	key := inFlightKey{fileID: pair.FileID, lang: pair.Language.String()}
+	d.state.mu.Lock()
+	defer d.state.mu.Unlock()
+	if _, busy := d.state.inFlight[key]; busy {
+		return false
 	}
+	d.state.inFlight[key] = struct{}{}
+	return true
+}
 
-	sem := make(chan struct{}, workerCount)
-	var wg sync.WaitGroup
+func (d *Dispatcher) endPair(pair store.PendingPair) {
+	key := inFlightKey{fileID: pair.FileID, lang: pair.Language.String()}
+	d.state.mu.Lock()
+	delete(d.state.inFlight, key)
+	d.state.mu.Unlock()
+}
+
+// startWorker runs pair on pool's Provider in a tracked goroutine. The caller
+// must already hold a slot in pool.sem and have registered pair via beginPair.
+func (d *Dispatcher) startWorker(ctx context.Context, pool *workerPool, pair store.PendingPair, lib domain.Library) {
+	d.state.wg.Add(1)
+	go func() {
+		defer d.state.wg.Done()
+		defer d.endPair(pair)
+		defer func() { <-pool.sem }()
+
+		name := pool.entry.Name
+		result := pool.entry.Pipeline.ProcessPending(ctx, lib, pair.FileID, pair.ContentHash, pair.Path, pair.Language, pair.Force, name)
+		switch {
+		case result.Outcome == pipeline.OutcomeNoCandidateMiss:
+			// Legacy mode has one Provider, so its miss is always terminal.
+			if d.state.legacy != nil || d.allProvidersAttempted(ctx, pair.FileID, pair.Language) {
+				d.markNoCandidate(ctx, lib, pair)
+			}
+		case result.Err != nil:
+			d.logger().Error("dispatcher: processing pending pair failed",
+				"provider", name, "library", lib.Name, "path", pair.Path, "language", pair.Language.String(), "error", result.Err)
+		}
+	}()
+}
+
+// dispatchLegacyMode handles the single-pipeline dispatch mode (Providers empty).
+func (d *Dispatcher) dispatchLegacyMode(ctx context.Context, pairs []store.PendingPair, librariesByName map[string]domain.Library, waitForCapacity bool) {
+	pool := d.state.legacy
 
 	for _, pair := range pairs {
 		lib, ok := librariesByName[pair.LibraryName]
@@ -241,60 +394,39 @@ func (d *Dispatcher) runOnceLegacyMode(ctx context.Context, pairs []store.Pendin
 			continue
 		}
 
-		select {
-		case sem <- struct{}{}:
-		case <-ctx.Done():
-			wg.Wait()
-			return ctx.Err()
+		if !d.beginPair(pair) {
+			continue
 		}
 
-		wg.Add(1)
-		go func(pair store.PendingPair, lib domain.Library) {
-			defer wg.Done()
-			defer func() { <-sem }()
-
-			// Legacy mode: single provider, use "default" as provider name.
-			// A no-candidate miss here is terminal (single provider = exhausted).
-			result := d.Pipeline.ProcessPending(ctx, lib, pair.FileID, pair.ContentHash, pair.Path, pair.Language, pair.Force, "default")
-			if result.Outcome == pipeline.OutcomeNoCandidateMiss {
-				d.markNoCandidate(ctx, lib, pair)
-			} else if result.Err != nil {
-				d.logger().Error("dispatcher: processing pending pair failed",
-					"library", lib.Name, "path", pair.Path, "language", pair.Language.String(), "error", result.Err)
+		if waitForCapacity {
+			select {
+			case pool.sem <- struct{}{}:
+			case <-ctx.Done():
+				d.endPair(pair)
+				return
 			}
-		}(pair, lib)
-	}
+		} else {
+			select {
+			case pool.sem <- struct{}{}:
+			default:
+				d.endPair(pair)
+				return
+			}
+		}
 
-	wg.Wait()
-	return ctx.Err()
+		d.startWorker(ctx, pool, pair, lib)
+	}
 }
 
-// runOnceChainMode handles the Provider Chain dispatch mode (Providers non-empty).
-// Each Provider gets its own semaphore, and for each pair we walk the chain
-// to find the first Provider that isn't Suspended and has spare capacity.
-func (d *Dispatcher) runOnceChainMode(ctx context.Context, pairs []store.PendingPair, librariesByName map[string]domain.Library) error {
-	type providerPool struct {
-		entry ProviderEntry
-		sem   chan struct{}
-	}
-	pools := make([]providerPool, len(d.Providers))
-	for i, entry := range d.Providers {
-		wc := entry.WorkerCount
-		if wc <= 0 {
-			wc = runtime.NumCPU() / len(d.Providers)
-			if wc < 1 {
-				wc = 1
-			}
-		}
-		pools[i] = providerPool{
-			entry: entry,
-			sem:   make(chan struct{}, wc),
-		}
-	}
-
-	var wg sync.WaitGroup
-
+// dispatchChainMode handles the Provider Chain dispatch mode (Providers non-empty).
+// Each Provider has its own long-lived pool, and for each pair we walk the
+// chain to find the first Provider that isn't Suspended and has spare capacity.
+func (d *Dispatcher) dispatchChainMode(ctx context.Context, pairs []store.PendingPair, librariesByName map[string]domain.Library) {
 	for _, pair := range pairs {
+		if ctx.Err() != nil || allFull(d.state.chain) {
+			return
+		}
+
 		lib, ok := librariesByName[pair.LibraryName]
 		if !ok {
 			d.logger().Warn("dispatcher: pending pair references an unconfigured library; skipping",
@@ -302,105 +434,69 @@ func (d *Dispatcher) runOnceChainMode(ctx context.Context, pairs []store.Pending
 			continue
 		}
 
-		var claimed bool
-		for i := range pools {
-			pool := &pools[i]
+		if !d.beginPair(pair) {
+			continue
+		}
 
+		var claimed bool
+		for _, pool := range d.state.chain {
 			if d.pipelineSuspended(pool.entry.Pipeline) {
 				continue
 			}
 
 			select {
 			case pool.sem <- struct{}{}:
+				d.startWorker(ctx, pool, pair, lib)
 				claimed = true
-				wg.Add(1)
-				go func(p *pipeline.Pipeline, name string, sem chan struct{}, pair store.PendingPair, lib domain.Library) {
-					defer wg.Done()
-					defer func() { <-sem }()
-
-					result := p.ProcessPending(ctx, lib, pair.FileID, pair.ContentHash, pair.Path, pair.Language, pair.Force, name)
-					if result.Outcome == pipeline.OutcomeNoCandidateMiss {
-						if d.allProvidersAttempted(ctx, pair.FileID, pair.Language) {
-							d.markNoCandidate(ctx, lib, pair)
-						}
-					} else if result.Err != nil {
-						d.logger().Error("dispatcher: processing pending pair failed",
-							"provider", name, "library", lib.Name, "path", pair.Path, "language", pair.Language.String(), "error", result.Err)
-					}
-				}(pool.entry.Pipeline, pool.entry.Name, pool.sem, pair, lib)
 			default:
-				continue
 			}
-
 			if claimed {
 				break
 			}
 		}
-
-		if ctx.Err() != nil {
-			break
+		if !claimed {
+			d.endPair(pair)
 		}
 	}
-
-	wg.Wait()
-	return ctx.Err()
 }
 
-// tierPool holds a ProviderEntry and its per-provider semaphore.
-type tierPool struct {
-	entry ProviderEntry
-	sem   chan struct{}
+func allFull(pools []*workerPool) bool {
+	for _, p := range pools {
+		if !p.full() {
+			return false
+		}
+	}
+	return true
 }
 
-// runOnceTierMode handles the Tier-grouped Provider Chain dispatch mode
-// (ProviderTiers non-empty). Each Provider gets its own semaphore, and for
-// each pair we walk Tiers in priority order. Within a Tier, the first
-// healthy (non-Suspended) Provider with spare capacity is used. Suspension
-// may skip to a Tier-mate but never crosses a Tier boundary: if every
-// Provider in the current Tier is Suspended, the pair stays Pending.
-// runOnceTierMode handles the Tier-grouped Provider Chain dispatch mode
-// (ProviderTiers non-empty). Each Provider gets its own semaphore, and for
-// each pair we walk Tiers in priority order. Within a Tier, the first
+// dispatchTierMode handles the Tier-grouped Provider Chain dispatch mode
+// (ProviderTiers non-empty). Each Provider has its own long-lived pool, and
+// for each pair we walk Tiers in priority order. Within a Tier, the first
 // healthy (non-Suspended, non-already-attempted) Provider with spare
 // capacity is used. Suspension may skip to a Tier-mate but never crosses a
 // Tier boundary: if every Provider in the current Tier is Suspended, the
 // pair stays Pending. When all Providers across all Tiers have been
 // attempted, the Dispatcher marks the pair Failed(no_candidate).
-func (d *Dispatcher) runOnceTierMode(ctx context.Context, pairs []store.PendingPair, librariesByName map[string]domain.Library) error {
-	tierPools := make([][]tierPool, len(d.ProviderTiers))
-	totalProviders := 0
-	for _, tier := range d.ProviderTiers {
-		totalProviders += len(tier.Providers)
+func (d *Dispatcher) dispatchTierMode(ctx context.Context, pairs []store.PendingPair, librariesByName map[string]domain.Library) {
+	var every []*workerPool
+	for _, pools := range d.state.tiers {
+		every = append(every, pools...)
 	}
-	if totalProviders == 0 {
-		totalProviders = 1
-	}
-
-	for i, tier := range d.ProviderTiers {
-		tierPools[i] = make([]tierPool, len(tier.Providers))
-		for j, entry := range tier.Providers {
-			wc := entry.WorkerCount
-			if wc <= 0 {
-				wc = runtime.NumCPU() / totalProviders
-				if wc < 1 {
-					wc = 1
-				}
-			}
-			tierPools[i][j] = tierPool{
-				entry: entry,
-				sem:   make(chan struct{}, wc),
-			}
-		}
-	}
-
-	var wg sync.WaitGroup
 
 pairLoop:
 	for _, pair := range pairs {
+		if ctx.Err() != nil || allFull(every) {
+			return
+		}
+
 		lib, ok := librariesByName[pair.LibraryName]
 		if !ok {
 			d.logger().Warn("dispatcher: pending pair references an unconfigured library; skipping",
 				"library", pair.LibraryName, "path", pair.Path)
+			continue
+		}
+
+		if !d.beginPair(pair) {
 			continue
 		}
 
@@ -408,6 +504,7 @@ pairLoop:
 		if err != nil {
 			d.logger().Error("dispatcher: reading attempted providers",
 				"library", lib.Name, "path", pair.Path, "language", pair.Language.String(), "error", err)
+			d.endPair(pair)
 			continue
 		}
 		attemptedSet := make(map[string]bool, len(attempted))
@@ -415,10 +512,10 @@ pairLoop:
 			attemptedSet[name] = true
 		}
 
-		for tierIdx, pools := range tierPools {
+		for tierIdx, pools := range d.state.tiers {
 			allSuspended := true
-			for j := range pools {
-				if !d.pipelineSuspended(pools[j].entry.Pipeline) {
+			for _, pool := range pools {
+				if !d.pipelineSuspended(pool.entry.Pipeline) {
 					allSuspended = false
 					break
 				}
@@ -426,51 +523,26 @@ pairLoop:
 			if allSuspended {
 				d.logger().Debug("dispatcher: tier fully suspended, waiting",
 					"tier", tierIdx, "path", pair.Path, "language", pair.Language.String())
+				d.endPair(pair)
 				continue pairLoop
 			}
 
-			for j := range pools {
-				pool := &pools[j]
-
-				if d.pipelineSuspended(pool.entry.Pipeline) {
-					continue
-				}
-
-				if attemptedSet[pool.entry.Name] {
+			for _, pool := range pools {
+				if d.pipelineSuspended(pool.entry.Pipeline) || attemptedSet[pool.entry.Name] {
 					continue
 				}
 
 				select {
 				case pool.sem <- struct{}{}:
-					wg.Add(1)
-					go func(p *pipeline.Pipeline, name string, sem chan struct{}, pair store.PendingPair, lib domain.Library) {
-						defer wg.Done()
-						defer func() { <-sem }()
-
-						result := p.ProcessPending(ctx, lib, pair.FileID, pair.ContentHash, pair.Path, pair.Language, pair.Force, name)
-						if result.Outcome == pipeline.OutcomeNoCandidateMiss {
-							if d.allProvidersAttempted(ctx, pair.FileID, pair.Language) {
-								d.markNoCandidate(ctx, lib, pair)
-							}
-						} else if result.Err != nil {
-							d.logger().Error("dispatcher: processing pending pair failed",
-								"provider", name, "library", lib.Name, "path", pair.Path, "language", pair.Language.String(), "error", result.Err)
-						}
-					}(pool.entry.Pipeline, pool.entry.Name, pool.sem, pair, lib)
+					d.startWorker(ctx, pool, pair, lib)
 					continue pairLoop
 				default:
-					continue
 				}
 			}
 		}
 
-		if ctx.Err() != nil {
-			break
-		}
+		d.endPair(pair)
 	}
-
-	wg.Wait()
-	return ctx.Err()
 }
 
 // markNoCandidate lands pair on Failed(no_candidate) after every Provider has
@@ -490,12 +562,17 @@ func (d *Dispatcher) markNoCandidate(ctx context.Context, lib domain.Library, pa
 	}
 }
 
-// Run wraps RunOnce in a fixed polling-interval loop: it runs one pass
-// immediately, then again every PollInterval, until ctx is cancelled. It
-// always returns a non-nil error once cancelled (ctx.Err() in the common
-// case). A failed pass is logged and doesn't stop the loop — the next tick
-// tries again.
+// Run wraps dispatchPass in a fixed polling-interval loop: it runs one pass
+// immediately, then again every PollInterval, until ctx is cancelled. Passes
+// never wait on in-flight pairs, so a long-running Provider call cannot stall
+// dispatch to other Providers. On cancellation Run waits for every in-flight
+// worker to wind down (each leaves its pair Pending) before returning, and
+// always returns a non-nil error (ctx.Err() in the common case). A failed
+// pass is logged and doesn't stop the loop — the next tick tries again.
 func (d *Dispatcher) Run(ctx context.Context) error {
+	d.initPools()
+	defer d.state.wg.Wait()
+
 	if err := d.runPass(ctx); err != nil {
 		return err
 	}
@@ -515,11 +592,11 @@ func (d *Dispatcher) Run(ctx context.Context) error {
 	}
 }
 
-// runPass runs one RunOnce pass, logging (rather than propagating) any
+// runPass runs one dispatchPass, logging (rather than propagating) any
 // error that isn't ctx cancellation, so a single bad pass doesn't take
 // down the whole polling loop.
 func (d *Dispatcher) runPass(ctx context.Context) error {
-	if err := d.RunOnce(ctx); err != nil {
+	if err := d.dispatchPass(ctx, false); err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return err
 		}
