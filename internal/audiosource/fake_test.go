@@ -61,3 +61,23 @@ func TestFakeSource_ConfiguredErrorsAndAudioOverrideDefaults(t *testing.T) {
 		t.Errorf("Extract = %q, %v; want canned audio", got, err)
 	}
 }
+
+func TestFakeSource_ReportsConfiguredDurationAndSilences(t *testing.T) {
+	want := []audiosource.Silence{{Start: time.Second, End: 2 * time.Second}}
+	fake := &audiosource.FakeSource{
+		Streams:          []audiosource.Stream{{Index: 1}},
+		Length:           time.Minute,
+		SilenceIntervals: want,
+	}
+
+	if got, err := fake.Duration(context.Background(), "/v.mkv"); err != nil || got != time.Minute {
+		t.Errorf("Duration = %v, %v; want 1m", got, err)
+	}
+	got, err := fake.Silences(context.Background(), "/v.mkv", 1)
+	if err != nil || len(got) != 1 || got[0] != want[0] {
+		t.Errorf("Silences = %+v, %v; want %+v", got, err, want)
+	}
+	if _, err := fake.Silences(context.Background(), "/v.mkv", 9); !errors.Is(err, audiosource.ErrNoAudioStream) {
+		t.Errorf("Silences(unknown stream) error = %v, want ErrNoAudioStream", err)
+	}
+}

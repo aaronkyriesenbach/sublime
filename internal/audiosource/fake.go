@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"time"
 )
 
 // ExtractCall records a single Extract invocation on a FakeSource.
@@ -24,6 +25,22 @@ type FakeSource struct {
 	// StreamsErr, if set, is returned by AudioStreams instead of Streams.
 	StreamsErr error
 
+	// Length is returned by Duration for every video path.
+	Length time.Duration
+
+	// DurationErr, if set, is returned by Duration instead of Length.
+	DurationErr error
+
+	// SilenceIntervals is returned by Silences for every video path.
+	SilenceIntervals []Silence
+
+	// SilencesErr, if set, is returned by Silences instead of
+	// SilenceIntervals.
+	SilencesErr error
+
+	// SilencesCalls counts Silences invocations.
+	SilencesCalls int
+
 	// Audio, if non-nil, is returned verbatim by Extract. Left nil, Extract
 	// returns silence of the requested Range.Duration as a valid WAV.
 	Audio []byte
@@ -41,6 +58,30 @@ func (f *FakeSource) AudioStreams(_ context.Context, _ string) ([]Stream, error)
 		return nil, f.StreamsErr
 	}
 	return append([]Stream(nil), f.Streams...), nil
+}
+
+// Duration implements Source.
+func (f *FakeSource) Duration(_ context.Context, _ string) (time.Duration, error) {
+	if f.DurationErr != nil {
+		return 0, f.DurationErr
+	}
+	return f.Length, nil
+}
+
+// Silences implements Source. Like the real implementation, it reports
+// ErrNoAudioStream for an index that is not in Streams.
+func (f *FakeSource) Silences(_ context.Context, _ string, streamIndex int) ([]Silence, error) {
+	f.mu.Lock()
+	f.SilencesCalls++
+	f.mu.Unlock()
+
+	if f.SilencesErr != nil {
+		return nil, f.SilencesErr
+	}
+	if !hasStream(f.Streams, streamIndex) {
+		return nil, fmt.Errorf("%w: fake has no audio stream at index %d", ErrNoAudioStream, streamIndex)
+	}
+	return append([]Silence(nil), f.SilenceIntervals...), nil
 }
 
 // Extract implements Source. Like the real implementation, it reports

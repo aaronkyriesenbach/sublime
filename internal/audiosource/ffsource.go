@@ -6,8 +6,22 @@ import (
 	"encoding/json"
 	"fmt"
 	"os/exec"
+	"regexp"
 	"strconv"
 	"time"
+)
+
+// Silence detection thresholds. -30 dB sits above typical encoder noise
+// floors yet below speech and music, and half a second is long enough to be
+// a pause between phrases rather than a gap between words.
+const (
+	silenceNoiseFloor  = "-30dB"
+	silenceMinDuration = "0.5"
+)
+
+var (
+	silenceStartPattern = regexp.MustCompile(`silence_start: (-?\d+(?:\.\d+)?)`)
+	silenceEndPattern   = regexp.MustCompile(`silence_end: (-?\d+(?:\.\d+)?)`)
 )
 
 // FFSource is a Source backed by the real ffprobe and ffmpeg binaries. The
@@ -59,6 +73,86 @@ func (s *FFSource) AudioStreams(ctx context.Context, videoPath string) ([]Stream
 		streams[i] = Stream{Index: st.Index, Language: normalizeLanguageTag(st.Tags["language"])}
 	}
 	return streams, nil
+}
+
+// Duration implements Source.
+func (s *FFSource) Duration(ctx context.Context, videoPath string) (time.Duration, error) {
+	cmd := exec.CommandContext(ctx, s.ffprobePath,
+		"-v", "error",
+		"-show_entries", "format=duration",
+		"-of", "default=noprint_wrappers=1:nokey=1",
+		videoPath,
+	)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return 0, fmt.Errorf("audiosource: ffprobe duration of %q: %w: %s", videoPath, err, stderr.String())
+	}
+
+	secs, err := strconv.ParseFloat(string(bytes.TrimSpace(stdout.Bytes())), 64)
+	if err != nil {
+		return 0, fmt.Errorf("audiosource: parsing duration of %q: %w", videoPath, err)
+	}
+	return time.Duration(secs * float64(time.Second)), nil
+}
+
+// Silences implements Source.
+func (s *FFSource) Silences(ctx context.Context, videoPath string, streamIndex int) ([]Silence, error) {
+	streams, err := s.AudioStreams(ctx, videoPath)
+	if err != nil {
+		return nil, err
+	}
+	if !hasStream(streams, streamIndex) {
+		return nil, fmt.Errorf("%w: %q has no audio stream at index %d", ErrNoAudioStream, videoPath, streamIndex)
+	}
+
+	// silencedetect reports through the log, which -v error would hide.
+	cmd := exec.CommandContext(ctx, s.ffmpegPath,
+		"-v", "info", "-nostats", "-nostdin",
+		"-i", videoPath,
+		"-map", "0:"+strconv.Itoa(streamIndex),
+		"-vn", "-sn", "-dn",
+		"-af", "silencedetect=noise="+silenceNoiseFloor+":d="+silenceMinDuration,
+		"-f", "null", "-",
+	)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("audiosource: ffmpeg detecting silence in stream %d of %q: %w: %s", streamIndex, videoPath, err, stderr.String())
+	}
+
+	silences := parseSilences(stderr.Bytes())
+	// A silence running to the end of the stream has a start but no end.
+	if n := len(silences); n > 0 && silences[n-1].End < silences[n-1].Start {
+		total, err := s.Duration(ctx, videoPath)
+		if err != nil {
+			return nil, err
+		}
+		silences[n-1].End = total
+	}
+	return silences, nil
+}
+
+// parseSilences extracts silencedetect's start/end log lines. A trailing
+// silence without an end is returned with End before Start, for the caller
+// to close at the stream's end.
+func parseSilences(log []byte) []Silence {
+	var silences []Silence
+	for _, line := range bytes.Split(log, []byte("\n")) {
+		if m := silenceStartPattern.FindSubmatch(line); m != nil {
+			silences = append(silences, Silence{Start: parseSeconds(m[1]), End: -1})
+		} else if m := silenceEndPattern.FindSubmatch(line); m != nil && len(silences) > 0 {
+			silences[len(silences)-1].End = parseSeconds(m[1])
+		}
+	}
+	return silences
+}
+
+func parseSeconds(text []byte) time.Duration {
+	// The pattern only admits well-formed numbers.
+	secs, _ := strconv.ParseFloat(string(text), 64)
+	return time.Duration(secs * float64(time.Second))
 }
 
 // Extract implements Source.
