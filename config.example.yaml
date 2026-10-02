@@ -52,8 +52,7 @@ providers:
   # the other Provider substitute. Whisper never translates (audio must be in
   # the target language) and its subtitles are never Synced. Changing the chain
   # does not rewrite existing subtitles: run `sublime reprocess` to redo them.
-  # Sidecar setup, models and GPU images: docs/whisper.md (compose example is
-  # unverified until spike #100 completes).
+  # Sidecar setup, models, GPU images and measured speed: docs/whisper.md.
 
   opensubtitles:
     worker_count: 4 # concurrent workers in this Provider's pool
@@ -69,4 +68,6 @@ providers:
   #   endpoint: http://whisper:8080 # required
   #   worker_count: 1 # default; the sidecar serves one request at a time
   #   chunk_length: 10m # default; audio is transcribed in chunks about this
-  #   long, cut at silence. Use a shorter value on a slow CPU. Must be positive.
+  #   long, cut at silence. Each request gets 3 x the chunk's audio length + 1
+  #   minute. Keep the default; on a slow CPU pick a smaller model instead.
+  #   Must be positive.

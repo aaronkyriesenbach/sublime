@@ -36,9 +36,8 @@ a subtitle using a [whisper.cpp](https://github.com/ggml-org/whisper.cpp)
 server running as a sidecar container. `whisper` is a Provider like
 `opensubtitles` or `subdl`: you put it in `providers.chain`, and its position
 is its priority. Starting the sidecar, model and GPU choice, and expected
-speed are in [docs/whisper.md](docs/whisper.md); the sidecar example in
-`docker-compose.yml` is unverified until spike
-[#100](https://github.com/aaronkyriesenbach/sublime/issues/100) completes.
+speed are in [docs/whisper.md](docs/whisper.md); the sidecar example is in
+`docker-compose.yml`.
 Whisper needs no API keys, only the sidecar's URL:
 
 ```yaml
