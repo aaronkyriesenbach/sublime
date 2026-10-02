@@ -46,18 +46,36 @@ docker compose --profile whisper up -d
 
 The compose file ships with `--vad` off. Uncommenting the `--vad` and
 `--vad-model` lines of the `whisper` service skips silence and music before
-decoding, which made `small` about 25% faster (26.7 s vs 35.9 s per 10-minute
-chunk at 12 threads) and avoided the repeated-line loops that the no-VAD run
-produced in 2 of 9 chunks of a 92-minute film. Without it, expect occasional
-non-speech hallucinations, which Sublime's sanity check rejects and retries.
+decoding. It is much faster, but on content with music and sound effects under
+the dialogue it also throws away real speech, so it is **not recommended
+unless your audio is clean**.
 
-`--vad` makes whisper.cpp report word timestamps on the shortened, speechless
-timeline, so cues would land far too early (upstream
+What was measured with `small-q5_1`, 4 threads, on a modern TV episode (two
+*Doctor Who* 2005 episodes, 44 to 46 minutes, music and effects under most
+scenes), compared with the episode's existing human-made subtitle:
+
+| | Wall time per episode | Words recovered (recall) | Words that were right (precision) |
+| --- | --- | --- | --- |
+| no `--vad` (default) | 4 to 8 min | 0.91 | 0.83 |
+| `--vad` | about 1.1 min | 0.55 | 0.93 |
+| `--vad --vad-threshold 0.2` | (10-minute chunk, about 2x faster) | 0.66 | 0.94 |
+
+Recall and precision are bag-of-words against the human subtitle for one
+10-minute stretch of dialogue, so they are rough, but the direction is clear:
+with `--vad` the transcript looked clean and was missing about a third to a
+half of the dialogue. Without it the transcript is complete, and the
+occasional repeated-line loop or hallucinated word on non-speech is caught by
+Sublime's sanity check, which retries the chunk (up to 3 attempts) before
+giving up on the file. Lowering `--vad-threshold` recovers only some of the
+lost speech. Clean, speech-only audio (an old film, a podcast, a lecture) can
+safely use `--vad`.
+
+`--vad` also makes whisper.cpp report word timestamps on the shortened,
+speechless timeline, so cues would land far too early (upstream
 [whisper.cpp#3174](https://github.com/ggml-org/whisper.cpp/issues/3174)).
 Sublime's whisper Provider shifts each segment's word times back onto the real
-timeline, so enabling it is safe, with about half a second of timing jitter
-that comes with VAD remapping. The VAD model is already downloaded by
-`whisper-models`.
+timeline, so enabling it is safe, with about half a second of timing jitter.
+The VAD model is already downloaded by `whisper-models`.
 
 Without the `whisper` profile, `docker compose up -d` does not start the
 sidecar. If the sidecar is down or restarting, Sublime marks the whisper
@@ -131,6 +149,12 @@ limited with `docker run --cpus=N` and `-t N`.
 | | 4 | 210.8 s | 2.85x | 976 MiB |
 | | 8 | 113.3 s | 5.29x | 977 MiB |
 | | 12 | 103.0 s | 5.83x | 976 MiB |
+
+These runs used `--vad`, which the shipped compose file leaves off (see
+[voice activity detection](#optional-voice-activity-detection)). Without it,
+expect roughly 1.4x to 4x longer: a 45-minute TV episode took 4 to 8 minutes
+with `small` and 4 threads (about 6-11x real time), the slower end when
+chunks had to be retried.
 
 End to end through Sublime (silence detection and chunk extraction included),
 the whole 91:44 film with `small` and 12 threads took 301.8 s (18.2x) with
