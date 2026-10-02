@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1847,10 +1848,11 @@ func TestDispatcher_RunDispatchesToOtherProvidersWhileOnePairIsBlocked(t *testin
 	}
 
 	d := &dispatcher.Dispatcher{
-		ProviderTiers: []dispatcher.ProviderTier{
-			{Providers: []dispatcher.ProviderEntry{{Name: "slow", Pipeline: slowPipeline, WorkerCount: 1}}},
-			{Providers: []dispatcher.ProviderEntry{{Name: "fast", Pipeline: fastPipeline, WorkerCount: 1}}},
-		},
+		// Tier-mates: capacity overflow never crosses a Tier (ADR 0015).
+		ProviderTiers: []dispatcher.ProviderTier{{Providers: []dispatcher.ProviderEntry{
+			{Name: "slow", Pipeline: slowPipeline, WorkerCount: 1},
+			{Name: "fast", Pipeline: fastPipeline, WorkerCount: 1},
+		}}},
 		Store:        st,
 		Libraries:    []domain.Library{lib},
 		PollInterval: 10 * time.Millisecond,
@@ -2048,6 +2050,118 @@ func TestDispatcher_RunLegacyModeDoesNotWaitForInFlightPair(t *testing.T) {
 
 	close(release)
 	waitFor(t, "both pairs to land Failed(no_candidate)", func() bool { return summaryFor(t, st, lib).Failed == 2 })
+	cancel()
+	<-done
+}
+
+// blockingProvider holds every Search until release is closed, counting calls.
+func blockingProvider(release <-chan struct{}, searches *atomic.Int32) *provider.Fake {
+	return &provider.Fake{
+		SearchFunc: func(ctx context.Context, _ provider.Query) ([]domain.Candidate, error) {
+			searches.Add(1)
+			select {
+			case <-release:
+			case <-ctx.Done():
+			}
+			return nil, errors.New("released")
+		},
+	}
+}
+
+// TestDispatcher_CapacityNeverCrossesATierBoundary guards ADR 0015: when every
+// Provider in a pair's current Tier is at worker capacity, the pair stays
+// Pending instead of overflowing to a lower Tier.
+func TestDispatcher_CapacityNeverCrossesATierBoundary(t *testing.T) {
+	st, lib := longLivedFixture(t, 2)
+	release := make(chan struct{})
+	var upperSearches, lowerSearches atomic.Int32
+	upper := blockingProvider(release, &upperSearches)
+	lower := &provider.Fake{
+		SearchFunc: func(context.Context, provider.Query) ([]domain.Candidate, error) {
+			lowerSearches.Add(1)
+			return []domain.Candidate{{ID: "match", HashMatch: true}}, nil
+		},
+		DownloadFunc: func(context.Context, domain.Candidate) ([]byte, error) {
+			return []byte("1\n00:00:00,500 --> 00:00:01,900\nOne two three\n"), nil
+		},
+	}
+	newPipeline := func(p provider.Provider) *pipeline.Pipeline {
+		return &pipeline.Pipeline{Store: st, Provider: p, SyncEngine: &syncengine.FakeSyncEngine{}, Stripper: &pipeline.FakeStripper{}}
+	}
+	upperPipeline, lowerPipeline := newPipeline(upper), newPipeline(lower)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if _, err := upperPipeline.Run(ctx, lib); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	d := &dispatcher.Dispatcher{
+		ProviderTiers: []dispatcher.ProviderTier{
+			{Providers: []dispatcher.ProviderEntry{{Name: "upper", Pipeline: upperPipeline, WorkerCount: 1}}},
+			{Providers: []dispatcher.ProviderEntry{{Name: "lower", Pipeline: lowerPipeline, WorkerCount: 1}}},
+		},
+		Store:        st,
+		Libraries:    []domain.Library{lib},
+		PollInterval: 5 * time.Millisecond,
+	}
+	done := make(chan error, 1)
+	go func() { done <- d.Run(ctx) }()
+
+	waitFor(t, "upper Provider's only worker busy", func() bool { return summaryFor(t, st, lib).InProgress == 1 })
+	// Let several polling passes elapse while the upper Tier is at capacity.
+	time.Sleep(100 * time.Millisecond)
+
+	got := summaryFor(t, st, lib)
+	if got.InProgress != 1 || got.Pending != 1 {
+		t.Errorf("InProgress/Pending = %d/%d, want 1/1 (second pair waits on the upper Tier)", got.InProgress, got.Pending)
+	}
+	if n := lowerSearches.Load(); n != 0 {
+		t.Errorf("lower Tier searches = %d, want 0 (capacity must not cross a Tier)", n)
+	}
+
+	close(release)
+	cancel()
+	<-done
+}
+
+// TestDispatcher_CapacityOverflowsToTierMate guards that within one Tier a
+// Tier-mate with spare capacity is still used when the preferred Provider's
+// workers are all busy.
+func TestDispatcher_CapacityOverflowsToTierMate(t *testing.T) {
+	st, lib := longLivedFixture(t, 2)
+	release := make(chan struct{})
+	var firstSearches, secondSearches atomic.Int32
+	newPipeline := func(p provider.Provider) *pipeline.Pipeline {
+		return &pipeline.Pipeline{Store: st, Provider: p, SyncEngine: &syncengine.FakeSyncEngine{}, Stripper: &pipeline.FakeStripper{}}
+	}
+	firstPipeline := newPipeline(blockingProvider(release, &firstSearches))
+	secondPipeline := newPipeline(blockingProvider(release, &secondSearches))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if _, err := firstPipeline.Run(ctx, lib); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	d := &dispatcher.Dispatcher{
+		ProviderTiers: []dispatcher.ProviderTier{{Providers: []dispatcher.ProviderEntry{
+			{Name: "first", Pipeline: firstPipeline, WorkerCount: 1},
+			{Name: "second", Pipeline: secondPipeline, WorkerCount: 1},
+		}}},
+		Store:        st,
+		Libraries:    []domain.Library{lib},
+		PollInterval: 5 * time.Millisecond,
+	}
+	done := make(chan error, 1)
+	go func() { done <- d.Run(ctx) }()
+
+	waitFor(t, "both Tier-mates busy", func() bool { return summaryFor(t, st, lib).InProgress == 2 })
+	if first, second := firstSearches.Load(), secondSearches.Load(); first != 1 || second != 1 {
+		t.Errorf("searches first/second = %d/%d, want 1/1", first, second)
+	}
+
+	close(release)
 	cancel()
 	<-done
 }

@@ -70,9 +70,10 @@ type Dispatcher struct {
 	// ProviderTiers is the Tier-grouped Provider Chain (see ADR 0008):
 	// each Tier is tried in priority order, and within a Tier, the first
 	// healthy (non-Suspended) Provider with spare capacity is used.
-	// Suspension may skip to a Tier-mate but never crosses a Tier boundary:
-	// if every Provider in the current Tier is Suspended, the pair stays
-	// Pending waiting on that Tier rather than descending to the next.
+	// Suspension and worker capacity may skip to a Tier-mate but never cross
+	// a Tier boundary: if every Provider in the current Tier is Suspended or
+	// at capacity, the pair stays Pending waiting on that Tier rather than
+	// descending to the next.
 	// When non-empty, both Pipeline and Providers are ignored.
 	ProviderTiers []ProviderTier
 
@@ -473,10 +474,11 @@ func allFull(pools []*workerPool) bool {
 // (ProviderTiers non-empty). Each Provider has its own long-lived pool, and
 // for each pair we walk Tiers in priority order. Within a Tier, the first
 // healthy (non-Suspended, non-already-attempted) Provider with spare
-// capacity is used. Suspension may skip to a Tier-mate but never crosses a
-// Tier boundary: if every Provider in the current Tier is Suspended, the
-// pair stays Pending. When all Providers across all Tiers have been
-// attempted, the Dispatcher marks the pair Failed(no_candidate).
+// capacity is used. Neither Suspension nor worker capacity crosses a Tier
+// boundary (ADR 0008, ADR 0015): if every Provider in the current Tier is
+// Suspended or at capacity, the pair stays Pending. When all Providers
+// across all Tiers have been attempted, the Dispatcher marks the pair
+// Failed(no_candidate).
 func (d *Dispatcher) dispatchTierMode(ctx context.Context, pairs []store.PendingPair, librariesByName map[string]domain.Library) {
 	var every []*workerPool
 	for _, pools := range d.state.tiers {
@@ -513,22 +515,22 @@ pairLoop:
 		}
 
 		for tierIdx, pools := range d.state.tiers {
-			allSuspended := true
+			var candidates []*workerPool
 			for _, pool := range pools {
-				if !d.pipelineSuspended(pool.entry.Pipeline) {
-					allSuspended = false
-					break
+				if !attemptedSet[pool.entry.Name] {
+					candidates = append(candidates, pool)
 				}
 			}
-			if allSuspended {
-				d.logger().Debug("dispatcher: tier fully suspended, waiting",
-					"tier", tierIdx, "path", pair.Path, "language", pair.Language.String())
-				d.endPair(pair)
-				continue pairLoop
+			if len(candidates) == 0 {
+				// Every Provider here already missed, so this Tier is spent.
+				continue
 			}
 
-			for _, pool := range pools {
-				if d.pipelineSuspended(pool.entry.Pipeline) || attemptedSet[pool.entry.Name] {
+			// This is the pair's current Tier. Whether its Providers are all
+			// Suspended or all at capacity, the pair waits here rather than
+			// descending: chain order is operator preference (ADR 0015).
+			for _, pool := range candidates {
+				if d.pipelineSuspended(pool.entry.Pipeline) {
 					continue
 				}
 
@@ -539,6 +541,9 @@ pairLoop:
 				default:
 				}
 			}
+			d.logger().Debug("dispatcher: tier suspended or at capacity, waiting",
+				"tier", tierIdx, "path", pair.Path, "language", pair.Language.String())
+			break
 		}
 
 		d.endPair(pair)
