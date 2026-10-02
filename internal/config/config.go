@@ -6,6 +6,7 @@ package config
 import (
 	"bytes"
 	"fmt"
+	"net/url"
 	"os"
 
 	"golang.org/x/text/language"
@@ -44,6 +45,10 @@ type ProviderConfig struct {
 	// Paid is SubDL-specific: whether to use SubDL's paid tier. It is
 	// meaningless for other Providers.
 	Paid bool
+
+	// Endpoint is whisper-specific: the base URL of the whisper.cpp
+	// sidecar. It is meaningless for other Providers.
+	Endpoint string
 }
 
 // ProviderTier is a named rank within the Provider Chain, holding one or
@@ -92,11 +97,18 @@ type rawProviders struct {
 var knownProviderNames = map[string]struct{}{
 	"opensubtitles": {},
 	"subdl":         {},
+	"whisper":       {},
 }
 
+// whisperDefaultWorkerCount overrides the generic split-evenly default:
+// the whisper.cpp sidecar serves one inference at a time, so extra workers
+// would only queue multi-hour requests behind it.
+const whisperDefaultWorkerCount = 1
+
 type rawProviderSettings struct {
-	WorkerCount int  `yaml:"worker_count"`
-	Paid        bool `yaml:"paid"`
+	WorkerCount int    `yaml:"worker_count"`
+	Paid        bool   `yaml:"paid"`
+	Endpoint    string `yaml:"endpoint"`
 }
 
 // Load reads, parses, and validates the config file at path.
@@ -196,6 +208,15 @@ func providerChainFromRaw(raw *rawProviders) ([]ProviderConfig, []ProviderTier, 
 				Name:        name,
 				WorkerCount: settings.WorkerCount,
 				Paid:        settings.Paid,
+				Endpoint:    settings.Endpoint,
+			}
+			if name == "whisper" {
+				if err := validateWhisperSettings(provider); err != nil {
+					return nil, nil, err
+				}
+				if provider.WorkerCount == 0 {
+					provider.WorkerCount = whisperDefaultWorkerCount
+				}
 			}
 			chain = append(chain, provider)
 			tierProviders = append(tierProviders, provider)
@@ -205,6 +226,22 @@ func providerChainFromRaw(raw *rawProviders) ([]ProviderConfig, []ProviderTier, 
 	}
 
 	return chain, tiers, nil
+}
+
+// validateWhisperSettings requires an http(s) endpoint with a host, so a
+// typo fails at startup instead of during a transcription.
+func validateWhisperSettings(whisper ProviderConfig) error {
+	if whisper.Endpoint == "" {
+		return fmt.Errorf("providers.whisper: missing required field %q", "endpoint")
+	}
+	u, err := url.Parse(whisper.Endpoint)
+	if err != nil {
+		return fmt.Errorf("providers.whisper: invalid endpoint %q: %w", whisper.Endpoint, err)
+	}
+	if (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return fmt.Errorf("providers.whisper: invalid endpoint %q: must be an http(s) URL with a host", whisper.Endpoint)
+	}
+	return nil
 }
 
 // tierNamesFromNode extracts the Provider name(s) declared by a single

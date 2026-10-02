@@ -28,6 +28,11 @@ providers:
   # A nested list is one Tier of Providers the operator trusts equally
   # (see CONTEXT.md's Tier entry and docs/adr/0008-tiered-provider-chain.md):
   chain: [[opensubtitles, subdl]]
+  #
+  # whisper generates a subtitle from the video's own audio (same language
+  # only, never Synced) and takes its place in the chain like any other
+  # Provider: [whisper] alone, [whisper, opensubtitles] to prefer generated
+  # subtitles, or [opensubtitles, whisper] as a last resort.
 
   opensubtitles:
     worker_count: 4 # concurrent workers in this Provider's pool
@@ -35,3 +40,9 @@ providers:
   subdl:
     worker_count: 2
     paid: true # use SubDL's paid tier
+
+  # Only needed when whisper is in the chain. No secrets: just the URL of a
+  # whisper.cpp server.
+  # whisper:
+  #   endpoint: http://whisper:8080 # required
+  #   worker_count: 1 # default; the sidecar serves one request at a time
