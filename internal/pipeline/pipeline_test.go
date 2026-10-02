@@ -1413,3 +1413,162 @@ func TestPipeline_TransitionsPendingToInProgressToSynced(t *testing.T) {
 		t.Fatalf("file.Languages = %+v, want 1 entry with status synced", file.Languages)
 	}
 }
+
+// neverSyncedFixture wires a Pipeline around a provider.Fake that declares
+// GeneratesSubtitles (or not), with a fake Sync Engine whose Calls tell a
+// test whether the sync stage ran.
+type neverSyncedFixture struct {
+	lib       domain.Library
+	videoPath string
+	sidecar   string
+	st        *store.Store
+	engine    *syncengine.FakeSyncEngine
+	downloads *int
+	pipe      *pipeline.Pipeline
+}
+
+func newNeverSyncedFixture(t *testing.T, generatesSubtitles bool) *neverSyncedFixture {
+	t.Helper()
+	libDir := t.TempDir()
+	videoPath := filepath.Join(libDir, "Test.Movie.2024.HDTV.x264-FAKEGROUP.mp4")
+	writeVideoFixture(t, videoPath)
+
+	downloads := new(int)
+	fakeProvider := &provider.Fake{
+		GeneratesSubtitles: generatesSubtitles,
+		SearchFunc: func(context.Context, provider.Query) ([]domain.Candidate, error) {
+			return []domain.Candidate{{ID: "candidate", Title: "Test Movie", Year: 2024}}, nil
+		},
+		DownloadFunc: func(context.Context, domain.Candidate) ([]byte, error) {
+			*downloads++
+			return []byte("1\n00:00:00,500 --> 00:00:01,900\nOne two three\n"), nil
+		},
+	}
+	st := openTestStore(t)
+	engine := &syncengine.FakeSyncEngine{}
+	return &neverSyncedFixture{
+		lib: domain.Library{
+			Name:       "test-library",
+			Path:       libDir,
+			Languages:  []language.Tag{language.English},
+			StripScope: domain.StripScopeAll,
+		},
+		videoPath: videoPath,
+		sidecar:   filepath.Join(libDir, "Test.Movie.2024.HDTV.x264-FAKEGROUP.en.srt"),
+		st:        st,
+		engine:    engine,
+		downloads: downloads,
+		pipe: &pipeline.Pipeline{
+			Store:      st,
+			Provider:   fakeProvider,
+			SyncEngine: engine,
+			Stripper:   &pipeline.FakeStripper{},
+		},
+	}
+}
+
+func (f *neverSyncedFixture) assertSyncedWithValidMarker(t *testing.T) {
+	t.Helper()
+	file, found, err := f.st.GetFile(context.Background(), f.lib.Name, f.videoPath)
+	if err != nil || !found {
+		t.Fatalf("GetFile found=%v err=%v", found, err)
+	}
+	if len(file.Languages) != 1 || file.Languages[0].Status != domain.StatusSynced {
+		t.Fatalf("file.Languages = %+v, want 1 entry with status synced", file.Languages)
+	}
+
+	content, err := os.ReadFile(f.sidecar)
+	if err != nil {
+		t.Fatalf("reading sidecar: %v", err)
+	}
+	hash, err := media.ComputeContentHash(f.videoPath)
+	if err != nil {
+		t.Fatalf("computing video hash: %v", err)
+	}
+	codec, _ := marker.CodecFor(".srt")
+	m, presence := codec.Read(content)
+	if presence != marker.Present || m.ContentHash != hash {
+		t.Fatalf("sidecar marker = %+v (presence %v), want hash %q Present", m, presence, hash)
+	}
+}
+
+func TestPipeline_NeverSyncedProviderSkipsSyncAndEndsSyncedWithMarker(t *testing.T) {
+	f := newNeverSyncedFixture(t, true)
+	ctx := context.Background()
+	if _, err := f.pipe.Run(ctx, f.lib); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	dispatchPending(t, ctx, f.pipe, f.st, f.lib)
+
+	if len(f.engine.Calls) != 0 {
+		t.Errorf("SyncEngine.Calls = %d, want 0 for a never-Synced Provider", len(f.engine.Calls))
+	}
+	f.assertSyncedWithValidMarker(t)
+}
+
+func TestPipeline_NeverSyncedProviderStillRebindsMarkerToPostStripHash(t *testing.T) {
+	f := newNeverSyncedFixture(t, true)
+	f.pipe.Stripper = &pipeline.FakeStripper{StripEmbeddedIndices: []int{2}}
+	ctx := context.Background()
+	if _, err := f.pipe.Run(ctx, f.lib); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	dispatchPending(t, ctx, f.pipe, f.st, f.lib)
+
+	if len(f.engine.Calls) != 0 {
+		t.Errorf("SyncEngine.Calls = %d, want 0", len(f.engine.Calls))
+	}
+	f.assertSyncedWithValidMarker(t)
+}
+
+func TestPipeline_OrdinaryProviderStillSyncs(t *testing.T) {
+	f := newNeverSyncedFixture(t, false)
+	ctx := context.Background()
+	if _, err := f.pipe.Run(ctx, f.lib); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	dispatchPending(t, ctx, f.pipe, f.st, f.lib)
+
+	if len(f.engine.Calls) != 1 {
+		t.Errorf("SyncEngine.Calls = %d, want 1 for an ordinary Provider", len(f.engine.Calls))
+	}
+	f.assertSyncedWithValidMarker(t)
+}
+
+func TestPipeline_NeverSyncedProviderHonorsMarkerGateAndForce(t *testing.T) {
+	f := newNeverSyncedFixture(t, true)
+	ctx := context.Background()
+	if _, err := f.pipe.Run(ctx, f.lib); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	dispatchPending(t, ctx, f.pipe, f.st, f.lib)
+	if *f.downloads != 1 {
+		t.Fatalf("downloads after first dispatch = %d, want 1", *f.downloads)
+	}
+
+	// A re-registered pair with a still-valid Marker is skipped by the gate.
+	file, found, err := f.st.GetFile(ctx, f.lib.Name, f.videoPath)
+	if err != nil || !found {
+		t.Fatalf("GetFile found=%v err=%v", found, err)
+	}
+	if err := f.st.ResetToPending(ctx, file.ID); err != nil {
+		t.Fatalf("resetting to pending: %v", err)
+	}
+	dispatchPending(t, ctx, f.pipe, f.st, f.lib)
+	if *f.downloads != 1 {
+		t.Errorf("downloads after gated dispatch = %d, want still 1", *f.downloads)
+	}
+
+	// Force bypasses the gate and regenerates, still without Sync.
+	if _, err := f.pipe.RunFile(ctx, f.lib, f.videoPath, pipeline.WithForce()); err != nil {
+		t.Fatalf("forced RunFile: %v", err)
+	}
+	dispatchPending(t, ctx, f.pipe, f.st, f.lib)
+	if *f.downloads != 2 {
+		t.Errorf("downloads after forced dispatch = %d, want 2", *f.downloads)
+	}
+	if len(f.engine.Calls) != 0 {
+		t.Errorf("SyncEngine.Calls = %d, want 0", len(f.engine.Calls))
+	}
+	f.assertSyncedWithValidMarker(t)
+}

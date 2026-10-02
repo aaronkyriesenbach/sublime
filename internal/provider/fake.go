@@ -28,6 +28,11 @@ type Fake struct {
 	// A nil SuspendedFunc reports not-suspended, matching a Provider that
 	// has never suspended.
 	SuspendedFunc func() (resumeAt time.Time, suspended bool)
+
+	// GeneratesSubtitles makes the Fake declare, through the optional
+	// neverSynced capability (see internal/pipeline), that its subtitles are
+	// never Synced — the way a Provider producing Generated Subtitles does.
+	GeneratesSubtitles bool
 }
 
 var _ Provider = (*Fake)(nil)
@@ -57,4 +62,10 @@ func (f *Fake) Suspension() (resumeAt time.Time, suspended bool) {
 		return time.Time{}, false
 	}
 	return f.SuspendedFunc()
+}
+
+// NeverSynced reports GeneratesSubtitles. It implements the optional
+// capability internal/pipeline checks to skip the sync stage.
+func (f *Fake) NeverSynced() bool {
+	return f.GeneratesSubtitles
 }

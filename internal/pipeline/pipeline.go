@@ -146,6 +146,22 @@ func (p *Pipeline) markPending(
 	return nil
 }
 
+// neverSyncedProvider is the optional capability interface a Provider may
+// implement to declare that its subtitles are never Synced (a Generated
+// Subtitle's timing already derives from the video's audio — see
+// docs/adr/0014-whisper-generated-subtitles-as-a-provider.md). Defined here,
+// at the wiring seam, rather than on provider.Provider, so implementing it
+// stays opt-in.
+type neverSyncedProvider interface {
+	NeverSynced() bool
+}
+
+// skipsSync reports whether p.Provider declares its subtitles are never Synced.
+func (p *Pipeline) skipsSync() bool {
+	ns, ok := p.Provider.(neverSyncedProvider)
+	return ok && ns.NeverSynced()
+}
+
 // Stripper is the subset of strip.FFStripper the pipeline needs, extracted
 // as an interface so tests can inject a fake that doesn't shell out to
 // ffprobe/ffmpeg.
@@ -602,12 +618,15 @@ func (p *Pipeline) processFile(
 		return ProcessResult{Outcome: OutcomeFailed, Err: fmt.Errorf("downloading candidate: %w", err)}
 	}
 
-	syncedContent, err := p.syncSubtitle(ctx, videoPath, subtitleContent)
-	if err != nil {
-		if markErr := p.markFailed(ctx, lib, videoPath, lang, file.ID, domain.FailureSyncFailed, err); markErr != nil {
-			return ProcessResult{Outcome: OutcomeFailed, Err: errors.Join(err, markErr)}
+	syncedContent := subtitleContent
+	if !p.skipsSync() {
+		syncedContent, err = p.syncSubtitle(ctx, videoPath, subtitleContent)
+		if err != nil {
+			if markErr := p.markFailed(ctx, lib, videoPath, lang, file.ID, domain.FailureSyncFailed, err); markErr != nil {
+				return ProcessResult{Outcome: OutcomeFailed, Err: errors.Join(err, markErr)}
+			}
+			return ProcessResult{Outcome: OutcomeFailed, Err: fmt.Errorf("syncing subtitle: %w", err)}
 		}
-		return ProcessResult{Outcome: OutcomeFailed, Err: fmt.Errorf("syncing subtitle: %w", err)}
 	}
 
 	sidecarExt := ".srt"

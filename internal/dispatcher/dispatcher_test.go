@@ -1442,3 +1442,105 @@ func TestDispatcher_SingleProviderMissIsImmediatelyTerminal(t *testing.T) {
 		t.Fatalf("expected reason no_candidate, got %v", file.Languages[0].FailureReason)
 	}
 }
+
+// chainProvider builds a Fake that either misses (no scoring match) or hits,
+// optionally declaring never-Synced, for the chain-order tests below.
+func chainProvider(hit, generatesSubtitles bool) *provider.Fake {
+	title, year := "Wrong", 1900
+	if hit {
+		title, year = "Test Movie", 2024
+	}
+	return &provider.Fake{
+		GeneratesSubtitles: generatesSubtitles,
+		SearchFunc: func(context.Context, provider.Query) ([]domain.Candidate, error) {
+			return []domain.Candidate{{ID: "c", Title: title, Year: year}}, nil
+		},
+		DownloadFunc: func(context.Context, domain.Candidate) ([]byte, error) {
+			return []byte("1\n00:00:00,500 --> 00:00:01,900\nSubtitle text\n"), nil
+		},
+	}
+}
+
+// runTwoProviderChain dispatches one pair through a two-Provider, one-Tier
+// chain [first, second] until it leaves Pending, returning the final state
+// and each Provider's Sync Engine for asserting whether Sync ran.
+func runTwoProviderChain(t *testing.T, first, second *provider.Fake) (domain.FileLanguageState, *syncengine.FakeSyncEngine, *syncengine.FakeSyncEngine) {
+	t.Helper()
+	libDir := t.TempDir()
+	videoPath := filepath.Join(libDir, "Test.Movie.2024.HDTV.x264-FAKEGROUP.mp4")
+	writeVideoFixture(t, videoPath)
+	st := openTestStore(t)
+
+	engine1, engine2 := &syncengine.FakeSyncEngine{}, &syncengine.FakeSyncEngine{}
+	pipeline1 := &pipeline.Pipeline{Store: st, Provider: first, SyncEngine: engine1, Stripper: &pipeline.FakeStripper{}}
+	pipeline2 := &pipeline.Pipeline{Store: st, Provider: second, SyncEngine: engine2, Stripper: &pipeline.FakeStripper{}}
+
+	lib := domain.Library{
+		Name:       "test-library",
+		Path:       libDir,
+		Languages:  []language.Tag{language.English},
+		StripScope: domain.StripScopeAll,
+	}
+	ctx := context.Background()
+	if _, err := pipeline1.Run(ctx, lib); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	d := &dispatcher.Dispatcher{
+		ProviderTiers: []dispatcher.ProviderTier{{
+			Providers: []dispatcher.ProviderEntry{
+				{Name: "first", Pipeline: pipeline1, WorkerCount: 1},
+				{Name: "second", Pipeline: pipeline2, WorkerCount: 1},
+			},
+		}},
+		Store:     st,
+		Libraries: []domain.Library{lib},
+	}
+	for range 2 {
+		if err := d.RunOnce(ctx); err != nil {
+			t.Fatalf("RunOnce: %v", err)
+		}
+	}
+
+	file, found, err := st.GetFile(ctx, lib.Name, videoPath)
+	if err != nil || !found {
+		t.Fatalf("GetFile found=%v err=%v", found, err)
+	}
+	return file.Languages[0], engine1, engine2
+}
+
+func TestDispatcher_NeverSyncedProviderMissFallsThroughToOrdinaryProvider(t *testing.T) {
+	state, neverSyncedEngine, ordinaryEngine := runTwoProviderChain(t, chainProvider(false, true), chainProvider(true, false))
+
+	if state.Status != domain.StatusSynced {
+		t.Fatalf("status = %v (reason %v), want Synced via the ordinary Provider", state.Status, state.FailureReason)
+	}
+	if len(neverSyncedEngine.Calls) != 0 {
+		t.Errorf("never-Synced Provider's Sync calls = %d, want 0", len(neverSyncedEngine.Calls))
+	}
+	if len(ordinaryEngine.Calls) != 1 {
+		t.Errorf("ordinary Provider's Sync calls = %d, want 1", len(ordinaryEngine.Calls))
+	}
+}
+
+func TestDispatcher_OrdinaryProviderMissFallsThroughToNeverSyncedProvider(t *testing.T) {
+	state, ordinaryEngine, neverSyncedEngine := runTwoProviderChain(t, chainProvider(false, false), chainProvider(true, true))
+
+	if state.Status != domain.StatusSynced {
+		t.Fatalf("status = %v (reason %v), want Synced via the never-Synced Provider", state.Status, state.FailureReason)
+	}
+	if len(ordinaryEngine.Calls) != 0 {
+		t.Errorf("ordinary Provider's Sync calls = %d, want 0 (it missed)", len(ordinaryEngine.Calls))
+	}
+	if len(neverSyncedEngine.Calls) != 0 {
+		t.Errorf("never-Synced Provider's Sync calls = %d, want 0", len(neverSyncedEngine.Calls))
+	}
+}
+
+func TestDispatcher_ChainOfNeverSyncedAndOrdinaryFullMissLandsOnNoCandidate(t *testing.T) {
+	state, _, _ := runTwoProviderChain(t, chainProvider(false, true), chainProvider(false, false))
+
+	if state.Status != domain.StatusFailed || state.FailureReason != domain.FailureNoCandidate {
+		t.Fatalf("state = %v/%v, want Failed/no_candidate", state.Status, state.FailureReason)
+	}
+}
