@@ -1766,3 +1766,288 @@ func TestDispatcher_RecoveredInProgressPairIsClaimedAndProcessed(t *testing.T) {
 		t.Errorf("status after recovery = %q, want synced", file.Languages[0].Status)
 	}
 }
+
+// longLivedFixture writes numFiles videos into a fresh Library and returns it
+// with an empty store; callers register them via Pipeline.Run.
+func longLivedFixture(t *testing.T, numFiles int) (*store.Store, domain.Library) {
+	t.Helper()
+	libDir := t.TempDir()
+	for i := 0; i < numFiles; i++ {
+		writeVideoFixture(t, filepath.Join(libDir, string(rune('A'+i))+".Movie.2020.HDTV.x264-GRP.mp4"))
+	}
+	lib := domain.Library{
+		Name:       "test-library",
+		Path:       libDir,
+		Languages:  []language.Tag{language.English},
+		StripScope: domain.StripScopeAll,
+	}
+	return openTestStore(t), lib
+}
+
+func summaryFor(t *testing.T, st *store.Store, lib domain.Library) store.LibrarySummary {
+	t.Helper()
+	summaries, err := st.LibrarySummaries(context.Background())
+	if err != nil {
+		t.Fatalf("LibrarySummaries: %v", err)
+	}
+	for _, s := range summaries {
+		if s.LibraryName == lib.Name {
+			return s
+		}
+	}
+	t.Fatalf("no summary for library %q", lib.Name)
+	return store.LibrarySummary{}
+}
+
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", what)
+}
+
+// TestDispatcher_RunDispatchesToOtherProvidersWhileOnePairIsBlocked guards
+// that the polling loop never waits on in-flight pairs: while a Provider call
+// is stuck, a later pass still dispatches newly Pending pairs to a Provider
+// with spare capacity.
+func TestDispatcher_RunDispatchesToOtherProvidersWhileOnePairIsBlocked(t *testing.T) {
+	st, lib := longLivedFixture(t, 1)
+	block := make(chan struct{})
+	slow := &provider.Fake{
+		SearchFunc: func(ctx context.Context, _ provider.Query) ([]domain.Candidate, error) {
+			select {
+			case <-block:
+			case <-ctx.Done():
+			}
+			return nil, errors.New("slow provider released")
+		},
+	}
+	fast := &provider.Fake{
+		SearchFunc: func(context.Context, provider.Query) ([]domain.Candidate, error) {
+			return []domain.Candidate{{ID: "match", HashMatch: true}}, nil
+		},
+		DownloadFunc: func(context.Context, domain.Candidate) ([]byte, error) {
+			return []byte("1\n00:00:00,500 --> 00:00:01,900\nOne two three\n"), nil
+		},
+	}
+	newPipeline := func(p provider.Provider) *pipeline.Pipeline {
+		return &pipeline.Pipeline{Store: st, Provider: p, SyncEngine: &syncengine.FakeSyncEngine{}, Stripper: &pipeline.FakeStripper{}}
+	}
+	slowPipeline, fastPipeline := newPipeline(slow), newPipeline(fast)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if _, err := slowPipeline.Run(ctx, lib); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	d := &dispatcher.Dispatcher{
+		ProviderTiers: []dispatcher.ProviderTier{
+			{Providers: []dispatcher.ProviderEntry{{Name: "slow", Pipeline: slowPipeline, WorkerCount: 1}}},
+			{Providers: []dispatcher.ProviderEntry{{Name: "fast", Pipeline: fastPipeline, WorkerCount: 1}}},
+		},
+		Store:        st,
+		Libraries:    []domain.Library{lib},
+		PollInterval: 10 * time.Millisecond,
+	}
+	done := make(chan error, 1)
+	go func() { done <- d.Run(ctx) }()
+
+	waitFor(t, "first pair In Progress on the slow Provider", func() bool { return summaryFor(t, st, lib).InProgress == 1 })
+
+	// A second video appears while the first is still stuck in the slow Provider.
+	writeVideoFixture(t, filepath.Join(lib.Path, "B.Movie.2020.HDTV.x264-GRP.mp4"))
+	if _, err := slowPipeline.Run(ctx, lib); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	// The slow Provider's only worker is taken, so the new pair must reach the
+	// fast Provider without the first pair finishing.
+	waitFor(t, "second pair Synced via the fast Provider", func() bool { return summaryFor(t, st, lib).Synced == 1 })
+	if got := summaryFor(t, st, lib).InProgress; got != 1 {
+		t.Errorf("InProgress = %d, want 1 (the blocked pair still holds its worker)", got)
+	}
+
+	close(block)
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run = %v, want context.Canceled", err)
+	}
+}
+
+// TestDispatcher_RunNeverExceedsProviderWorkerCountAcrossPasses guards that a
+// Provider's worker pool persists between passes: with one worker busy,
+// repeated polls must not start further pairs on that Provider.
+func TestDispatcher_RunNeverExceedsProviderWorkerCountAcrossPasses(t *testing.T) {
+	const workerCount = 2
+	st, lib := longLivedFixture(t, 5)
+
+	var mu sync.Mutex
+	var current, peak, searches int
+	release := make(chan struct{})
+	prov := &provider.Fake{
+		SearchFunc: func(ctx context.Context, _ provider.Query) ([]domain.Candidate, error) {
+			mu.Lock()
+			current++
+			searches++
+			if current > peak {
+				peak = current
+			}
+			mu.Unlock()
+			defer func() {
+				mu.Lock()
+				current--
+				mu.Unlock()
+			}()
+			select {
+			case <-release:
+			case <-ctx.Done():
+			}
+			return nil, errors.New("released")
+		},
+	}
+	p := &pipeline.Pipeline{Store: st, Provider: prov, SyncEngine: &syncengine.FakeSyncEngine{}, Stripper: &pipeline.FakeStripper{}}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if _, err := p.Run(ctx, lib); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	d := &dispatcher.Dispatcher{
+		Providers:    []dispatcher.ProviderEntry{{Name: "only", Pipeline: p, WorkerCount: workerCount}},
+		Store:        st,
+		Libraries:    []domain.Library{lib},
+		PollInterval: 5 * time.Millisecond,
+	}
+	done := make(chan error, 1)
+	go func() { done <- d.Run(ctx) }()
+
+	waitFor(t, "pool to fill", func() bool { return summaryFor(t, st, lib).InProgress == workerCount })
+	// Let many polling passes elapse while the pool is full.
+	time.Sleep(100 * time.Millisecond)
+
+	mu.Lock()
+	gotSearches, gotPeak := searches, peak
+	mu.Unlock()
+	if gotSearches != workerCount {
+		t.Errorf("searches while pool full = %d, want %d", gotSearches, workerCount)
+	}
+	if got := summaryFor(t, st, lib).InProgress; got != workerCount {
+		t.Errorf("InProgress = %d, want %d", got, workerCount)
+	}
+
+	close(release)
+	waitFor(t, "all pairs to finish a first attempt", func() bool { return summaryFor(t, st, lib).InProgress == 0 })
+	cancel()
+	<-done
+
+	mu.Lock()
+	defer mu.Unlock()
+	if peak > workerCount || gotPeak > workerCount {
+		t.Errorf("peak concurrent Provider calls = %d, want <= %d", peak, workerCount)
+	}
+}
+
+// TestDispatcher_RunShutdownWaitsForInFlightWorkAndLeavesPairPending guards
+// that cancelling Run cancels in-flight work and Run only returns once the
+// pair has been given back as Pending.
+func TestDispatcher_RunShutdownWaitsForInFlightWorkAndLeavesPairPending(t *testing.T) {
+	st, lib := longLivedFixture(t, 1)
+	inSearch := make(chan struct{})
+	finished := make(chan struct{})
+	prov := &provider.Fake{
+		SearchFunc: func(ctx context.Context, _ provider.Query) ([]domain.Candidate, error) {
+			close(inSearch)
+			<-ctx.Done()
+			// Cancellation is slow to wind down, so Run returning early would
+			// be observable as a still-In-Progress pair.
+			time.Sleep(50 * time.Millisecond)
+			close(finished)
+			return nil, ctx.Err()
+		},
+	}
+	p := &pipeline.Pipeline{Store: st, Provider: prov, SyncEngine: &syncengine.FakeSyncEngine{}, Stripper: &pipeline.FakeStripper{}}
+	if _, err := p.Run(context.Background(), lib); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	d := &dispatcher.Dispatcher{
+		Providers:    []dispatcher.ProviderEntry{{Name: "only", Pipeline: p, WorkerCount: 1}},
+		Store:        st,
+		Libraries:    []domain.Library{lib},
+		PollInterval: 10 * time.Millisecond,
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- d.Run(ctx) }()
+
+	<-inSearch
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run = %v, want context.Canceled", err)
+	}
+	select {
+	case <-finished:
+	default:
+		t.Fatal("Run returned before the in-flight Provider call wound down")
+	}
+	if s := summaryFor(t, st, lib); s.Pending != 1 || s.InProgress != 0 || s.Failed != 0 {
+		t.Errorf("after shutdown summary = %+v, want the pair Pending", s)
+	}
+}
+
+// TestDispatcher_RunLegacyModeDoesNotWaitForInFlightPair guards that the
+// single-pipeline mode's polling loop also leaves a full pool's pairs Pending
+// instead of blocking behind a stuck pair.
+func TestDispatcher_RunLegacyModeDoesNotWaitForInFlightPair(t *testing.T) {
+	st, lib := longLivedFixture(t, 2)
+	release := make(chan struct{})
+	var mu sync.Mutex
+	var searches int
+	prov := &provider.Fake{
+		SearchFunc: func(ctx context.Context, _ provider.Query) ([]domain.Candidate, error) {
+			mu.Lock()
+			searches++
+			mu.Unlock()
+			select {
+			case <-release:
+			case <-ctx.Done():
+			}
+			return nil, errors.New("released")
+		},
+	}
+	p := &pipeline.Pipeline{Store: st, Provider: prov, SyncEngine: &syncengine.FakeSyncEngine{}, Stripper: &pipeline.FakeStripper{}, WorkerCount: 1}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if _, err := p.Run(ctx, lib); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	d := &dispatcher.Dispatcher{
+		Pipeline:     p,
+		Store:        st,
+		Libraries:    []domain.Library{lib},
+		PollInterval: 5 * time.Millisecond,
+	}
+	done := make(chan error, 1)
+	go func() { done <- d.Run(ctx) }()
+
+	waitFor(t, "pool to fill", func() bool { return summaryFor(t, st, lib).InProgress == 1 })
+	time.Sleep(50 * time.Millisecond)
+	mu.Lock()
+	got := searches
+	mu.Unlock()
+	if got != 1 {
+		t.Errorf("searches while the single worker is busy = %d, want 1", got)
+	}
+
+	close(release)
+	waitFor(t, "both pairs to land Failed(no_candidate)", func() bool { return summaryFor(t, st, lib).Failed == 2 })
+	cancel()
+	<-done
+}
