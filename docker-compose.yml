@@ -11,3 +11,57 @@ services:
       - ./tv:/media/tv
     env_file: .env
     restart: unless-stopped
+
+  # --- Optional whisper sidecar -------------------------------------------
+  # Only needed when `whisper` is in providers.chain. Start it with
+  #   docker compose --profile whisper up -d
+  # and point config.yaml at it with `endpoint: http://whisper:8080`.
+  # See docs/whisper.md for model choice, GPU image variants and throughput.
+  #
+  # UNVERIFIED until spike #100 completes: the image tag, the whisper-server
+  # entrypoint and flags, and the model file names below are written from
+  # whisper.cpp's documentation and have not been run against a real server.
+
+  # One-shot download of the speech model and the VAD (voice activity
+  # detection) model into ./whisper-models. Existing files are kept, so
+  # re-running is cheap. To change model, edit MODEL here and the `-m` flag
+  # on the whisper service below.
+  whisper-models:
+    profiles: [whisper]
+    image: curlimages/curl:8.11.1
+    user: root
+    working_dir: /models
+    volumes:
+      - ./whisper-models:/models
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        set -e
+        [ -f ggml-small-q5_1.bin ] || curl -fL -o ggml-small-q5_1.bin https://huggingface.co/ggml-org/whisper.cpp/resolve/main/ggml-small-q5_1.bin
+        [ -f ggml-silero-v5.1.2.bin ] || curl -fL -o ggml-silero-v5.1.2.bin https://huggingface.co/ggml-org/whisper-vad/resolve/main/ggml-silero-v5.1.2.bin
+
+  whisper:
+    profiles: [whisper]
+    # CPU image. For a GPU, swap the tag and add the device access shown in
+    # docs/whisper.md; nothing on the Sublime side changes.
+    image: ghcr.io/ggml-org/whisper.cpp:main
+    entrypoint: ["whisper-server"]
+    command:
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8080"
+      - -m
+      - /models/ggml-small-q5_1.bin
+      # VAD skips silence and music, the main defence against hallucinated
+      # text; --suppress-nst drops non-speech tokens such as [MUSIC].
+      - --vad
+      - --vad-model
+      - /models/ggml-silero-v5.1.2.bin
+      - --suppress-nst
+    volumes:
+      - ./whisper-models:/models:ro
+    depends_on:
+      whisper-models:
+        condition: service_completed_successfully
+    restart: unless-stopped
