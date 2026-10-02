@@ -44,7 +44,21 @@ ffmpeg -y -v error -f lavfi -i "color=c=black:s=64x64:d=1:r=5" \
 	-c:v libx264 -preset veryfast -crf 40 -pix_fmt yuv420p -an \
 	video/tiny.mp4
 
-echo "Wrote video/sample.mp4 and video/tiny.mp4."
+# video/tones.mp4: 34s of 440 Hz tone bursts separated by silences, for the
+# real-binary chunked-transcription test. At a 10s chunk length the silences
+# that matter are 9-10s, 19.5-20.5s and 29-30s (cut points 9.5s, 20s, 29.5s).
+# The 11-11.6s silence sits in the first cut window but is shorter than the
+# 9-10s one, so it checks that the longest silence wins. The 3-3.6s silence
+# is outside every window. Whisper needs no real speech here: the test's
+# whisper server is fake, only the audio's silence structure is real.
+tones='between(t,0,3)+between(t,3.6,9)+between(t,10,11)+between(t,11.6,19.5)+between(t,20.5,29)+between(t,30,34)'
+ffmpeg -y -v error -f lavfi -i "color=c=gray:s=160x120:d=34:r=5" \
+	-f lavfi -i "aevalsrc='0.5*sin(2*PI*440*t)*($tones)':s=16000:d=34" \
+	-c:v libx264 -preset veryfast -crf 40 -pix_fmt yuv420p -c:a aac -b:a 32k \
+	-metadata:s:a:0 language=eng -shortest \
+	video/tones.mp4
+
+echo "Wrote video/sample.mp4, video/tiny.mp4 and video/tones.mp4."
 echo "Subtitle fixtures (subs/*.srt, subs/*.ass) are hand-authored to match"
 echo "the speech offsets above (0.5s / 3.5s / 6.5s) and are not regenerated"
 echo "by this script — edit them directly if the speech timeline changes."
