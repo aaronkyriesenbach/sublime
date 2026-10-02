@@ -676,15 +676,15 @@ func (p *Pipeline) fetchAndWrite(
 				"top_title", topMiss.Title, "top_year", topMiss.Year, "top_season", topMiss.Season, "top_episode", topMiss.Episode,
 				"score", score, "cutoff", cutoff)
 		}
-		if err := p.Store.RecordProviderMiss(ctx, file.ID, string(hash), lang, providerName); err != nil {
-			return ProcessResult{Outcome: OutcomeFailed, Err: fmt.Errorf("recording provider miss: %w", err)}
-		}
-		p.logStatusChange(ctx, lib, videoPath, lang, domain.StatusInProgress, domain.StatusPending, domain.FailureNone, nil)
-		return ProcessResult{Outcome: OutcomeNoCandidateMiss}
+		return p.recordMiss(ctx, lib, file.ID, videoPath, lang, string(hash), providerName, nil)
 	}
 
 	subtitleContent, err := p.Provider.Download(ctx, best)
 	if err != nil {
+		var miss *provider.MissError
+		if errors.As(err, &miss) {
+			return p.recordMiss(ctx, lib, file.ID, videoPath, lang, string(hash), providerName, miss)
+		}
 		if isSuspensionSignal(err) {
 			if pendingErr := p.markPending(ctx, lib, videoPath, lang, file.ID, string(hash)); pendingErr != nil {
 				return ProcessResult{Outcome: OutcomeFailed, Err: errors.Join(err, pendingErr)}
@@ -768,6 +768,30 @@ func (p *Pipeline) fetchAndWrite(
 	p.logStatusChange(ctx, lib, videoPath, lang, domain.StatusInProgress, domain.StatusSynced, domain.FailureNone, nil)
 
 	return ProcessResult{Outcome: OutcomeSynced}
+}
+
+// recordMiss records that providerName has nothing usable for the pair, so
+// the Provider Chain advances. cause is set when the Provider found a
+// Candidate but could not produce its subtitle, nil for a Search miss.
+func (p *Pipeline) recordMiss(
+	ctx context.Context,
+	lib domain.Library,
+	fileID int64,
+	videoPath string,
+	lang language.Tag,
+	hash string,
+	providerName string,
+	cause *provider.MissError,
+) ProcessResult {
+	if cause != nil {
+		p.logger().Info("provider produced no usable subtitle", "provider", providerName, "library", lib.Name,
+			"path", videoPath, "language", lang.String(), "cause", cause.Cause)
+	}
+	if err := p.Store.RecordProviderMiss(ctx, fileID, hash, lang, providerName); err != nil {
+		return ProcessResult{Outcome: OutcomeFailed, Err: fmt.Errorf("recording provider miss: %w", err)}
+	}
+	p.logStatusChange(ctx, lib, videoPath, lang, domain.StatusInProgress, domain.StatusPending, domain.FailureNone, nil)
+	return ProcessResult{Outcome: OutcomeNoCandidateMiss}
 }
 
 // syncSubtitle writes candidateContent to a temp file, runs the SyncEngine,
