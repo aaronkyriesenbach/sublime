@@ -1,4 +1,7 @@
-package strip
+// Package langcode crosswalks ISO 639-2 language tags, as found in media
+// container stream metadata, to the BCP-47 base languages Sublime uses
+// everywhere else.
+package langcode
 
 import (
 	"strings"
