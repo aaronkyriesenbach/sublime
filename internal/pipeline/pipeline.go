@@ -140,9 +140,9 @@ func isSuspensionSignal(err error) bool {
 // Used when a Provider reports a Suspension (QuotaExhaustedError or
 // UnavailableError): the attempt didn't fail in any way that reflects on
 // the file itself, so it's requeued rather than landing on Failed, and
-// logged as an ordinary Info-level
-// landing with no FailureReason — the "something's off" signal already
-// lives in the Provider's own Suspended log line.
+// logged as an ordinary Info-level landing with no FailureReason — the
+// "something's off" signal already lives in the Provider's own Suspended
+// log line.
 func (p *Pipeline) markPending(
 	ctx context.Context,
 	lib domain.Library,
