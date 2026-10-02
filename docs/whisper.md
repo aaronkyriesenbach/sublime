@@ -272,6 +272,18 @@ removed most of the repeated-line loops; a chunk that still loops is retried
 and, if it keeps looping, the file ends as a miss rather than shipping
 garbage.
 
+## Troubleshooting
+
+| Symptom | Cause and fix |
+| --- | --- |
+| `sublime` restarts with `opening state store ... unable to open database file` | `./data` was created by Docker as root. `sudo rm -r data && mkdir data` (or `chown`) and start again. |
+| `sublime status` lists `whisper` as Suspended right after `up` | Sublime started before the sidecar finished loading its model. It retries by itself after about two minutes; nothing to do. A sidecar that stays unreachable keeps it Suspended and pairs Pending. |
+| `whisper-models` fails with a 401 or 404 | The model URL is wrong. Speech models live at `huggingface.co/ggerganov/whisper.cpp`; the VAD model at `huggingface.co/ggml-org/whisper-vad`. |
+| Existing subtitles are not replaced after adding `whisper` | Subtitles Sublime made earlier carry its Marker and are kept. Run `sublime reprocess <path>`. |
+| `could not select device driver "nvidia"` or `AMD CDI spec not found` | Docker cannot find the GPU through the legacy runtime. Use the CDI device in `docker-compose.gpu.yml` and make sure `/etc/cdi` (or `/run/cdi`) has the NVIDIA spec; see [Running on an NVIDIA GPU](#running-on-an-nvidia-gpu). |
+| The sidecar log says `no GPU found` | It is running the CPU image or the GPU was not passed in. Check the `image:` is `main-cuda` and rerun the step 3 check in the GPU section. |
+| A file ends `Failed` with `no_candidate` | Whisper missed (wrong audio language, or every retry of a chunk looped) and no other Provider is in the chain. `docker compose logs sublime` says why. |
+
 ## Behavior to know about
 
 - **Same language only.** A Generated Subtitle is made only when the video's

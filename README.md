@@ -7,7 +7,8 @@ the full domain vocabulary and design decisions.
 ## Getting started
 
 1. Copy [`config.example.yaml`](config.example.yaml) to `config.yaml` and
-   list your libraries.
+   list your libraries. Run `mkdir -p data` too, so the state directory is
+   owned by you rather than created by Docker as root.
 2. Copy `docker-compose.yml`'s volume paths to point at your real media
    directories, and set the `SUBLIME_OPENSUBTITLES_*` environment variables
    (an [OpenSubtitles.com](https://www.opensubtitles.com/) account is
@@ -53,11 +54,13 @@ model choice and measured speed are in [docs/whisper.md](docs/whisper.md).
        chunk_length: 10m # default
    ```
 
-2. Create an empty `.env` if you have no other Provider credentials
-   (`docker-compose.yml` requires the file to exist):
+2. Create the state directory and an empty `.env`. Docker would otherwise
+   create `./data` owned by root, which the (non-root) Sublime container
+   cannot write to, and `docker-compose.yml` requires `.env` to exist even
+   with no Provider credentials:
 
    ```sh
-   touch .env
+   mkdir -p data && touch .env
    ```
 
 3. Start Sublime and the sidecar. Pick one:
@@ -74,7 +77,10 @@ model choice and measured speed are in [docs/whisper.md](docs/whisper.md).
 
 4. Watch it work. The sidecar's `/health` goes healthy once the model has
    loaded; `sublime status` shows progress, and the log shows each file's
-   chunks (`chunk 3 of 5`):
+   chunks (`chunk 3 of 5`). On the very first start Sublime comes up while
+   the model is still downloading, so `sublime status` may list `whisper` as
+   Suspended for a couple of minutes; that clears by itself once the sidecar
+   answers.
 
    ```sh
    docker compose ps
