@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"golang.org/x/text/language"
 
@@ -37,6 +38,10 @@ type fakeWhisperServer struct {
 	requests []inferenceRequest
 	status   int
 	body     []byte
+
+	// detectBody, if set, answers requests that ask for language detection
+	// instead of a transcription.
+	detectBody []byte
 }
 
 func newFakeWhisperServer(t *testing.T, body []byte) *fakeWhisperServer {
@@ -66,6 +71,9 @@ func newFakeWhisperServer(t *testing.T, body []byte) *fakeWhisperServer {
 		f.mu.Lock()
 		f.requests = append(f.requests, req)
 		status, respBody := f.status, f.body
+		if req.Fields["detect_language"] == "true" && f.detectBody != nil {
+			respBody = f.detectBody
+		}
 		f.mu.Unlock()
 
 		w.Header().Set("Content-Type", "application/json")
@@ -80,6 +88,16 @@ func (f *fakeWhisperServer) Requests() []inferenceRequest {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]inferenceRequest(nil), f.requests...)
+}
+
+func (f *fakeWhisperServer) DetectionRequests() []inferenceRequest {
+	var detections []inferenceRequest
+	for _, req := range f.Requests() {
+		if req.Fields["detect_language"] == "true" {
+			detections = append(detections, req)
+		}
+	}
+	return detections
 }
 
 func sampleResponse(t *testing.T) []byte {
@@ -173,7 +191,6 @@ func TestSearch_NoMatchingStreamCausesAreLogged(t *testing.T) {
 		want    string
 	}{
 		{name: "no audio at all", streams: nil, want: "video has no audio streams"},
-		{name: "untagged audio", streams: []audiosource.Stream{{Index: 1}}, want: "audio is untagged, target is en"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -324,5 +341,302 @@ func TestNeverSynced(t *testing.T) {
 
 	if !p.NeverSynced() {
 		t.Error("NeverSynced() = false, want true: a Generated Subtitle is never Synced")
+	}
+}
+
+// detectingServer answers language-detection requests with a verbose-JSON
+// body whose language is code.
+func detectingServer(t *testing.T, code string) *fakeWhisperServer {
+	t.Helper()
+	server := newFakeWhisperServer(t, sampleResponse(t))
+	server.detectBody = []byte(`{"language":"` + code + `"}`)
+	return server
+}
+
+func TestSearch_UntaggedAudioDetectedAsTargetIsEligible(t *testing.T) {
+	// audiosource reports an explicit "und" tag as untagged too, so both
+	// shapes arrive as an empty Language.
+	audio := &audiosource.FakeSource{
+		Streams:       []audiosource.Stream{{Index: 3}},
+		VideoDuration: 2 * time.Hour,
+	}
+	server := detectingServer(t, "en")
+	p := newProvider(t, server, audio, nil)
+
+	got, err := p.Search(context.Background(), query(language.English))
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if len(got) != 1 || !got[0].HashMatch {
+		t.Fatalf("Search = %+v, want one hash-match candidate", got)
+	}
+	if n := len(server.DetectionRequests()); n != 1 {
+		t.Errorf("sidecar saw %d detection requests, want 1", n)
+	}
+}
+
+func TestSearch_DetectionUsesAClipFromTheMiddleOfTheFile(t *testing.T) {
+	tests := []struct {
+		name     string
+		duration time.Duration
+		want     audiosource.Range
+	}{
+		{
+			name:     "long file: 30s centred on the midpoint",
+			duration: 2 * time.Hour,
+			want:     audiosource.Range{Start: time.Hour - 15*time.Second, Duration: 30 * time.Second},
+		},
+		{
+			name:     "file shorter than the clip: the whole file",
+			duration: 20 * time.Second,
+			want:     audiosource.Range{Start: 0, Duration: 20 * time.Second},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			audio := &audiosource.FakeSource{
+				Streams:       []audiosource.Stream{{Index: 1, Language: "jpn"}, {Index: 2}},
+				VideoDuration: tc.duration,
+			}
+			p := newProvider(t, detectingServer(t, "en"), audio, nil)
+
+			if _, err := p.Search(context.Background(), query(language.English)); err != nil {
+				t.Fatalf("Search: %v", err)
+			}
+			if len(audio.ExtractCalls) != 1 {
+				t.Fatalf("Extract called %d times, want 1: %+v", len(audio.ExtractCalls), audio.ExtractCalls)
+			}
+			call := audio.ExtractCalls[0]
+			if call.VideoPath != "/media/Test.Movie.2024.mkv" || call.StreamIndex != 2 || call.Range != tc.want {
+				t.Errorf("Extract call = %+v, want untagged stream 2 with range %+v", call, tc.want)
+			}
+		})
+	}
+}
+
+func TestSearch_DetectionAsksSidecarToDetectNotTranscribeOrTranslate(t *testing.T) {
+	audio := &audiosource.FakeSource{
+		Streams:       []audiosource.Stream{{Index: 1}},
+		VideoDuration: time.Hour,
+		Audio:         []byte("RIFF-clip"),
+	}
+	server := detectingServer(t, "en")
+	p := newProvider(t, server, audio, nil)
+
+	if _, err := p.Search(context.Background(), query(language.English)); err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	reqs := server.DetectionRequests()
+	if len(reqs) != 1 {
+		t.Fatalf("sidecar saw %d detection requests, want 1", len(reqs))
+	}
+	if string(reqs[0].Audio) != "RIFF-clip" {
+		t.Errorf("sidecar audio = %q, want the extracted clip", reqs[0].Audio)
+	}
+	if reqs[0].Fields["language"] != "auto" {
+		t.Errorf("language = %q, want %q so the sidecar detects", reqs[0].Fields["language"], "auto")
+	}
+	if translate, sent := reqs[0].Fields["translate"]; sent && translate != "false" {
+		t.Errorf("translate = %q, want it off", translate)
+	}
+}
+
+func TestSearch_DetectedLanguageDifferingFromTargetIsAMissWithLoggedCause(t *testing.T) {
+	audio := &audiosource.FakeSource{Streams: []audiosource.Stream{{Index: 1}}, VideoDuration: time.Hour}
+	var logs bytes.Buffer
+	p := newProvider(t, detectingServer(t, "ja"), audio, &logs)
+
+	got, err := p.Search(context.Background(), query(language.English))
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("Search returned %d candidates, want 0: a wrong-language guess must never become a transcript", len(got))
+	}
+	if !strings.Contains(logs.String(), "detected language is ja, target is en") {
+		t.Errorf("log does not state the cause:\n%s", logs.String())
+	}
+}
+
+func TestSearch_DetectionComparesOnBaseLanguage(t *testing.T) {
+	audio := &audiosource.FakeSource{Streams: []audiosource.Stream{{Index: 1}}, VideoDuration: time.Hour}
+	p := newProvider(t, detectingServer(t, "pt"), audio, nil)
+
+	got, err := p.Search(context.Background(), query(language.BrazilianPortuguese))
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("Search returned %d candidates, want 1 for detected pt vs pt-BR target", len(got))
+	}
+}
+
+func TestSearch_DetectionResponseShapes(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		want bool
+	}{
+		{name: "language code", body: `{"language":"en"}`, want: true},
+		{name: "detected_language code", body: `{"detected_language":"en","detected_language_probability":0.97}`, want: true},
+		{name: "language full name", body: `{"language":"english"}`, want: true},
+		{name: "detected_language full name", body: `{"detected_language":"English"}`, want: true},
+		{name: "other full name", body: `{"detected_language":"japanese","language":"ja"}`, want: false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			audio := &audiosource.FakeSource{Streams: []audiosource.Stream{{Index: 1}}, VideoDuration: time.Hour}
+			server := newFakeWhisperServer(t, nil)
+			server.detectBody = []byte(tc.body)
+			p := newProvider(t, server, audio, nil)
+
+			got, err := p.Search(context.Background(), query(language.English))
+			if err != nil {
+				t.Fatalf("Search: %v", err)
+			}
+			if (len(got) == 1) != tc.want {
+				t.Errorf("Search returned %d candidates, want eligible = %v", len(got), tc.want)
+			}
+		})
+	}
+}
+
+func TestSearch_UnintelligibleDetectionResponseIsAnError(t *testing.T) {
+	for _, body := range []string{`{}`, `{"language":"  "}`, `not json`} {
+		audio := &audiosource.FakeSource{Streams: []audiosource.Stream{{Index: 1}}, VideoDuration: time.Hour}
+		server := newFakeWhisperServer(t, nil)
+		server.detectBody = []byte(body)
+		p := newProvider(t, server, audio, nil)
+
+		if _, err := p.Search(context.Background(), query(language.English)); err == nil {
+			t.Errorf("Search with detection body %q: want an error, got nil", body)
+		}
+	}
+}
+
+func TestSearch_DetectionFailuresAreErrors(t *testing.T) {
+	t.Run("sidecar error", func(t *testing.T) {
+		audio := &audiosource.FakeSource{Streams: []audiosource.Stream{{Index: 1}}, VideoDuration: time.Hour}
+		server := detectingServer(t, "en")
+		server.status = http.StatusInternalServerError
+		p := newProvider(t, server, audio, nil)
+
+		if _, err := p.Search(context.Background(), query(language.English)); err == nil {
+			t.Fatal("Search: want an error for a 500 from the sidecar, got nil")
+		}
+	})
+	t.Run("unknown duration", func(t *testing.T) {
+		durationErr := errors.New("ffprobe exploded")
+		audio := &audiosource.FakeSource{Streams: []audiosource.Stream{{Index: 1}}, DurationErr: durationErr}
+		p := newProvider(t, detectingServer(t, "en"), audio, nil)
+
+		if _, err := p.Search(context.Background(), query(language.English)); !errors.Is(err, durationErr) {
+			t.Fatalf("Search error = %v, want it to wrap %v", err, durationErr)
+		}
+	})
+	t.Run("clip extraction", func(t *testing.T) {
+		extractErr := errors.New("ffmpeg exploded")
+		audio := &audiosource.FakeSource{Streams: []audiosource.Stream{{Index: 1}}, VideoDuration: time.Hour, ExtractErr: extractErr}
+		p := newProvider(t, detectingServer(t, "en"), audio, nil)
+
+		if _, err := p.Search(context.Background(), query(language.English)); !errors.Is(err, extractErr) {
+			t.Fatalf("Search error = %v, want it to wrap %v", err, extractErr)
+		}
+	})
+}
+
+func TestSearch_NeverDetectsWhenATaggedStreamMatches(t *testing.T) {
+	audio := &audiosource.FakeSource{
+		Streams:       []audiosource.Stream{{Index: 1}, {Index: 2, Language: "eng"}},
+		VideoDuration: time.Hour,
+	}
+	server := detectingServer(t, "ja")
+	p := newProvider(t, server, audio, nil)
+
+	got, err := p.Search(context.Background(), query(language.English))
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("Search returned %d candidates, want 1 from the tagged stream", len(got))
+	}
+	if n := len(server.Requests()); n != 0 {
+		t.Errorf("sidecar saw %d requests, want 0: a matching tag needs no detection", n)
+	}
+	if len(audio.ExtractCalls) != 0 {
+		t.Errorf("Extract called %d times during Search, want 0", len(audio.ExtractCalls))
+	}
+}
+
+func TestSearch_NeverDetectsWhenOnlyMismatchingTagsExist(t *testing.T) {
+	audio := &audiosource.FakeSource{
+		Streams:       []audiosource.Stream{{Index: 1, Language: "jpn"}, {Index: 2, Language: "fra"}},
+		VideoDuration: time.Hour,
+	}
+	server := detectingServer(t, "en")
+	p := newProvider(t, server, audio, nil)
+
+	got, err := p.Search(context.Background(), query(language.English))
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("Search returned %d candidates, want 0", len(got))
+	}
+	if n := len(server.Requests()); n != 0 {
+		t.Errorf("sidecar saw %d requests, want 0: mismatching tags are not uncertainty", n)
+	}
+}
+
+func TestDownload_MultiTrackPicksTheFirstTrackTaggedWithTheTarget(t *testing.T) {
+	audio := &audiosource.FakeSource{
+		Streams: []audiosource.Stream{
+			{Index: 1, Language: "jpn"},
+			{Index: 2, Language: "eng"},
+			{Index: 3, Language: "eng"},
+		},
+	}
+	p := newProvider(t, newFakeWhisperServer(t, sampleResponse(t)), audio, nil)
+
+	candidates, err := p.Search(context.Background(), query(language.English))
+	if err != nil || len(candidates) != 1 {
+		t.Fatalf("Search = %+v, %v; want exactly one candidate", candidates, err)
+	}
+	if _, err := p.Download(context.Background(), candidates[0]); err != nil {
+		t.Fatalf("Download: %v", err)
+	}
+	if got := audio.ExtractCalls[len(audio.ExtractCalls)-1].StreamIndex; got != 2 {
+		t.Errorf("transcribed stream = %d, want 2 (the first English track)", got)
+	}
+}
+
+func TestDownload_TranscribesTheUntaggedStreamAcceptedByDetection(t *testing.T) {
+	audio := &audiosource.FakeSource{
+		Streams:       []audiosource.Stream{{Index: 1, Language: "jpn"}, {Index: 2}},
+		VideoDuration: time.Hour,
+	}
+	server := detectingServer(t, "en")
+	p := newProvider(t, server, audio, nil)
+
+	candidates, err := p.Search(context.Background(), query(language.English))
+	if err != nil || len(candidates) != 1 {
+		t.Fatalf("Search = %+v, %v; want exactly one candidate", candidates, err)
+	}
+	if _, err := p.Download(context.Background(), candidates[0]); err != nil {
+		t.Fatalf("Download: %v", err)
+	}
+
+	last := audio.ExtractCalls[len(audio.ExtractCalls)-1]
+	if last.StreamIndex != 2 || last.Range != (audiosource.Range{}) {
+		t.Errorf("Download extracted %+v, want the whole untagged stream 2", last)
+	}
+	var transcription *inferenceRequest
+	for _, req := range server.Requests() {
+		if req.Fields["detect_language"] != "true" {
+			transcription = &req
+		}
+	}
+	if transcription == nil || transcription.Fields["language"] != "en" {
+		t.Errorf("transcription request = %+v, want explicit language en", transcription)
 	}
 }

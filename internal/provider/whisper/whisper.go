@@ -4,9 +4,10 @@
 // CONTEXT.md and docs/adr/0014-whisper-generated-subtitles-as-a-provider.md).
 //
 // A Generated Subtitle is same-language only: Search offers a Candidate
-// only when an audio stream is tagged with the target's base language, and
-// Download always pins that language on the request and never asks the
-// sidecar to translate.
+// only when an audio stream is tagged with the target's base language or,
+// for untagged audio, the sidecar detects that language. Download always
+// pins that language on the request and never asks the sidecar to
+// translate.
 package whisper
 
 import (
@@ -18,6 +19,10 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
+
+	"golang.org/x/text/language"
+	"golang.org/x/text/language/display"
 
 	"github.com/aaronkyriesenbach/sublime/internal/audiosource"
 	"github.com/aaronkyriesenbach/sublime/internal/domain"
@@ -100,10 +105,17 @@ type candidateID struct {
 	Language string `json:"language"`
 }
 
-// Search decides eligibility from the video's audio stream tags alone: the
-// first stream tagged with query.Language's base language yields exactly
-// one hash-match Candidate, so scoring selects it unconditionally.
-// Otherwise it is an ordinary miss, with the specific cause logged.
+// detectionClipLength is the span of audio the sidecar listens to when
+// detecting the language of an untagged stream: long enough for a reliable
+// guess, short enough to stay cheap.
+const detectionClipLength = 30 * time.Second
+
+// Search decides eligibility from the video's audio. The first stream
+// tagged with query.Language's base language yields exactly one hash-match
+// Candidate, so scoring selects it unconditionally. Failing that, the first
+// untagged stream is sampled and the sidecar asked to detect its language;
+// the pair is eligible only if the detection equals the target. Otherwise
+// it is an ordinary miss, with the specific cause logged.
 func (p *Provider) Search(ctx context.Context, query provider.Query) ([]domain.Candidate, error) {
 	streams, err := p.audio.AudioStreams(ctx, query.Path)
 	if err != nil {
@@ -114,21 +126,28 @@ func (p *Provider) Search(ctx context.Context, query provider.Query) ([]domain.C
 	target := base.String()
 
 	for _, stream := range streams {
-		if !stream.MatchesLanguage(query.Language) {
+		if stream.MatchesLanguage(query.Language) {
+			return p.candidateFor(query, stream, target)
+		}
+	}
+
+	// A tag that names another language is a definite answer; only a stream
+	// with no usable tag leaves the audio language unknown.
+	for _, stream := range streams {
+		if !stream.Untagged() {
 			continue
 		}
-		id, err := json.Marshal(candidateID{VideoPath: query.Path, StreamIndex: stream.Index, Language: target})
+		detected, err := p.detectLanguage(ctx, query.Path, stream)
 		if err != nil {
-			return nil, fmt.Errorf("whisper: encoding candidate ID: %w", err)
+			return nil, err
 		}
-		return []domain.Candidate{{
-			ID:        string(id),
-			Title:     query.Title,
-			Year:      query.Year,
-			Season:    query.Season,
-			Episode:   query.Episode,
-			HashMatch: true,
-		}}, nil
+		if detectedMatches(detected, base) {
+			return p.candidateFor(query, stream, target)
+		}
+		p.logger().Info("whisper: no candidate",
+			"cause", fmt.Sprintf("detected language is %s, target is %s", detected, target),
+			"path", query.Path, "language", query.Language.String())
+		return nil, nil
 	}
 
 	p.logger().Info("whisper: no candidate",
@@ -136,8 +155,57 @@ func (p *Provider) Search(ctx context.Context, query provider.Query) ([]domain.C
 	return nil, nil
 }
 
-// missCause describes why no stream matched target, e.g. "audio is ja,
-// target is en".
+func (p *Provider) candidateFor(query provider.Query, stream audiosource.Stream, target string) ([]domain.Candidate, error) {
+	id, err := json.Marshal(candidateID{VideoPath: query.Path, StreamIndex: stream.Index, Language: target})
+	if err != nil {
+		return nil, fmt.Errorf("whisper: encoding candidate ID: %w", err)
+	}
+	return []domain.Candidate{{
+		ID:        string(id),
+		Title:     query.Title,
+		Year:      query.Year,
+		Season:    query.Season,
+		Episode:   query.Episode,
+		HashMatch: true,
+	}}, nil
+}
+
+// detectLanguage samples the middle of the video — its first seconds are
+// often logos, intros or music — and asks the sidecar which language is
+// spoken there.
+func (p *Provider) detectLanguage(ctx context.Context, videoPath string, stream audiosource.Stream) (string, error) {
+	duration, err := p.audio.Duration(ctx, videoPath)
+	if err != nil {
+		return "", fmt.Errorf("whisper: measuring video duration: %w", err)
+	}
+	clip := audiosource.Range{Duration: min(duration, detectionClipLength)}
+	if duration > detectionClipLength {
+		clip.Start = duration/2 - detectionClipLength/2
+	}
+
+	audio, err := p.audio.Extract(ctx, videoPath, stream.Index, clip)
+	if err != nil {
+		return "", fmt.Errorf("whisper: extracting detection clip: %w", err)
+	}
+	detected, err := p.client.detectLanguage(ctx, audio)
+	if err != nil {
+		return "", fmt.Errorf("whisper: detecting language: %w", err)
+	}
+	return detected, nil
+}
+
+// detectedMatches reports whether the sidecar's detected language, given as
+// a code or an English name, is the target's base language. A name that
+// resolves to no known language simply fails to match.
+func detectedMatches(detected string, target language.Base) bool {
+	detected = strings.ToLower(detected)
+	return detected == target.String() ||
+		detected == strings.ToLower(display.English.Languages().Name(target))
+}
+
+// missCause describes why no tagged stream matched target, e.g. "audio is
+// jpn, target is en". Untagged streams never reach it: they go to language
+// detection instead.
 func missCause(streams []audiosource.Stream, target string) string {
 	if len(streams) == 0 {
 		return "video has no audio streams"
@@ -145,9 +213,6 @@ func missCause(streams []audiosource.Stream, target string) string {
 	tags := make([]string, len(streams))
 	for i, s := range streams {
 		tags[i] = s.Language
-		if s.Untagged() {
-			tags[i] = "untagged"
-		}
 	}
 	return fmt.Sprintf("audio is %s, target is %s", strings.Join(tags, "/"), target)
 }

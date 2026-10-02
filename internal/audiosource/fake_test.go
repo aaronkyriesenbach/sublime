@@ -61,3 +61,12 @@ func TestFakeSource_ConfiguredErrorsAndAudioOverrideDefaults(t *testing.T) {
 		t.Errorf("Extract = %q, %v; want canned audio", got, err)
 	}
 }
+
+func TestFakeSource_ReportsConfiguredDuration(t *testing.T) {
+	fake := &audiosource.FakeSource{VideoDuration: 2 * time.Hour}
+
+	got, err := fake.Duration(context.Background(), "/v.mkv")
+	if err != nil || got != 2*time.Hour {
+		t.Errorf("Duration = %v, %v; want 2h", got, err)
+	}
+}
