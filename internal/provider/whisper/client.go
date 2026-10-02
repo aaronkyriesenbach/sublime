@@ -9,6 +9,7 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/aaronkyriesenbach/sublime/internal/retry"
@@ -66,13 +67,18 @@ type verboseResponse struct {
 // transcribe posts audio to /inference. The language is always explicit —
 // left to auto-detect, whisper could silently transcribe in the wrong
 // language — and translation is always off. The verbose_json format is what
-// makes the sidecar return per-token timestamps for cue shaping.
-func (c *client) transcribe(ctx context.Context, audio []byte, languageCode string) ([]segment, error) {
-	parsed, err := c.inference(ctx, audio, map[string]string{
+// makes the sidecar return per-token timestamps for cue shaping. A zero
+// temperature leaves the sidecar's default decoding; a retry raises it.
+func (c *client) transcribe(ctx context.Context, audio []byte, languageCode string, temperature float64) ([]segment, error) {
+	fields := map[string]string{
 		"response_format": "verbose_json",
 		"language":        languageCode,
 		"translate":       "false",
-	})
+	}
+	if temperature > 0 {
+		fields["temperature"] = strconv.FormatFloat(temperature, 'f', -1, 64)
+	}
+	parsed, err := c.inference(ctx, audio, fields)
 	if err != nil {
 		return nil, err
 	}

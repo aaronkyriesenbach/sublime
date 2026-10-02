@@ -300,7 +300,7 @@ func (p *Provider) Download(ctx context.Context, candidate domain.Candidate) ([]
 
 		segments, err := p.transcribeChunk(ctx, id, c, total)
 		if err != nil {
-			return nil, fmt.Errorf("whisper: chunk %d of %d: %w", i+1, len(chunks), err)
+			return nil, p.chunkError(id, i, len(chunks), err)
 		}
 
 		segments = trim(segments, c.keepFrom, c.keepUntil)
@@ -310,28 +310,86 @@ func (p *Provider) Download(ctx context.Context, candidate domain.Candidate) ([]
 		transcript = append(transcript, segments...)
 	}
 
-	srt := formatSRT(shapeCues(transcript))
-	if len(srt) == 0 {
-		return nil, errors.New("whisper: transcript contains no speech")
+	cues := shapeCues(transcript)
+	if err := transcriptProblem(transcript, cues, total); err != nil {
+		return nil, p.miss(id, err)
 	}
-	return srt, nil
+	return formatSRT(cues), nil
+}
+
+// chunkError names the chunk an error came from. A miss stays a miss, and
+// is logged with its cause since the pipeline only records that the
+// Provider was tried.
+func (p *Provider) chunkError(id candidateID, index, count int, err error) error {
+	var miss *provider.MissError
+	if errors.As(err, &miss) {
+		return p.miss(id, fmt.Errorf("chunk %d of %d: %w", index+1, count, miss.Cause))
+	}
+	return fmt.Errorf("whisper: chunk %d of %d: %w", index+1, count, err)
+}
+
+// miss logs why the Provider could not produce a subtitle and returns the
+// signal that advances the Provider Chain.
+func (p *Provider) miss(id candidateID, cause error) error {
+	p.logger().Info("whisper: no candidate", "cause", cause, "path", id.VideoPath, "language", id.Language)
+	return &provider.MissError{Cause: cause}
 }
 
 // transcribeChunk extracts one chunk's audio and returns its segments with
-// timestamps on the whole video's timeline.
+// timestamps on the whole video's timeline. A failed request or untrustworthy
+// output is retried at a raised temperature, and a chunk still bad after
+// maxChunkAttempts yields no subtitle at all, so a partial one is never
+// produced. Untrustworthy output is a provider.MissError, which advances the
+// Provider Chain; a request that keeps failing is an ordinary error, a
+// retrieval failure like any reachable-but-erroring sidecar, so a broken
+// sidecar is not mistaken for a hallucinating one. An outage or cancellation
+// is returned as is: it says nothing about the chunk.
+//
+// A chunk that stays empty is accepted as holding no speech: a long film
+// can have a wordless stretch, and a transcript that is empty overall is
+// caught after assembly.
 func (p *Provider) transcribeChunk(ctx context.Context, id candidateID, c chunk, total time.Duration) ([]segment, error) {
 	audio, err := p.audio.Extract(ctx, id.VideoPath, id.StreamIndex, c.extract)
 	if err != nil {
 		return nil, fmt.Errorf("extracting audio: %w", err)
 	}
 
-	segments, err := p.transcribe(ctx, audio, id.Language, c.timeout(total))
-	if err != nil {
-		return nil, fmt.Errorf("transcribing: %w", err)
+	var problem error
+	requestFailed := false
+	for attempt := range maxChunkAttempts {
+		segments, err := p.transcribe(ctx, audio, id.Language, temperatureFor(attempt), c.timeout(total))
+		requestFailed = err != nil
+		if err == nil {
+			problem = chunkProblem(segments)
+		} else {
+			var unavailable *provider.UnavailableError
+			if ctx.Err() != nil || errors.As(err, &unavailable) {
+				return nil, err
+			}
+			problem = fmt.Errorf("transcribing: %w", err)
+		}
+		if problem == nil {
+			for i := range segments {
+				segments[i] = segments[i].offset(c.extract.Start)
+			}
+			return segments, nil
+		}
+
+		p.logger().Warn("whisper: chunk output rejected",
+			"path", id.VideoPath, "start", c.extract.Start, "attempt", attempt+1, "of", maxChunkAttempts, "cause", problem)
+		// A rejected request is deterministic: raising the temperature
+		// cannot make the sidecar accept it.
+		var rejected *sidecarError
+		if errors.As(problem, &rejected) && rejected.status < 500 {
+			break
+		}
 	}
 
-	for i := range segments {
-		segments[i] = segments[i].offset(c.extract.Start)
+	switch {
+	case requestFailed:
+		return nil, problem
+	case errors.Is(problem, errEmptyChunk):
+		return nil, nil
 	}
-	return segments, nil
+	return nil, &provider.MissError{Cause: problem}
 }
