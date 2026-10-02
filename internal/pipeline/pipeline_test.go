@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -1411,5 +1413,283 @@ func TestPipeline_TransitionsPendingToInProgressToSynced(t *testing.T) {
 	}
 	if len(file.Languages) != 1 || file.Languages[0].Status != domain.StatusSynced {
 		t.Fatalf("file.Languages = %+v, want 1 entry with status synced", file.Languages)
+	}
+}
+
+// cancellingStripper cancels the pair's context while StripEmbedded runs, as
+// a shutdown arriving mid-Strip would, and reports ctx's error the way an
+// interrupted ffmpeg does.
+type cancellingStripper struct {
+	*pipeline.FakeStripper
+	cancel context.CancelFunc
+}
+
+func (s *cancellingStripper) StripEmbedded(ctx context.Context, _ string, _ domain.StripScope, _ language.Tag) ([]int, error) {
+	s.cancel()
+	return nil, ctx.Err()
+}
+
+// cancellingSyncEngine cancels the pair's context while Sync runs and fails
+// with a non-context error, since alass is killed or exits non-zero rather
+// than reporting ctx's error.
+type cancellingSyncEngine struct {
+	cancel context.CancelFunc
+}
+
+func (e *cancellingSyncEngine) Sync(_, _, _ string) (string, error) {
+	e.cancel()
+	return "", errors.New("alass exited with status 1")
+}
+
+// TestPipeline_CancelledWorkLeavesPairPendingNotFailed guards that when
+// shutdown cancels a pair's in-flight Search, Download, Sync or Strip, the
+// pair ends Pending (retryable) with an info-level log, never Failed or
+// stuck In Progress, even though ctx is already cancelled when the pair's
+// status is written.
+func TestPipeline_CancelledWorkLeavesPairPendingNotFailed(t *testing.T) {
+	candidate := []domain.Candidate{{ID: "candidate", Title: "Test Movie", Year: 2024}}
+	srt := []byte("1\n00:00:00,500 --> 00:00:01,900\nSubtitle text\n")
+
+	tests := []struct {
+		name  string
+		build func(cancel context.CancelFunc, p *pipeline.Pipeline)
+	}{
+		{
+			name: "search",
+			build: func(cancel context.CancelFunc, p *pipeline.Pipeline) {
+				p.Provider = &provider.Fake{
+					SearchFunc: func(ctx context.Context, _ provider.Query) ([]domain.Candidate, error) {
+						cancel()
+						return nil, ctx.Err()
+					},
+				}
+			},
+		},
+		{
+			name: "download",
+			build: func(cancel context.CancelFunc, p *pipeline.Pipeline) {
+				p.Provider = &provider.Fake{
+					SearchFunc: func(context.Context, provider.Query) ([]domain.Candidate, error) { return candidate, nil },
+					DownloadFunc: func(ctx context.Context, _ domain.Candidate) ([]byte, error) {
+						cancel()
+						return nil, fmt.Errorf("fetching subtitle: %w", ctx.Err())
+					},
+				}
+			},
+		},
+		{
+			name: "sync",
+			build: func(cancel context.CancelFunc, p *pipeline.Pipeline) {
+				p.Provider = &provider.Fake{
+					SearchFunc:   func(context.Context, provider.Query) ([]domain.Candidate, error) { return candidate, nil },
+					DownloadFunc: func(context.Context, domain.Candidate) ([]byte, error) { return srt, nil },
+				}
+				p.SyncEngine = &cancellingSyncEngine{cancel: cancel}
+			},
+		},
+		{
+			name: "strip",
+			build: func(cancel context.CancelFunc, p *pipeline.Pipeline) {
+				p.Provider = &provider.Fake{
+					SearchFunc:   func(context.Context, provider.Query) ([]domain.Candidate, error) { return candidate, nil },
+					DownloadFunc: func(context.Context, domain.Candidate) ([]byte, error) { return srt, nil },
+				}
+				p.Stripper = &cancellingStripper{FakeStripper: &pipeline.FakeStripper{}, cancel: cancel}
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			libDir := t.TempDir()
+			videoPath := filepath.Join(libDir, "Test.Movie.2024.HDTV.x264-FAKEGROUP.mp4")
+			writeVideoFixture(t, videoPath)
+
+			st := openTestStore(t)
+			lib := domain.Library{
+				Name:       "test-library",
+				Path:       libDir,
+				Languages:  []language.Tag{language.English},
+				StripScope: domain.StripScopeAll,
+			}
+
+			var logBuf bytes.Buffer
+			p := &pipeline.Pipeline{
+				Store:      st,
+				SyncEngine: &syncengine.FakeSyncEngine{},
+				Stripper:   &pipeline.FakeStripper{},
+				Logger:     slog.New(slog.NewTextHandler(&logBuf, nil)),
+			}
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			tc.build(cancel, p)
+
+			if _, err := p.Run(context.Background(), lib); err != nil {
+				t.Fatalf("run: %v", err)
+			}
+			file, _, err := st.GetFile(context.Background(), lib.Name, videoPath)
+			if err != nil {
+				t.Fatalf("GetFile: %v", err)
+			}
+			if err := st.RecordProviderMiss(context.Background(), file.ID, language.English, "earlier-provider"); err != nil {
+				t.Fatalf("RecordProviderMiss: %v", err)
+			}
+
+			result := p.ProcessPending(ctx, lib, file.ID, file.ContentHash, videoPath, language.English, false, "test-provider")
+			if result.Outcome != pipeline.OutcomePending {
+				t.Errorf("outcome = %v (err %v), want OutcomePending", result.Outcome, result.Err)
+			}
+
+			got, _, err := st.GetFile(context.Background(), lib.Name, videoPath)
+			if err != nil {
+				t.Fatalf("GetFile: %v", err)
+			}
+			state := got.Languages[0]
+			if state.Status != domain.StatusPending {
+				t.Errorf("status = %q, want pending", state.Status)
+			}
+			if state.FailureReason != domain.FailureNone {
+				t.Errorf("failure reason = %q, want none", state.FailureReason)
+			}
+			if !slices.Equal(state.Attempted, []string{"earlier-provider"}) {
+				t.Errorf("attempted = %v, want the earlier provider kept", state.Attempted)
+			}
+
+			logOutput := logBuf.String()
+			for _, want := range []string{"level=INFO", `msg="status changed"`, "from=in_progress", "to=pending"} {
+				if !strings.Contains(logOutput, want) {
+					t.Errorf("log output = %q, want it to contain %q", logOutput, want)
+				}
+			}
+			if strings.Contains(logOutput, "to=failed") || strings.Contains(logOutput, "level=ERROR") {
+				t.Errorf("log output unexpectedly records a failure:%s", logOutput)
+			}
+		})
+	}
+}
+
+// TestPipeline_GenuineFailureStillFailsWhenContextIsLive guards that only
+// cancellation is treated as an interruption: a Provider error with a live
+// context still lands Failed(retrieval_failed).
+func TestPipeline_GenuineFailureStillFailsWhenContextIsLive(t *testing.T) {
+	libDir := t.TempDir()
+	videoPath := filepath.Join(libDir, "Test.Movie.2024.HDTV.x264-FAKEGROUP.mp4")
+	writeVideoFixture(t, videoPath)
+
+	st := openTestStore(t)
+	lib := domain.Library{
+		Name:       "test-library",
+		Path:       libDir,
+		Languages:  []language.Tag{language.English},
+		StripScope: domain.StripScopeAll,
+	}
+	p := &pipeline.Pipeline{
+		Store: st,
+		Provider: &provider.Fake{
+			SearchFunc: func(context.Context, provider.Query) ([]domain.Candidate, error) {
+				return nil, errors.New("provider returned 500")
+			},
+		},
+		SyncEngine: &syncengine.FakeSyncEngine{},
+		Stripper:   &pipeline.FakeStripper{},
+	}
+
+	ctx := context.Background()
+	if _, err := p.Run(ctx, lib); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	dispatchPending(t, ctx, p, st, lib)
+
+	got, _, err := st.GetFile(ctx, lib.Name, videoPath)
+	if err != nil {
+		t.Fatalf("GetFile: %v", err)
+	}
+	if got.Languages[0].Status != domain.StatusFailed || got.Languages[0].FailureReason != domain.FailureRetrievalFailed {
+		t.Errorf("state = %+v, want failed/retrieval_failed", got.Languages[0])
+	}
+}
+
+// TestPipeline_InterruptedForcedPairIsStillForcedWhenClaimedAgain guards that
+// a forced reprocess cut short by cancellation bypasses the Marker gate on
+// its next claim, even though a valid Marker already exists on disk.
+func TestPipeline_InterruptedForcedPairIsStillForcedWhenClaimedAgain(t *testing.T) {
+	libDir := t.TempDir()
+	videoPath := filepath.Join(libDir, "Test.Movie.2024.HDTV.x264-FAKEGROUP.mp4")
+	writeVideoFixture(t, videoPath)
+
+	st := openTestStore(t)
+	lib := domain.Library{
+		Name:       "test-library",
+		Path:       libDir,
+		Languages:  []language.Tag{language.English},
+		StripScope: domain.StripScopeAll,
+	}
+
+	srt := []byte("1\n00:00:00,500 --> 00:00:01,900\nSubtitle text\n")
+	var searches int
+	p := &pipeline.Pipeline{
+		Store: st,
+		Provider: &provider.Fake{
+			SearchFunc: func(context.Context, provider.Query) ([]domain.Candidate, error) {
+				searches++
+				return []domain.Candidate{{ID: "candidate", Title: "Test Movie", Year: 2024}}, nil
+			},
+			DownloadFunc: func(context.Context, domain.Candidate) ([]byte, error) { return srt, nil },
+		},
+		SyncEngine: &syncengine.FakeSyncEngine{},
+		Stripper:   &pipeline.FakeStripper{},
+	}
+
+	ctx := context.Background()
+	if _, err := p.Run(ctx, lib); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	// First pass syncs normally, leaving a valid Marker behind.
+	dispatchPending(t, ctx, p, st, lib)
+	if searches != 1 {
+		t.Fatalf("searches after first pass = %d, want 1", searches)
+	}
+
+	if _, err := p.RunFile(ctx, lib, videoPath, pipeline.WithForce()); err != nil {
+		t.Fatalf("forced RunFile: %v", err)
+	}
+
+	// The forced attempt is interrupted mid-Search.
+	cancelCtx, cancel := context.WithCancel(ctx)
+	p.Provider = &provider.Fake{
+		SearchFunc: func(c context.Context, _ provider.Query) ([]domain.Candidate, error) {
+			cancel()
+			return nil, c.Err()
+		},
+	}
+	dispatchPending(t, cancelCtx, p, st, lib)
+
+	pairs, err := st.PendingPairs(ctx)
+	if err != nil {
+		t.Fatalf("PendingPairs: %v", err)
+	}
+	if len(pairs) != 1 || !pairs[0].Force {
+		t.Fatalf("PendingPairs = %+v, want one forced pair after interruption", pairs)
+	}
+
+	// Claimed again, the forced pair runs the Provider despite the Marker.
+	p.Provider = &provider.Fake{
+		SearchFunc: func(context.Context, provider.Query) ([]domain.Candidate, error) {
+			searches++
+			return []domain.Candidate{{ID: "candidate", Title: "Test Movie", Year: 2024}}, nil
+		},
+		DownloadFunc: func(context.Context, domain.Candidate) ([]byte, error) { return srt, nil },
+	}
+	dispatchPending(t, ctx, p, st, lib)
+	if searches != 2 {
+		t.Errorf("searches after reclaim = %d, want 2 (Marker gate bypassed)", searches)
+	}
+	got, _, err := st.GetFile(ctx, lib.Name, videoPath)
+	if err != nil {
+		t.Fatalf("GetFile: %v", err)
+	}
+	if got.Languages[0].Status != domain.StatusSynced {
+		t.Errorf("status = %q, want synced", got.Languages[0].Status)
 	}
 }

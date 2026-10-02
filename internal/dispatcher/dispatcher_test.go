@@ -1442,3 +1442,164 @@ func TestDispatcher_SingleProviderMissIsImmediatelyTerminal(t *testing.T) {
 		t.Fatalf("expected reason no_candidate, got %v", file.Languages[0].FailureReason)
 	}
 }
+
+// TestDispatcher_ShutdownMidWorkLeavesPairPendingAndRetriesAfterRestart
+// guards that cancelling the dispatch context while a Provider call is in
+// flight leaves the pair Pending, not Failed or In Progress, and that a
+// fresh pass (the restarted process) then completes it.
+func TestDispatcher_ShutdownMidWorkLeavesPairPendingAndRetriesAfterRestart(t *testing.T) {
+	libDir := t.TempDir()
+	videoPath := filepath.Join(libDir, "Test.Movie.2024.HDTV.x264-FAKEGROUP.mp4")
+	writeVideoFixture(t, videoPath)
+
+	st := openTestStore(t)
+	lib := domain.Library{
+		Name:       "test-library",
+		Path:       libDir,
+		Languages:  []language.Tag{language.English},
+		StripScope: domain.StripScopeAll,
+	}
+
+	inSearch := make(chan struct{})
+	blocking := &provider.Fake{
+		SearchFunc: func(ctx context.Context, _ provider.Query) ([]domain.Candidate, error) {
+			close(inSearch)
+			<-ctx.Done()
+			return nil, ctx.Err()
+		},
+	}
+	p := &pipeline.Pipeline{
+		Store:      st,
+		Provider:   blocking,
+		SyncEngine: &syncengine.FakeSyncEngine{},
+		Stripper:   &pipeline.FakeStripper{},
+	}
+
+	if _, err := p.Run(context.Background(), lib); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	d := &dispatcher.Dispatcher{
+		ProviderTiers: []dispatcher.ProviderTier{{
+			Providers: []dispatcher.ProviderEntry{{Name: "blocking", Pipeline: p, WorkerCount: 1}},
+		}},
+		Store:     st,
+		Libraries: []domain.Library{lib},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- d.RunOnce(ctx) }()
+
+	select {
+	case <-inSearch:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for Search to start")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("RunOnce = %v, want context.Canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for RunOnce to return after cancellation")
+	}
+
+	file, _, err := st.GetFile(context.Background(), lib.Name, videoPath)
+	if err != nil {
+		t.Fatalf("GetFile: %v", err)
+	}
+	if got := file.Languages[0]; got.Status != domain.StatusPending || got.FailureReason != domain.FailureNone {
+		t.Fatalf("state after shutdown = %+v, want pending with no failure reason", got)
+	}
+
+	// The restarted process finds the pair Pending and finishes it.
+	p.Provider = &provider.Fake{
+		SearchFunc: func(context.Context, provider.Query) ([]domain.Candidate, error) {
+			return []domain.Candidate{{ID: "match", Title: "Test Movie", Year: 2024}}, nil
+		},
+		DownloadFunc: func(context.Context, domain.Candidate) ([]byte, error) {
+			return []byte("1\n00:00:00,500 --> 00:00:01,900\nSubtitle text\n"), nil
+		},
+	}
+	if err := d.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce after restart: %v", err)
+	}
+	file, _, err = st.GetFile(context.Background(), lib.Name, videoPath)
+	if err != nil {
+		t.Fatalf("GetFile: %v", err)
+	}
+	if file.Languages[0].Status != domain.StatusSynced {
+		t.Errorf("status after restart = %q, want synced", file.Languages[0].Status)
+	}
+}
+
+// TestDispatcher_RecoveredInProgressPairIsClaimedAndProcessed guards that a
+// pair stranded In Progress by a crash, once reset by
+// store.Store.RecoverInProgress at startup, is picked up by the Dispatcher.
+func TestDispatcher_RecoveredInProgressPairIsClaimedAndProcessed(t *testing.T) {
+	libDir := t.TempDir()
+	videoPath := filepath.Join(libDir, "Test.Movie.2024.HDTV.x264-FAKEGROUP.mp4")
+	writeVideoFixture(t, videoPath)
+
+	st := openTestStore(t)
+	lib := domain.Library{
+		Name:       "test-library",
+		Path:       libDir,
+		Languages:  []language.Tag{language.English},
+		StripScope: domain.StripScopeAll,
+	}
+	p := &pipeline.Pipeline{
+		Store: st,
+		Provider: &provider.Fake{
+			SearchFunc: func(context.Context, provider.Query) ([]domain.Candidate, error) {
+				return []domain.Candidate{{ID: "match", Title: "Test Movie", Year: 2024}}, nil
+			},
+			DownloadFunc: func(context.Context, domain.Candidate) ([]byte, error) {
+				return []byte("1\n00:00:00,500 --> 00:00:01,900\nSubtitle text\n"), nil
+			},
+		},
+		SyncEngine: &syncengine.FakeSyncEngine{},
+		Stripper:   &pipeline.FakeStripper{},
+	}
+
+	ctx := context.Background()
+	if _, err := p.Run(ctx, lib); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	file, _, err := st.GetFile(ctx, lib.Name, videoPath)
+	if err != nil {
+		t.Fatalf("GetFile: %v", err)
+	}
+	// Simulate the crashed process: claimed, then never finished.
+	if err := st.MarkInProgress(ctx, file.ID, language.English); err != nil {
+		t.Fatalf("MarkInProgress: %v", err)
+	}
+
+	d := &dispatcher.Dispatcher{Pipeline: p, Store: st, Libraries: []domain.Library{lib}}
+	if err := d.RunOnce(ctx); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	file, _, err = st.GetFile(ctx, lib.Name, videoPath)
+	if err != nil {
+		t.Fatalf("GetFile: %v", err)
+	}
+	if file.Languages[0].Status != domain.StatusInProgress {
+		t.Fatalf("status without recovery = %q, want in_progress (stuck)", file.Languages[0].Status)
+	}
+
+	if _, err := st.RecoverInProgress(ctx); err != nil {
+		t.Fatalf("RecoverInProgress: %v", err)
+	}
+	if err := d.RunOnce(ctx); err != nil {
+		t.Fatalf("RunOnce after recovery: %v", err)
+	}
+	file, _, err = st.GetFile(ctx, lib.Name, videoPath)
+	if err != nil {
+		t.Fatalf("GetFile: %v", err)
+	}
+	if file.Languages[0].Status != domain.StatusSynced {
+		t.Errorf("status after recovery = %q, want synced", file.Languages[0].Status)
+	}
+}

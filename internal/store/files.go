@@ -190,6 +190,46 @@ func (s *Store) ResetLanguageToPending(ctx context.Context, fileID int64, lang l
 	return checkUpdated(res)
 }
 
+// RecoverInProgress resets every StatusInProgress row to StatusPending and
+// returns how many it reset. It is for process startup, when no worker can
+// own an In Progress pair yet: such a row was left behind by a crash or hard
+// kill and would otherwise stay stuck forever. The force flag and the
+// attempted-Provider set are kept, since the interrupted attempt is the same
+// cycle continuing.
+func (s *Store) RecoverInProgress(ctx context.Context) (int, error) {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE file_language_states SET status = ?, updated_at = ? WHERE status = ?`,
+		domain.StatusPending, nowString(), domain.StatusInProgress,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("recovering in-progress language states: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("reading rows affected: %w", err)
+	}
+	return int(n), nil
+}
+
+// RequeueInProgress resets fileID's (file, language) row to StatusPending
+// only if it is currently StatusInProgress, reporting whether it did. It is
+// how an interrupted attempt (shutdown cancelled its work) gives its claim
+// back without overwriting an outcome a concurrent writer already recorded.
+func (s *Store) RequeueInProgress(ctx context.Context, fileID int64, lang language.Tag) (bool, error) {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE file_language_states SET status = ?, failure_reason = NULL, updated_at = ? WHERE file_id = ? AND language = ? AND status = ?`,
+		domain.StatusPending, nowString(), fileID, lang.String(), domain.StatusInProgress,
+	)
+	if err != nil {
+		return false, fmt.Errorf("requeueing in-progress language state: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("reading rows affected: %w", err)
+	}
+	return n > 0, nil
+}
+
 // RecordProviderMiss records that providerName searched this (file,
 // language) pair's current cycle and found no Candidate clearing the
 // scoring cutoff: it appends providerName to the pair's attempted-Provider
@@ -381,11 +421,11 @@ func (s *Store) GetFile(ctx context.Context, libraryName, path string) (domain.F
 }
 
 // MarkSynced sets fileID's language state to StatusSynced, clearing any
-// FailureReason. It returns ErrLanguageStateNotFound if no such row exists;
+// FailureReason and the force flag. It returns ErrLanguageStateNotFound if no such row exists;
 // callers must EnsureLanguage first.
 func (s *Store) MarkSynced(ctx context.Context, fileID int64, lang language.Tag) error {
 	res, err := s.db.ExecContext(ctx,
-		`UPDATE file_language_states SET status = ?, failure_reason = NULL, updated_at = ? WHERE file_id = ? AND language = ?`,
+		`UPDATE file_language_states SET status = ?, failure_reason = NULL, force = 0, updated_at = ? WHERE file_id = ? AND language = ?`,
 		domain.StatusSynced, nowString(), fileID, lang.String(),
 	)
 	if err != nil {
@@ -400,9 +440,13 @@ func (s *Store) MarkSynced(ctx context.Context, fileID int64, lang language.Tag)
 // whether because another caller already claimed it or for any other
 // reason; see ErrClaimLost's doc comment for why that's not distinguished
 // from a genuinely missing row. Callers must EnsureLanguage first.
+//
+// The force flag survives the claim: a forced pair interrupted mid-work
+// (shutdown, crash) must still bypass the Marker gate when it is claimed
+// again. It is cleared by MarkSynced and MarkFailed, which end the cycle.
 func (s *Store) MarkInProgress(ctx context.Context, fileID int64, lang language.Tag) error {
 	res, err := s.db.ExecContext(ctx,
-		`UPDATE file_language_states SET status = ?, failure_reason = NULL, force = 0, updated_at = ? WHERE file_id = ? AND language = ? AND status = ?`,
+		`UPDATE file_language_states SET status = ?, failure_reason = NULL, updated_at = ? WHERE file_id = ? AND language = ? AND status = ?`,
 		domain.StatusInProgress, nowString(), fileID, lang.String(), domain.StatusPending,
 	)
 	if err != nil {
@@ -418,7 +462,8 @@ func (s *Store) MarkInProgress(ctx context.Context, fileID int64, lang language.
 	return nil
 }
 
-// MarkFailed sets fileID's language state to StatusFailed with reason. It
+// MarkFailed sets fileID's language state to StatusFailed with reason,
+// clearing the force flag. It
 // returns ErrLanguageStateNotFound if no such row exists; callers must
 // EnsureLanguage first.
 func (s *Store) MarkFailed(ctx context.Context, fileID int64, lang language.Tag, reason domain.FailureReason) error {
@@ -427,7 +472,7 @@ func (s *Store) MarkFailed(ctx context.Context, fileID int64, lang language.Tag,
 	}
 
 	res, err := s.db.ExecContext(ctx,
-		`UPDATE file_language_states SET status = ?, failure_reason = ?, updated_at = ? WHERE file_id = ? AND language = ?`,
+		`UPDATE file_language_states SET status = ?, failure_reason = ?, force = 0, updated_at = ? WHERE file_id = ? AND language = ?`,
 		domain.StatusFailed, reason, nowString(), fileID, lang.String(),
 	)
 	if err != nil {
