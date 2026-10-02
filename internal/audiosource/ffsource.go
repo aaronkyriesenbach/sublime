@@ -61,6 +61,39 @@ func (s *FFSource) AudioStreams(ctx context.Context, videoPath string) ([]Stream
 	return streams, nil
 }
 
+type ffprobeFormatOutput struct {
+	Format struct {
+		Duration string `json:"duration"`
+	} `json:"format"`
+}
+
+// Duration implements Source.
+func (s *FFSource) Duration(ctx context.Context, videoPath string) (time.Duration, error) {
+	cmd := exec.CommandContext(ctx, s.ffprobePath,
+		"-v", "error",
+		"-show_entries", "format=duration",
+		"-of", "json",
+		videoPath,
+	)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		return 0, fmt.Errorf("audiosource: ffprobe duration of %q: %w: %s", videoPath, err, stderr.String())
+	}
+
+	var parsed ffprobeFormatOutput
+	if err := json.Unmarshal(stdout.Bytes(), &parsed); err != nil {
+		return 0, fmt.Errorf("audiosource: parsing ffprobe duration for %q: %w", videoPath, err)
+	}
+	secs, err := strconv.ParseFloat(parsed.Format.Duration, 64)
+	if err != nil {
+		return 0, fmt.Errorf("audiosource: %q has no usable duration (%q): %w", videoPath, parsed.Format.Duration, err)
+	}
+	return time.Duration(secs * float64(time.Second)), nil
+}
+
 // Extract implements Source.
 func (s *FFSource) Extract(ctx context.Context, videoPath string, streamIndex int, r Range) ([]byte, error) {
 	streams, err := s.AudioStreams(ctx, videoPath)

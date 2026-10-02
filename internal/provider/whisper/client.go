@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime/multipart"
 	"net/http"
+	"strings"
 )
 
 // client is the HTTP transport for a whisper.cpp server's /inference
@@ -25,68 +27,101 @@ type segment struct {
 	Text  string  `json:"text"`
 }
 
-// verboseResponse mirrors the parts of whisper.cpp's verbose_json response
+// verboseResponse mirrors the parts of whisper.cpp's /inference response
 // Sublime uses. A failed request answers with an "error" message instead
-// of segments.
+// of segments. A language-detection request answers with the detected
+// language in "detected_language" and/or "language"; which of them a server
+// version fills in, and whether as a code or a name, is not stable.
 type verboseResponse struct {
-	Error    string    `json:"error"`
-	Segments []segment `json:"segments"`
+	Error            string    `json:"error"`
+	Segments         []segment `json:"segments"`
+	Language         string    `json:"language"`
+	DetectedLanguage string    `json:"detected_language"`
 }
 
 // transcribe posts audio to /inference. The language is always explicit —
 // left to auto-detect, whisper could silently transcribe in the wrong
 // language — and translation is always off.
 func (c *client) transcribe(ctx context.Context, audio []byte, languageCode string) ([]segment, error) {
+	parsed, err := c.inference(ctx, audio, map[string]string{
+		"response_format": "verbose_json",
+		"language":        languageCode,
+		"translate":       "false",
+	})
+	if err != nil {
+		return nil, err
+	}
+	return parsed.Segments, nil
+}
+
+// detectLanguage asks the sidecar which language is spoken in a short clip
+// and returns it as the sidecar names it: a code ("en") or, depending on
+// the server version, an English name ("english").
+func (c *client) detectLanguage(ctx context.Context, clip []byte) (string, error) {
+	parsed, err := c.inference(ctx, clip, map[string]string{
+		"response_format": "json",
+		"language":        "auto",
+		"detect_language": "true",
+		"translate":       "false",
+	})
+	if err != nil {
+		return "", err
+	}
+	for _, detected := range []string{parsed.DetectedLanguage, parsed.Language} {
+		if detected = strings.TrimSpace(detected); detected != "" {
+			return detected, nil
+		}
+	}
+	return "", errors.New("sidecar response names no detected language")
+}
+
+func (c *client) inference(ctx context.Context, audio []byte, fields map[string]string) (verboseResponse, error) {
 	var body bytes.Buffer
 	form := multipart.NewWriter(&body)
 	file, err := form.CreateFormFile("file", "audio.wav")
 	if err != nil {
-		return nil, err
+		return verboseResponse{}, err
 	}
 	if _, err := file.Write(audio); err != nil {
-		return nil, err
+		return verboseResponse{}, err
 	}
-	for name, value := range map[string]string{
-		"response_format": "verbose_json",
-		"language":        languageCode,
-		"translate":       "false",
-	} {
+	for name, value := range fields {
 		if err := form.WriteField(name, value); err != nil {
-			return nil, err
+			return verboseResponse{}, err
 		}
 	}
 	if err := form.Close(); err != nil {
-		return nil, err
+		return verboseResponse{}, err
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/inference", &body)
 	if err != nil {
-		return nil, err
+		return verboseResponse{}, err
 	}
 	req.Header.Set("Content-Type", form.FormDataContentType())
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, err
+		return verboseResponse{}, err
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("reading response: %w", err)
+		return verboseResponse{}, fmt.Errorf("reading response: %w", err)
 	}
 
 	var parsed verboseResponse
 	decodeErr := json.Unmarshal(data, &parsed)
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("sidecar returned status %d: %s", resp.StatusCode, parsed.Error)
+		return verboseResponse{}, fmt.Errorf("sidecar returned status %d: %s", resp.StatusCode, parsed.Error)
 	}
 	if decodeErr != nil {
-		return nil, fmt.Errorf("decoding response: %w", decodeErr)
+		return verboseResponse{}, fmt.Errorf("decoding response: %w", decodeErr)
 	}
 	if parsed.Error != "" {
-		return nil, fmt.Errorf("sidecar reported an error: %s", parsed.Error)
+		return verboseResponse{}, fmt.Errorf("sidecar reported an error: %s", parsed.Error)
 	}
-	return parsed.Segments, nil
+	return parsed, nil
 }

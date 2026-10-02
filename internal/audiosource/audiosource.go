@@ -74,6 +74,10 @@ type Source interface {
 	// video without audio yields an empty slice, not an error.
 	AudioStreams(ctx context.Context, videoPath string) ([]Stream, error)
 
+	// Duration returns the length of the video's container, which bounds
+	// the ranges Extract can serve.
+	Duration(ctx context.Context, videoPath string) (time.Duration, error)
+
 	// Extract returns the given range of the audio stream at streamIndex
 	// as a WAV file: 16 kHz, mono, 16-bit PCM. The audio is decoded
 	// straight from the video, so memory use is bounded by the range, not

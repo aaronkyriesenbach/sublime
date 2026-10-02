@@ -266,3 +266,21 @@ func TestStream_MatchesLanguage_BaseLanguageIncludingRegionVariants(t *testing.T
 		}
 	}
 }
+
+func TestFFSource_Duration_ReportsContainerLength(t *testing.T) {
+	requireBinary(t, "ffprobe")
+
+	got, err := audiosource.NewFFSource().Duration(context.Background(), fixtureVideo)
+	if err != nil {
+		t.Fatalf("Duration: %v", err)
+	}
+	assertDuration(t, got, fixtureVideoDuration)
+}
+
+func TestFFSource_Duration_MissingFileIsAnError(t *testing.T) {
+	requireBinary(t, "ffprobe")
+
+	if _, err := audiosource.NewFFSource().Duration(context.Background(), filepath.Join(t.TempDir(), "absent.mkv")); err == nil {
+		t.Fatal("Duration: want an error for a missing file, got nil")
+	}
+}
