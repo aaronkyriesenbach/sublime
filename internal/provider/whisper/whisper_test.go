@@ -47,6 +47,10 @@ type fakeWhisperServer struct {
 	// instead of body, so each chunk of one Download gets its own transcript.
 	chunkBodies [][]byte
 
+	// chunkStatuses, if set, answers the n-th request with chunkStatuses[n]
+	// instead of status; a zero entry keeps status.
+	chunkStatuses []int
+
 	// hang makes the server hold every request open until the client goes
 	// away, and signals on hung when one arrives.
 	hang bool
@@ -89,6 +93,9 @@ func newFakeWhisperServer(t *testing.T, body []byte) *fakeWhisperServer {
 		}
 		if n := len(f.requests) - 1; n < len(f.chunkBodies) {
 			respBody = f.chunkBodies[n]
+		}
+		if n := len(f.requests) - 1; n < len(f.chunkStatuses) && f.chunkStatuses[n] != 0 {
+			status = f.chunkStatuses[n]
 		}
 		hang := f.hang
 		f.mu.Unlock()
@@ -161,10 +168,12 @@ func TestNew_RequiresEndpointAndAudioSource(t *testing.T) {
 	}
 }
 
-func TestNew_RejectsNegativeChunkLength(t *testing.T) {
-	cfg := whisper.Config{Endpoint: "http://whisper:8080", Audio: &audiosource.FakeSource{}, ChunkLength: -time.Minute}
-	if _, err := whisper.New(cfg); err == nil {
-		t.Error("New with a negative ChunkLength: want error, got nil")
+func TestNew_RejectsNonPositiveChunkLength(t *testing.T) {
+	for _, length := range []time.Duration{0, -time.Minute} {
+		cfg := whisper.Config{Endpoint: "http://whisper:8080", Audio: &audiosource.FakeSource{}, ChunkLength: length}
+		if _, err := whisper.New(cfg); err == nil {
+			t.Errorf("New with ChunkLength %s: want error, got nil", length)
+		}
 	}
 }
 

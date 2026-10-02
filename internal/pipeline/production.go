@@ -105,23 +105,28 @@ func providerStatusFor(name string, p provider.Provider) ProviderStatus {
 }
 
 // providerConstructor builds a real provider.Provider from cfg's
-// entry-specific settings (worker_count, paid) and every Provider's
-// secrets. Adding a new Provider means adding one entry to
+// entry-specific settings (worker_count, paid), every Provider's secrets,
+// and the logger for Providers that log their own causes. Adding a new Provider means adding one entry to
 // providerConstructors, not branching logic elsewhere in this file.
-type providerConstructor func(secrets config.ProviderSecrets, entry config.ProviderConfig) (provider.Provider, error)
+type providerConstructor func(secrets config.ProviderSecrets, entry config.ProviderConfig, logger *slog.Logger) (provider.Provider, error)
 
 // providerConstructors maps a providers.chain name to the constructor for
 // its concrete Provider. This is the seam that determines which Provider
 // names NewProduction recognizes.
 var providerConstructors = map[string]providerConstructor{
-	"opensubtitles": func(secrets config.ProviderSecrets, _ config.ProviderConfig) (provider.Provider, error) {
+	"opensubtitles": func(secrets config.ProviderSecrets, _ config.ProviderConfig, _ *slog.Logger) (provider.Provider, error) {
 		return opensubtitles.New(opensubtitles.Config{Secrets: secrets.OpenSubtitles})
 	},
-	"subdl": func(secrets config.ProviderSecrets, entry config.ProviderConfig) (provider.Provider, error) {
+	"subdl": func(secrets config.ProviderSecrets, entry config.ProviderConfig, _ *slog.Logger) (provider.Provider, error) {
 		return subdl.New(subdl.Config{APIKey: secrets.SubDL.APIKey, Paid: entry.Paid})
 	},
-	"whisper": func(_ config.ProviderSecrets, entry config.ProviderConfig) (provider.Provider, error) {
-		return whisper.New(whisper.Config{Endpoint: entry.Endpoint, Audio: audiosource.NewFFSource(), ChunkLength: entry.ChunkLength})
+	"whisper": func(_ config.ProviderSecrets, entry config.ProviderConfig, logger *slog.Logger) (provider.Provider, error) {
+		return whisper.New(whisper.Config{
+			Endpoint:    entry.Endpoint,
+			Audio:       audiosource.NewFFSource(),
+			ChunkLength: entry.ChunkLength,
+			Logger:      logger,
+		})
 	},
 }
 
@@ -160,7 +165,7 @@ func newProductionFromChain(cfg ProductionConfig) (*Pipeline, []ProviderStatus, 
 			return nil, nil, nil, fmt.Errorf("providers.chain: unknown provider %q", entry.Name)
 		}
 
-		p, err := ctor(cfg.Secrets, entry)
+		p, err := ctor(cfg.Secrets, entry, cfg.Logger)
 		if err != nil {
 			return nil, nil, nil, fmt.Errorf("creating %s provider: %w", entry.Name, err)
 		}
@@ -205,7 +210,7 @@ func newProductionFromTiers(cfg ProductionConfig) (*Pipeline, []ProviderStatus, 
 				return nil, nil, nil, fmt.Errorf("providers.chain: unknown provider %q", entry.Name)
 			}
 
-			p, err := ctor(cfg.Secrets, entry)
+			p, err := ctor(cfg.Secrets, entry, cfg.Logger)
 			if err != nil {
 				return nil, nil, nil, fmt.Errorf("creating %s provider: %w", entry.Name, err)
 			}

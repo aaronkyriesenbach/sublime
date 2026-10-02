@@ -28,7 +28,7 @@ func TestNewProduction_WhisperOnlyChainNeedsNoSecrets(t *testing.T) {
 }
 
 func TestNewProduction_WhisperStatusReportsSuspension(t *testing.T) {
-	whisper := config.ProviderConfig{Name: "whisper", Endpoint: "http://whisper:8080", WorkerCount: 1}
+	whisper := config.ProviderConfig{Name: "whisper", Endpoint: "http://whisper:8080", WorkerCount: 1, ChunkLength: 10 * time.Minute}
 
 	_, statuses, _, err := pipeline.NewProduction(pipeline.ProductionConfig{
 		ProviderChain: []config.ProviderConfig{whisper},

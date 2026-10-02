@@ -154,6 +154,31 @@ func TestDownload_LineDominatingAChunkIsRejectedEvenWhenNotConsecutive(t *testin
 	}
 }
 
+func TestDownload_EmptyFinalAttemptAfterALoopIsAMissNotNoSpeech(t *testing.T) {
+	server := newFakeWhisperServer(t, nil)
+	loop := repeatedLine("Thank you.", 12)
+	server.chunkBodies = [][]byte{loop, loop, []byte(`{"segments":[]}`)}
+	p := newProvider(t, server, longVideo(at(5, 0)), nil)
+
+	srt, err := download(t, p)
+
+	if err == nil {
+		t.Fatalf("Download shipped a subtitle with a hallucinating chunk silently dropped:\n%s", srt)
+	}
+	assertMiss(t, err)
+}
+
+func TestDownload_RequestFailureAfterALoopIsAMissNotARetrievalFailure(t *testing.T) {
+	server := newFakeWhisperServer(t, nil)
+	loop := repeatedLine("Thank you.", 12)
+	server.chunkBodies = [][]byte{loop, []byte(`{"error":"inference failed"}`), []byte(`{"error":"inference failed"}`)}
+	p := newProvider(t, server, longVideo(at(5, 0)), nil)
+
+	_, err := download(t, p)
+
+	assertMiss(t, err)
+}
+
 func TestDownload_ChunkThatStaysEmptyIsAcceptedAsWordless(t *testing.T) {
 	audio := longVideo(at(25, 0))
 	server := newFakeWhisperServer(t, nil)

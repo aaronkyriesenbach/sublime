@@ -70,12 +70,13 @@ func (s segment) keeping(keep func(unit) bool) (segment, bool) {
 	return out, true
 }
 
-// trim restricts segments to the units whose midpoint lies in [from, until).
-func trim(segments []segment, from, until time.Duration) []segment {
+// trim restricts segments to the units whose midpoint lies in [from, until);
+// a nil bound leaves that side open.
+func trim(segments []segment, from, until *time.Duration) []segment {
 	var out []segment
 	for _, s := range segments {
 		if kept, ok := s.keeping(func(u unit) bool {
-			return u.mid() >= from.Seconds() && u.mid() < until.Seconds()
+			return (from == nil || u.mid() >= from.Seconds()) && (until == nil || u.mid() < until.Seconds())
 		}); ok {
 			out = append(out, kept)
 		}
@@ -116,6 +117,8 @@ func sameWords(a, b []unit) bool {
 	return true
 }
 
+// normalizeWord reduces text to lowercase letters and digits, so words are
+// compared despite punctuation and case.
 func normalizeWord(text string) string {
 	return strings.Map(func(r rune) rune {
 		if unicode.IsLetter(r) || unicode.IsDigit(r) {

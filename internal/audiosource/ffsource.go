@@ -46,26 +46,32 @@ type ffprobeStream struct {
 	Tags  map[string]string `json:"tags"`
 }
 
-// AudioStreams implements Source.
-func (s *FFSource) AudioStreams(ctx context.Context, videoPath string) ([]Stream, error) {
-	cmd := exec.CommandContext(ctx, s.ffprobePath,
-		"-v", "error",
-		"-select_streams", "a",
-		"-show_entries", "stream=index:stream_tags=language",
-		"-of", "json",
-		videoPath,
-	)
+// runFFprobe runs ffprobe for what (e.g. "duration"), which names the query
+// in errors, and decodes its JSON output.
+func runFFprobe[T any](ctx context.Context, s *FFSource, videoPath, what string, args ...string) (T, error) {
+	var parsed T
+	cmd := exec.CommandContext(ctx, s.ffprobePath, append([]string{"-v", "error"}, append(args, "-of", "json", videoPath)...)...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
 	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("audiosource: ffprobe on %q: %w: %s", videoPath, err, stderr.String())
+		return parsed, fmt.Errorf("audiosource: ffprobe %s of %q: %w: %s", what, videoPath, err, stderr.String())
 	}
-
-	var parsed ffprobeOutput
 	if err := json.Unmarshal(stdout.Bytes(), &parsed); err != nil {
-		return nil, fmt.Errorf("audiosource: parsing ffprobe output for %q: %w", videoPath, err)
+		return parsed, fmt.Errorf("audiosource: parsing ffprobe %s of %q: %w", what, videoPath, err)
+	}
+	return parsed, nil
+}
+
+// AudioStreams implements Source.
+func (s *FFSource) AudioStreams(ctx context.Context, videoPath string) ([]Stream, error) {
+	parsed, err := runFFprobe[ffprobeOutput](ctx, s, videoPath, "audio streams",
+		"-select_streams", "a",
+		"-show_entries", "stream=index:stream_tags=language",
+	)
+	if err != nil {
+		return nil, err
 	}
 
 	streams := make([]Stream, len(parsed.Streams))
@@ -83,23 +89,11 @@ type ffprobeFormatOutput struct {
 
 // Duration implements Source.
 func (s *FFSource) Duration(ctx context.Context, videoPath string) (time.Duration, error) {
-	cmd := exec.CommandContext(ctx, s.ffprobePath,
-		"-v", "error",
+	parsed, err := runFFprobe[ffprobeFormatOutput](ctx, s, videoPath, "duration",
 		"-show_entries", "format=duration",
-		"-of", "json",
-		videoPath,
 	)
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-
-	if err := cmd.Run(); err != nil {
-		return 0, fmt.Errorf("audiosource: ffprobe duration of %q: %w: %s", videoPath, err, stderr.String())
-	}
-
-	var parsed ffprobeFormatOutput
-	if err := json.Unmarshal(stdout.Bytes(), &parsed); err != nil {
-		return 0, fmt.Errorf("audiosource: parsing ffprobe duration for %q: %w", videoPath, err)
+	if err != nil {
+		return 0, err
 	}
 	secs, err := strconv.ParseFloat(parsed.Format.Duration, 64)
 	if err != nil {
@@ -108,14 +102,23 @@ func (s *FFSource) Duration(ctx context.Context, videoPath string) (time.Duratio
 	return time.Duration(secs * float64(time.Second)), nil
 }
 
-// Silences implements Source.
-func (s *FFSource) Silences(ctx context.Context, videoPath string, streamIndex int) ([]Silence, error) {
+// requireStream fails with ErrNoAudioStream unless videoPath has an audio
+// stream at index.
+func (s *FFSource) requireStream(ctx context.Context, videoPath string, index int) error {
 	streams, err := s.AudioStreams(ctx, videoPath)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	if !hasStream(streams, streamIndex) {
-		return nil, fmt.Errorf("%w: %q has no audio stream at index %d", ErrNoAudioStream, videoPath, streamIndex)
+	if !hasStream(streams, index) {
+		return fmt.Errorf("%w: %q has no audio stream at index %d", ErrNoAudioStream, videoPath, index)
+	}
+	return nil
+}
+
+// Silences implements Source.
+func (s *FFSource) Silences(ctx context.Context, videoPath string, streamIndex int) ([]Silence, error) {
+	if err := s.requireStream(ctx, videoPath, streamIndex); err != nil {
+		return nil, err
 	}
 
 	// silencedetect reports through the log, which -v error would hide.
@@ -168,12 +171,8 @@ func parseSeconds(text []byte) time.Duration {
 
 // Extract implements Source.
 func (s *FFSource) Extract(ctx context.Context, videoPath string, streamIndex int, r Range) ([]byte, error) {
-	streams, err := s.AudioStreams(ctx, videoPath)
-	if err != nil {
+	if err := s.requireStream(ctx, videoPath, streamIndex); err != nil {
 		return nil, err
-	}
-	if !hasStream(streams, streamIndex) {
-		return nil, fmt.Errorf("%w: %q has no audio stream at index %d", ErrNoAudioStream, videoPath, streamIndex)
 	}
 
 	// -ss before -i seeks the demuxer instead of decoding and discarding

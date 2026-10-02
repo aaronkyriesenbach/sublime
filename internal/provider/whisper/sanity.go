@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"strings"
 	"time"
-	"unicode"
 )
 
 const (
@@ -99,11 +98,7 @@ func repetitionProblem(segments []segment) error {
 func normalizedLine(s segment) string {
 	var b strings.Builder
 	for _, u := range s.units() {
-		for _, r := range u.text {
-			if unicode.IsLetter(r) || unicode.IsDigit(r) {
-				b.WriteRune(unicode.ToLower(r))
-			}
-		}
+		b.WriteString(normalizeWord(u.text))
 		b.WriteByte(' ')
 	}
 	return strings.TrimSpace(b.String())
