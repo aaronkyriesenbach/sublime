@@ -27,6 +27,17 @@ type segment struct {
 	Start float64 `json:"start"`
 	End   float64 `json:"end"`
 	Text  string  `json:"text"`
+	// Words are whisper's token-level timings. A token that starts a word
+	// carries a leading space; one that continues a word does not.
+	Words []token `json:"words"`
+}
+
+// token is one timed piece of text from a segment's "words" array. Despite
+// the name, whisper.cpp emits sub-word tokens there.
+type token struct {
+	Text  string  `json:"word"`
+	Start float64 `json:"start"`
+	End   float64 `json:"end"`
 }
 
 // sidecarError is a non-2xx answer from the sidecar. Receiving one proves
@@ -54,7 +65,8 @@ type verboseResponse struct {
 
 // transcribe posts audio to /inference. The language is always explicit —
 // left to auto-detect, whisper could silently transcribe in the wrong
-// language — and translation is always off.
+// language — and translation is always off. The verbose_json format is what
+// makes the sidecar return per-token timestamps for cue shaping.
 func (c *client) transcribe(ctx context.Context, audio []byte, languageCode string) ([]segment, error) {
 	parsed, err := c.inference(ctx, audio, map[string]string{
 		"response_format": "verbose_json",

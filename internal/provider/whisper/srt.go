@@ -6,24 +6,16 @@ import (
 	"time"
 )
 
-// formatSRT renders segments as SRT cues, one per segment. Segments with
-// blank text are dropped, since whisper emits them for non-speech stretches.
-// It returns nil if no cue remains.
-func formatSRT(segments []segment) []byte {
+// formatSRT renders cues as SRT. It returns nil if there are none.
+func formatSRT(cues []cue) []byte {
 	var b strings.Builder
-	cue := 0
-	for _, s := range segments {
-		text := strings.TrimSpace(s.Text)
-		if text == "" {
-			continue
-		}
-		cue++
-		if cue > 1 {
+	for i, c := range cues {
+		if i > 0 {
 			b.WriteString("\n")
 		}
-		fmt.Fprintf(&b, "%d\n%s --> %s\n%s\n", cue, srtTimestamp(s.Start), srtTimestamp(s.End), text)
+		fmt.Fprintf(&b, "%d\n%s --> %s\n%s\n", i+1, srtTimestamp(c.Start), srtTimestamp(c.End), strings.Join(c.Lines, "\n"))
 	}
-	if cue == 0 {
+	if len(cues) == 0 {
 		return nil
 	}
 	return []byte(b.String())

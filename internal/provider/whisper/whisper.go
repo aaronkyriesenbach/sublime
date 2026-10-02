@@ -250,7 +250,8 @@ func missCause(streams []audiosource.Stream, target string) string {
 }
 
 // Download generates the subtitle for candidate: it extracts the audio
-// stream in one piece, transcribes it, and returns the segments as SRT.
+// stream in one piece, transcribes it, and returns the words shaped into SRT
+// cues.
 func (p *Provider) Download(ctx context.Context, candidate domain.Candidate) ([]byte, error) {
 	var id candidateID
 	if err := json.Unmarshal([]byte(candidate.ID), &id); err != nil || id.VideoPath == "" || id.Language == "" {
@@ -271,7 +272,7 @@ func (p *Provider) Download(ctx context.Context, candidate domain.Candidate) ([]
 		return nil, fmt.Errorf("whisper: transcribing: %w", err)
 	}
 
-	srt := formatSRT(segments)
+	srt := formatSRT(shapeCues(segments))
 	if len(srt) == 0 {
 		return nil, errors.New("whisper: transcript contains no speech")
 	}

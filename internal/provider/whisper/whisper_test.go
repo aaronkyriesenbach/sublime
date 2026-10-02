@@ -280,7 +280,7 @@ func TestDownload_SendsBaseLanguageForRegionVariantTarget(t *testing.T) {
 	}
 }
 
-func TestDownload_ReturnsSegmentsAsSRT(t *testing.T) {
+func TestDownload_ReturnsWordsMergedFromTokensAsSRT(t *testing.T) {
 	audio := &audiosource.FakeSource{Streams: []audiosource.Stream{{Index: 1, Language: "eng"}}}
 	p := newProvider(t, newFakeWhisperServer(t, sampleResponse(t)), audio, nil)
 
@@ -294,7 +294,7 @@ func TestDownload_ReturnsSegmentsAsSRT(t *testing.T) {
 	}
 
 	want := "1\n00:00:00,500 --> 00:00:02,250\nHello there.\n\n" +
-		"2\n00:00:03,000 --> 01:01:01,789\nGeneral Kenobi!\n"
+		"2\n00:00:03,000 --> 00:00:04,400\nGeneral Kenobi!\n"
 	if string(got) != want {
 		t.Errorf("SRT =\n%q\nwant\n%q", got, want)
 	}
