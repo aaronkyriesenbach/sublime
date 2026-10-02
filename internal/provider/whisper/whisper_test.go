@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"golang.org/x/text/language"
 
@@ -37,11 +38,24 @@ type fakeWhisperServer struct {
 	requests []inferenceRequest
 	status   int
 	body     []byte
+
+	// chunkBodies, if set, answers the n-th request with chunkBodies[n]
+	// instead of body, so each chunk of one Download gets its own transcript.
+	chunkBodies [][]byte
+
+	// hang makes the server hold every request open until the client goes
+	// away, and signals on hung when one arrives.
+	hang bool
+	hung chan struct{}
+	gone chan struct{}
 }
 
 func newFakeWhisperServer(t *testing.T, body []byte) *fakeWhisperServer {
 	t.Helper()
-	f := &fakeWhisperServer{status: http.StatusOK, body: body}
+	f := &fakeWhisperServer{
+		status: http.StatusOK, body: body,
+		hung: make(chan struct{}, 1), gone: make(chan struct{}, 1),
+	}
 	f.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost || r.URL.Path != "/inference" {
 			http.NotFound(w, r)
@@ -66,7 +80,18 @@ func newFakeWhisperServer(t *testing.T, body []byte) *fakeWhisperServer {
 		f.mu.Lock()
 		f.requests = append(f.requests, req)
 		status, respBody := f.status, f.body
+		if n := len(f.requests) - 1; n < len(f.chunkBodies) {
+			respBody = f.chunkBodies[n]
+		}
+		hang := f.hang
 		f.mu.Unlock()
+
+		if hang {
+			f.hung <- struct{}{}
+			<-r.Context().Done()
+			f.gone <- struct{}{}
+			return
+		}
 
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(status)
@@ -91,9 +116,11 @@ func sampleResponse(t *testing.T) []byte {
 	return body
 }
 
+const testChunkLength = 10 * time.Minute
+
 func newProvider(t *testing.T, server *fakeWhisperServer, audio audiosource.Source, logOut io.Writer) *whisper.Provider {
 	t.Helper()
-	cfg := whisper.Config{Endpoint: server.URL, Audio: audio}
+	cfg := whisper.Config{Endpoint: server.URL, Audio: audio, ChunkLength: testChunkLength}
 	if logOut != nil {
 		cfg.Logger = slog.New(slog.NewTextHandler(logOut, nil))
 	}
@@ -109,11 +136,18 @@ func query(tag language.Tag) provider.Query {
 }
 
 func TestNew_RequiresEndpointAndAudioSource(t *testing.T) {
-	if _, err := whisper.New(whisper.Config{Audio: &audiosource.FakeSource{}}); err == nil {
+	if _, err := whisper.New(whisper.Config{Audio: &audiosource.FakeSource{}, ChunkLength: testChunkLength}); err == nil {
 		t.Error("New without Endpoint: want error, got nil")
 	}
-	if _, err := whisper.New(whisper.Config{Endpoint: "http://whisper:8080"}); err == nil {
+	if _, err := whisper.New(whisper.Config{Endpoint: "http://whisper:8080", ChunkLength: testChunkLength}); err == nil {
 		t.Error("New without Audio: want error, got nil")
+	}
+}
+
+func TestNew_RejectsNegativeChunkLength(t *testing.T) {
+	cfg := whisper.Config{Endpoint: "http://whisper:8080", Audio: &audiosource.FakeSource{}, ChunkLength: -time.Minute}
+	if _, err := whisper.New(cfg); err == nil {
+		t.Error("New with a negative ChunkLength: want error, got nil")
 	}
 }
 

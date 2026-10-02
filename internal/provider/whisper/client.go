@@ -23,6 +23,19 @@ type segment struct {
 	Start float64 `json:"start"`
 	End   float64 `json:"end"`
 	Text  string  `json:"text"`
+
+	// Words are the segment's word-level timestamps. They are absent when
+	// the sidecar was not asked for them.
+	Words []word `json:"words"`
+}
+
+// word is one transcribed word. Text keeps whisper's leading space, which
+// is what separates it from the previous word when sub-word tokens are
+// concatenated.
+type word struct {
+	Text  string  `json:"word"`
+	Start float64 `json:"start"`
+	End   float64 `json:"end"`
 }
 
 // verboseResponse mirrors the parts of whisper.cpp's verbose_json response
