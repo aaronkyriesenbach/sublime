@@ -1176,6 +1176,75 @@ func TestPipeline_QuotaExhaustedOnDownloadResetsToPending(t *testing.T) {
 	}
 }
 
+// TestPipeline_UnavailableProviderResetsToPending guards that a
+// provider.UnavailableError — from Search or from Download — leaves the pair
+// Pending like quota exhaustion does, rather than Failed.
+func TestPipeline_UnavailableProviderResetsToPending(t *testing.T) {
+	unavailableErr := &provider.UnavailableError{ResumeAt: time.Now().Add(2 * time.Minute)}
+	tests := []struct {
+		name string
+		fake *provider.Fake
+	}{
+		{
+			name: "from Search",
+			fake: &provider.Fake{
+				SearchFunc: func(context.Context, provider.Query) ([]domain.Candidate, error) {
+					return nil, unavailableErr
+				},
+			},
+		},
+		{
+			name: "from Download",
+			fake: &provider.Fake{
+				SearchFunc: func(context.Context, provider.Query) ([]domain.Candidate, error) {
+					return []domain.Candidate{{ID: "candidate", Title: "Test Movie", Year: 2024}}, nil
+				},
+				DownloadFunc: func(context.Context, domain.Candidate) ([]byte, error) {
+					return nil, unavailableErr
+				},
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			libDir := t.TempDir()
+			videoPath := filepath.Join(libDir, "Test.Movie.2024.HDTV.x264-FAKEGROUP.mp4")
+			writeVideoFixture(t, videoPath)
+
+			st := openTestStore(t)
+			lib := domain.Library{
+				Name:       "test-library",
+				Path:       libDir,
+				Languages:  []language.Tag{language.English},
+				StripScope: domain.StripScopeAll,
+			}
+			p := &pipeline.Pipeline{
+				Store:      st,
+				Provider:   tc.fake,
+				SyncEngine: &syncengine.FakeSyncEngine{},
+				Stripper:   &pipeline.FakeStripper{},
+			}
+
+			ctx := context.Background()
+			if _, err := p.Run(ctx, lib); err != nil {
+				t.Fatalf("run: %v", err)
+			}
+			dispatchPending(t, ctx, p, st, lib)
+
+			file, ok, err := st.GetFile(ctx, "test-library", videoPath)
+			if err != nil || !ok {
+				t.Fatalf("GetFile ok=%v err=%v", ok, err)
+			}
+			if len(file.Languages) != 1 || file.Languages[0].Status != domain.StatusPending {
+				t.Fatalf("languages = %+v, want a single Pending row", file.Languages)
+			}
+			if file.Languages[0].FailureReason != domain.FailureNone {
+				t.Errorf("failure reason = %q, want none", file.Languages[0].FailureReason)
+			}
+		})
+	}
+}
+
 // TestPipeline_LogsStatusChangeForNoCandidate guards the uniform "status
 // changed" log line for a Failed landing whose reason is no_candidate: it
 // must log at WARN (not ERROR) with from=in_progress, to=failed, and

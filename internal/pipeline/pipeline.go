@@ -125,12 +125,22 @@ func (p *Pipeline) markFailed(
 	return nil
 }
 
+// isSuspensionSignal reports whether err tells the pipeline its Provider is
+// Suspended (quota exhausted or unavailable). The attempt then says nothing
+// about the file itself, so the pair is requeued instead of failed.
+func isSuspensionSignal(err error) bool {
+	var quotaErr *provider.QuotaExhaustedError
+	var unavailableErr *provider.UnavailableError
+	return errors.As(err, &quotaErr) || errors.As(err, &unavailableErr)
+}
+
 // markPending resets fileID's (file, language) pair back to StatusPending
 // via the store's single-language reset and, on success, emits the
 // uniform "status changed" log for the In Progress -> Pending transition.
-// Used when a Provider reports QuotaExhaustedError: the attempt didn't
-// fail in any way that reflects on the file itself, so it's requeued
-// rather than landing on Failed, and logged as an ordinary Info-level
+// Used when a Provider reports a Suspension (QuotaExhaustedError or
+// UnavailableError): the attempt didn't fail in any way that reflects on
+// the file itself, so it's requeued rather than landing on Failed, and
+// logged as an ordinary Info-level
 // landing with no FailureReason — the "something's off" signal already
 // lives in the Provider's own Suspended log line.
 func (p *Pipeline) markPending(
@@ -203,7 +213,8 @@ const (
 	// Providers are exhausted and mark Failed(no_candidate) if so.
 	OutcomeNoCandidateMiss
 	// OutcomePending means the pair was reset to StatusPending after a
-	// provider.QuotaExhaustedError — it will be retried on a future run.
+	// provider.QuotaExhaustedError or provider.UnavailableError — it will be
+	// retried on a future run.
 	OutcomePending
 	// OutcomeFailed means a non-recoverable failure occurred (not
 	// no_candidate — that's OutcomeNoCandidateMiss).
@@ -637,8 +648,7 @@ func (p *Pipeline) fetchAndWrite(
 
 	candidates, err := p.Provider.Search(ctx, query)
 	if err != nil {
-		var quotaErr *provider.QuotaExhaustedError
-		if errors.As(err, &quotaErr) {
+		if isSuspensionSignal(err) {
 			if pendingErr := p.markPending(ctx, lib, videoPath, lang, file.ID, string(hash)); pendingErr != nil {
 				return ProcessResult{Outcome: OutcomeFailed, Err: errors.Join(err, pendingErr)}
 			}
@@ -675,8 +685,7 @@ func (p *Pipeline) fetchAndWrite(
 
 	subtitleContent, err := p.Provider.Download(ctx, best)
 	if err != nil {
-		var quotaErr *provider.QuotaExhaustedError
-		if errors.As(err, &quotaErr) {
+		if isSuspensionSignal(err) {
 			if pendingErr := p.markPending(ctx, lib, videoPath, lang, file.ID, string(hash)); pendingErr != nil {
 				return ProcessResult{Outcome: OutcomeFailed, Err: errors.Join(err, pendingErr)}
 			}
