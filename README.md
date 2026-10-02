@@ -35,19 +35,60 @@ Besides downloading subtitles, Sublime can transcribe a video's own audio into
 a subtitle using a [whisper.cpp](https://github.com/ggml-org/whisper.cpp)
 server running as a sidecar container. `whisper` is a Provider like
 `opensubtitles` or `subdl`: you put it in `providers.chain`, and its position
-is its priority. Starting the sidecar, model and GPU choice, and expected
-speed are in [docs/whisper.md](docs/whisper.md); the sidecar example is in
-`docker-compose.yml`.
-Whisper needs no API keys, only the sidecar's URL:
+is its priority. It needs no API keys, only the sidecar's URL. Details,
+model choice and measured speed are in [docs/whisper.md](docs/whisper.md).
 
-```yaml
-providers:
-  chain: [whisper]
-  whisper:
-    endpoint: http://whisper:8080
-    worker_count: 1 # default
-    chunk_length: 10m # default
-```
+### Quick start
+
+1. Put `whisper` in `config.yaml` (the compose sidecar is reachable as
+   `http://whisper:8080` from the `sublime` service, because both are in the
+   same compose project):
+
+   ```yaml
+   providers:
+     chain: [whisper]
+     whisper:
+       endpoint: http://whisper:8080
+       worker_count: 1 # default
+       chunk_length: 10m # default
+   ```
+
+2. Create an empty `.env` if you have no other Provider credentials
+   (`docker-compose.yml` requires the file to exist):
+
+   ```sh
+   touch .env
+   ```
+
+3. Start Sublime and the sidecar. Pick one:
+
+   ```sh
+   # CPU: fine for a small library. The first start downloads a ~190 MB model.
+   docker compose --profile whisper up -d
+
+   # NVIDIA GPU: roughly 10-20x faster. Needs the NVIDIA Container Toolkit first
+   # (docs/whisper.md). The first start downloads a ~1.6 GB model.
+   docker compose -f docker-compose.yml -f docker-compose.gpu.yml \
+     --profile whisper up -d
+   ```
+
+4. Watch it work. The sidecar's `/health` goes healthy once the model has
+   loaded; `sublime status` shows progress, and the log shows each file's
+   chunks (`chunk 3 of 5`):
+
+   ```sh
+   docker compose ps
+   docker compose exec sublime sublime status
+   docker compose logs -f sublime
+   ```
+
+A subtitle Sublime already made for a file is recognized by its Marker and
+left alone, so a library Sublime has processed before is not redone when you
+add whisper to the chain. Run `sublime reprocess` to regenerate it (see
+[Switching sources](#switching-sources)). Other existing subtitles are
+replaced, as with any Provider.
+Expect a 45-minute episode to take about 20 seconds on an RTX 4080 SUPER and
+4 to 8 minutes on 4 CPU threads.
 
 ### Chain examples
 

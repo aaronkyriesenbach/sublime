@@ -86,12 +86,72 @@ The sidecar handles one request at a time, so `worker_count` defaults to 1.
 Raising it only queues requests behind one another unless you run several
 sidecars.
 
+## Running on an NVIDIA GPU
+
+[`docker-compose.gpu.yml`](../docker-compose.gpu.yml) is an override that
+swaps the sidecar for the CUDA image, gives it the GPU and switches to the
+`large-v3-turbo` model (a 1.6 GB download, about 4 GB of GPU memory in use).
+Sublime's own service and `config.yaml` stay exactly as they are.
+
+1. **Install the NVIDIA driver and the
+   [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)**
+   on the Docker host. On NixOS that is
+   `hardware.nvidia-container-toolkit.enable = true;`.
+2. **Make the GPU visible to Docker as a CDI device.** The override asks for
+   `nvidia.com/gpu=all`, which needs a CDI spec. The NixOS option writes one
+   for you; elsewhere generate it (and again after a driver update):
+
+   ```sh
+   sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml
+   ```
+
+3. **Check that a container can see the GPU:**
+
+   ```sh
+   docker run --rm --device nvidia.com/gpu=all ubuntu nvidia-smi -L
+   ```
+
+   It should print your GPU. If it says no CDI spec or vendor is found, the
+   spec from step 2 is missing, or your Docker Engine is too old for CDI
+   (tested with Docker 29.8 and Compose 5.5).
+4. **Start with both files:**
+
+   ```sh
+   docker compose -f docker-compose.yml -f docker-compose.gpu.yml \
+     --profile whisper up -d
+   ```
+
+5. **Confirm the sidecar is using it.** The log must say `using CUDA0 backend`
+   (`no GPU found` means it fell back to the CPU):
+
+   ```sh
+   docker compose logs whisper | grep -E "CUDA|GPU"
+   ```
+
+To keep the GPU setup permanently, copy the override's settings into
+`docker-compose.yml` or put `COMPOSE_FILE=docker-compose.yml:docker-compose.gpu.yml`
+in `.env`.
+
+The two older ways of requesting an NVIDIA GPU, `gpus: all` and
+`deploy.resources.reservations.devices` with `driver: nvidia`, need the
+toolkit's legacy `nvidia` Docker runtime. They failed on the NixOS test host
+(`could not select device driver "nvidia"` and `AMD CDI spec not found`) but
+should work on a host that registered the runtime with
+`sudo nvidia-ctk runtime configure --runtime=docker`; this was not tested.
+Use either in place of `devices:` in the override if CDI is not an option.
+
+Measured with the override on an RTX 4080 SUPER (16 GB): a 45-minute
+episode took about 20 seconds end to end (13 episodes in 4.5 minutes, about
+130x real time), where the CPU sidecar with `small` and 4 threads took 4 to 8
+minutes. Other vendors' GPUs are covered under [GPU image
+variants](#gpu-image-variants); only NVIDIA was run.
+
 ## Choosing a model
 
 | Hardware | Model | Why |
 | --- | --- | --- |
 | CPU only | `small`, quantized (`ggml-small-q5_1.bin`) | Runs at about 3-22x real time on the measured CPU depending on threads, about 590 MiB |
-| GPU | `large-v3-turbo` (`ggml-large-v3-turbo.bin`, or a quantized `-q5_0`) | Best accuracy that still runs fast on a GPU (not measured here) |
+| GPU | `large-v3-turbo` (`ggml-large-v3-turbo.bin`, or a quantized `-q5_0`) | Best accuracy that still runs fast on a GPU; about 130x real time on an RTX 4080 SUPER |
 
 `large-v3-turbo-q5_0` on a CPU ran at 0.7-5.8x real time depending on threads
 (about 980 MiB), so it only makes sense on a CPU with many fast cores. A host
@@ -115,14 +175,15 @@ access to the device.
 | Variant | Use when | Image tag | Container access |
 | --- | --- | --- | --- |
 | CPU | No supported GPU, or a small NAS | `ghcr.io/ggml-org/whisper.cpp:main` | none |
-| CUDA | NVIDIA GPU | `ghcr.io/ggml-org/whisper.cpp:main-cuda` | NVIDIA Container Toolkit; `deploy.resources.reservations.devices` with `driver: nvidia`, or `gpus: all` |
+| CUDA | NVIDIA GPU | `ghcr.io/ggml-org/whisper.cpp:main-cuda` | NVIDIA Container Toolkit; the compose override uses the CDI device `nvidia.com/gpu=all` (see [Running on an NVIDIA GPU](#running-on-an-nvidia-gpu)) |
 | Vulkan | AMD or Intel GPU where ROCm or oneAPI is unavailable; the most portable GPU option | `ghcr.io/ggml-org/whisper.cpp:main-vulkan` | `devices: [/dev/dri:/dev/dri]` |
 | ROCm | Supported AMD GPU | no published image (the repository has a ROCm Dockerfile that is not published); build whisper.cpp with `GGML_HIP=1` | `devices: [/dev/kfd, /dev/dri]` and `group_add: [video]` |
 | Intel (oneAPI/SYCL) | Intel Arc or integrated GPU | `ghcr.io/ggml-org/whisper.cpp:main-intel` | `devices: [/dev/dri:/dev/dri]` |
 
 The CPU, CUDA, Vulkan and Intel tags are published (alongside `main-musa`,
-`main-arm64` and `main-vulkan-arm64`); only the CPU image was run when the
-numbers below were measured. `main` is a moving tag with no version tags: pin
+`main-arm64` and `main-vulkan-arm64`). Only the CPU and CUDA images have been
+run; the Vulkan, ROCm and Intel rows are untested. The throughput table below
+is CPU only. `main` is a moving tag with no version tags: pin
 by digest or a `main-<commit>` tag for reproducibility. Tags are listed at
 <https://github.com/ggml-org/whisper.cpp/pkgs/container/whisper.cpp>.
 
@@ -167,7 +228,7 @@ Caveats:
   NAS or mini-PC will be slower per thread. A 4-core NAS will probably land
   near the 1-2 thread rows for `small` (about 3-7x, an extrapolation, not a
   measurement).
-- GPU images were not run, and no real multi-audio-track video was tested.
+- Only the CUDA GPU image was run (one RTX 4080 SUPER, see [Running on an NVIDIA GPU](#running-on-an-nvidia-gpu)), and no real multi-audio-track video was tested.
 - Timings are good to roughly 5-10%.
 - Speed does not depend on chunk length, but memory does: about 14 MiB per
   extra minute of audio on top of the model.
@@ -194,6 +255,22 @@ own: its 600 s socket timeouts do not cap inference (a request ran 887 s and
 succeeded), and a client disconnect aborts it. Keep the default unless you have
 a reason; the timeout assumes the sidecar runs at no less than about 0.33x real
 time.
+
+## What the output looks like
+
+Checked against the human-made subtitles of a 13-episode TV season (*Doctor
+Who* 2005, music and effects under most scenes), whisper agreed with the
+human text on about 90-95% of the words in 12 episodes (the 13th's human
+subtitle was for a different cut and was ignored). That was `large-v3-turbo`
+on the GPU; `small` on the CPU was close on the two episodes compared, with
+more mis-heard names and phrases. On four sampled episodes about 80% of cues
+started within a second of the matching human cue and 94-99% within three. Expect
+the odd hallucinated word over music or silence (a lone "The" or "you" cue)
+and mis-heard proper nouns. Sublime asks the sidecar not to carry text from
+one 30-second window into the next (`max_context=0`), which on this season
+removed most of the repeated-line loops; a chunk that still loops is retried
+and, if it keeps looping, the file ends as a miss rather than shipping
+garbage.
 
 ## Behavior to know about
 
