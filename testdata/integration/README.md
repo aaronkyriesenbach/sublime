@@ -13,6 +13,7 @@ see `generate.sh` for why. Regenerate with `./generate.sh` (requires
 | File | Purpose |
 |---|---|
 | `video/sample.mp4` | 9s, 320x240, gray field + a 3-line synthesized-speech audio track (spoken at 0.5s / 3.5s / 6.5s). Real voice content (not a tone), so alass's WebRTC VAD has genuine speech to lock onto. Used as: an ffprobe metadata fixture, and an alass reference-video input. |
+| `video/tones.mp4` | 34s, 160x120, audio tagged `eng`: 440 Hz tone bursts separated by silences (3–3.6s, 9–10s, 11–11.6s, 19.5–20.5s, 29–30s). Built for the whisper Provider's chunked-transcription integration test at a 10s chunk length, where the cuts must land in the 9–10s, 19.5–20.5s and 29–30s silences. No speech: the whisper server is faked. |
 | `video/tiny.mp4` | Silent, 1s, well under 64 KiB. Exercises the [Content Hash algorithm](https://github.com/aaronkyriesenbach/sublime/issues/12)'s first/last-64KiB overlap case for files smaller than one window. |
 | `subs/sample.srt` | Correctly-timed transcript of `sample.mp4`'s speech (`00:00.5`, `00:03.5`, `00:06.5`) — the alignment target. |
 | `subs/sample.shifted.srt` | Same text, shifted +2.5s — the "incorrect" input alass is expected to re-align back toward `sample.srt`'s timing. |
