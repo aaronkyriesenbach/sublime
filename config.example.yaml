@@ -29,6 +29,13 @@ providers:
   # (see CONTEXT.md's Tier entry and docs/adr/0008-tiered-provider-chain.md):
   chain: [[opensubtitles, subdl]]
   #
+  # Capacity, like Suspension, never crosses a Tier. When every worker of a
+  # Tier's Providers is busy, pairs wait (stay Pending) instead of falling to
+  # the next Tier; only a Tier-mate with a free worker may take the work (see
+  # docs/adr/0015-capacity-never-crosses-a-tier.md). So
+  # [opensubtitles, subdl] does not spill to SubDL while OpenSubtitles is busy;
+  # use [[opensubtitles, subdl]] if you want that overflow.
+  #
   # whisper generates a subtitle from the video's own audio (same language
   # only, never Synced) and takes its place in the chain like any other
   # Provider: [whisper] alone, [whisper, opensubtitles] to prefer generated
