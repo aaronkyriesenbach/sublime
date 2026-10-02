@@ -1,8 +1,8 @@
 // Package pipeline orchestrates Sublime's subtitle sync workflow.
 //
 // This file provides NewProduction, a factory for constructing a real
-// Provider per entry in config.Config.ProviderChain (opensubtitles and/or
-// subdl), each wrapped in its own Pipeline sharing the same alass Sync
+// Provider per entry in config.Config.ProviderChain (opensubtitles, subdl,
+// and/or whisper), each wrapped in its own Pipeline sharing the same alass Sync
 // Engine and FFStripper, instead of today's hardcoded single
 // opensubtitles.Provider.
 package pipeline
@@ -12,10 +12,12 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/aaronkyriesenbach/sublime/internal/audiosource"
 	"github.com/aaronkyriesenbach/sublime/internal/config"
 	"github.com/aaronkyriesenbach/sublime/internal/provider"
 	"github.com/aaronkyriesenbach/sublime/internal/provider/opensubtitles"
 	"github.com/aaronkyriesenbach/sublime/internal/provider/subdl"
+	"github.com/aaronkyriesenbach/sublime/internal/provider/whisper"
 	"github.com/aaronkyriesenbach/sublime/internal/store"
 	"github.com/aaronkyriesenbach/sublime/internal/strip"
 	"github.com/aaronkyriesenbach/sublime/internal/syncengine/alass"
@@ -117,6 +119,9 @@ var providerConstructors = map[string]providerConstructor{
 	},
 	"subdl": func(secrets config.ProviderSecrets, entry config.ProviderConfig) (provider.Provider, error) {
 		return subdl.New(subdl.Config{APIKey: secrets.SubDL.APIKey, Paid: entry.Paid})
+	},
+	"whisper": func(_ config.ProviderSecrets, entry config.ProviderConfig) (provider.Provider, error) {
+		return whisper.New(whisper.Config{Endpoint: entry.Endpoint, Audio: audiosource.NewFFSource()})
 	},
 }
 
