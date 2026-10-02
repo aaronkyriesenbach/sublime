@@ -1,6 +1,6 @@
 {
   "task": "transcribe",
-  "language": "en",
+  "language": "english",
   "duration": 6.0,
   "text": " Hello there. General Kenobi!",
   "segments": [
