@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/aaronkyriesenbach/sublime/internal/api"
 	"github.com/aaronkyriesenbach/sublime/internal/cli"
@@ -228,5 +229,64 @@ func TestStatusCommand_DaemonErrorSurfacesMessageAndNonZeroExit(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "unknown library") {
 		t.Errorf("error = %v, want it to surface the daemon's message", err)
+	}
+}
+
+func TestStatusCommand_ShowsSuspendedProviders(t *testing.T) {
+	resumeAt := time.Date(2026, 10, 2, 22, 0, 0, 0, time.UTC)
+	apiURL := newFakeAPIServer(t, func(w http.ResponseWriter, r *http.Request) {
+		resp := api.StatusResponse{
+			Libraries: []api.LibrarySummaryEntry{{Name: "tv", Pending: 2}},
+			Providers: []api.ProviderEntry{
+				{Name: "opensubtitles"},
+				{Name: "whisper", Suspended: true, ResumeAt: &resumeAt},
+			},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	})
+
+	root := cli.NewRootCommand()
+	out := &bytes.Buffer{}
+	root.SetOut(out)
+	root.SetErr(out)
+	root.SetArgs([]string{"status", "--api", apiURL})
+
+	if err := root.Execute(); err != nil {
+		t.Fatalf("Execute returned error: %v", err)
+	}
+
+	output := out.String()
+	for _, want := range []string{"PROVIDER", "whisper"} {
+		if !strings.Contains(output, want) {
+			t.Errorf("output missing %q; got:\n%s", want, output)
+		}
+	}
+	if strings.Contains(output, "opensubtitles") {
+		t.Errorf("healthy Provider should not be listed; got:\n%s", output)
+	}
+}
+
+func TestStatusCommand_OmitsProviderTableWhenNoneSuspended(t *testing.T) {
+	apiURL := newFakeAPIServer(t, func(w http.ResponseWriter, r *http.Request) {
+		resp := api.StatusResponse{
+			Libraries: []api.LibrarySummaryEntry{{Name: "tv"}},
+			Providers: []api.ProviderEntry{{Name: "whisper"}},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	})
+
+	root := cli.NewRootCommand()
+	out := &bytes.Buffer{}
+	root.SetOut(out)
+	root.SetErr(out)
+	root.SetArgs([]string{"status", "--api", apiURL})
+
+	if err := root.Execute(); err != nil {
+		t.Fatalf("Execute returned error: %v", err)
+	}
+	if strings.Contains(out.String(), "PROVIDER") {
+		t.Errorf("unexpected provider table; got:\n%s", out.String())
 	}
 }

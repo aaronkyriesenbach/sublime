@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"text/tabwriter"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -84,6 +85,10 @@ func printStatus(w io.Writer, resp api.StatusResponse) error {
 		return err
 	}
 
+	if err := printSuspendedProviders(w, resp.Providers); err != nil {
+		return err
+	}
+
 	if resp.Files == nil {
 		return nil
 	}
@@ -120,6 +125,38 @@ func printStatus(w io.Writer, resp api.StatusResponse) error {
 		}
 	}
 	return nil
+}
+
+// printSuspendedProviders explains why pairs are waiting. Healthy Providers are
+// omitted so the common case stays as terse as before.
+func printSuspendedProviders(w io.Writer, providers []api.ProviderEntry) error {
+	var suspended []api.ProviderEntry
+	for _, p := range providers {
+		if p.Suspended {
+			suspended = append(suspended, p)
+		}
+	}
+	if len(suspended) == 0 {
+		return nil
+	}
+
+	if _, err := fmt.Fprintln(w); err != nil {
+		return err
+	}
+	ptw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+	if _, err := fmt.Fprintln(ptw, "PROVIDER\tSUSPENDED UNTIL"); err != nil {
+		return fmt.Errorf("writing provider header: %w", err)
+	}
+	for _, p := range suspended {
+		until := "unknown"
+		if p.ResumeAt != nil {
+			until = p.ResumeAt.Local().Format(time.RFC3339)
+		}
+		if _, err := fmt.Fprintf(ptw, "%s\t%s\n", p.Name, until); err != nil {
+			return fmt.Errorf("writing provider state: %w", err)
+		}
+	}
+	return ptw.Flush()
 }
 
 func derefOrZero(v *int) int {
