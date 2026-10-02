@@ -39,7 +39,21 @@ providers:
   # whisper generates a subtitle from the video's own audio (same language
   # only, never Synced) and takes its place in the chain like any other
   # Provider: [whisper] alone, [whisper, opensubtitles] to prefer generated
-  # subtitles, or [opensubtitles, whisper] as a last resort.
+  # subtitles, or [opensubtitles, whisper] as a last resort. The four setups:
+  #
+  #   chain: [whisper]                   # whisper only; no online account needed
+  #   chain: [whisper, opensubtitles]    # prefer generated; fall back online
+  #   chain: [opensubtitles, whisper]    # prefer online; generate as last resort
+  #   chain: [[whisper, opensubtitles]]  # shared Tier: equally trusted
+  #
+  # Order is priority. Suspension (sidecar down, quota) and capacity (whisper's
+  # single worker busy) never move a pair to the next Tier, so in
+  # [whisper, opensubtitles] pairs wait for whisper; only a shared Tier lets
+  # the other Provider substitute. Whisper never translates (audio must be in
+  # the target language) and its subtitles are never Synced. Changing the chain
+  # does not rewrite existing subtitles: run `sublime reprocess` to redo them.
+  # Sidecar setup, models and GPU images: docs/whisper.md (compose example is
+  # unverified until spike #100 completes).
 
   opensubtitles:
     worker_count: 4 # concurrent workers in this Provider's pool
@@ -49,7 +63,8 @@ providers:
     paid: true # use SubDL's paid tier
 
   # Only needed when whisper is in the chain. No secrets: just the URL of a
-  # whisper.cpp server.
+  # whisper.cpp server. The compose example's sidecar is reachable at
+  # http://whisper:8080 (start it with `docker compose --profile whisper up -d`).
   # whisper:
   #   endpoint: http://whisper:8080 # required
   #   worker_count: 1 # default; the sidecar serves one request at a time
