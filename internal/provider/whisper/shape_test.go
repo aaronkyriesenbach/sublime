@@ -221,15 +221,23 @@ func TestDownload_ShapesWordsIntoWellFormedCues(t *testing.T) {
 			want: []string{"Hm.", "Okay then."},
 		},
 		{
-			name: "runs of identical consecutive cues collapse",
+			name: "runs of identical cues close in time collapse",
 			segments: []wireSegment{segmentOf(concat(
-				say(0, 0.5, "Thank you."),
-				say(3, 0.5, "Thank you."),
-				say(6, 0.5, "Thank you."),
+				say(0, 0.6, "Thank you."),
+				say(1.5, 0.6, "Thank you."),
+				say(3, 0.6, "Thank you."),
 				say(9, 0.5, "See you soon."),
 				say(12, 0.5, "Thank you."),
 			))},
 			want: []string{"Thank you.", "See you soon.", "Thank you."},
+		},
+		{
+			name: "identical cues far apart in time are both kept",
+			segments: []wireSegment{segmentOf(concat(
+				say(0, 0.5, "What?"),
+				say(5, 0.5, "What?"),
+			))},
+			want: []string{"What?", "What?"},
 		},
 		{
 			name: "sub-word tokens merge into words and punctuation attaches to its word",

@@ -263,12 +263,20 @@ func abs(n int) int {
 	return n
 }
 
-// collapseRepeats drops a cue whose text equals the previous cue's, so a
-// hallucinated stutter shows once.
+// repeatGapSeconds is the longest silence between two identical cues that
+// still reads as one stutter. Past it the repeat is a line actually spoken
+// twice ("What?" ... "What?").
+const repeatGapSeconds = 1.0
+
+// collapseRepeats folds a cue whose text equals the previous cue's and
+// follows it closely into that cue, extending it, so a hallucinated stutter
+// shows once and a long run stays one cue.
 func collapseRepeats(cues []cue) []cue {
 	var out []cue
 	for _, c := range cues {
-		if n := len(out); n > 0 && strings.EqualFold(out[n-1].text(), c.text()) {
+		if n := len(out); n > 0 && c.Start-out[n-1].End < repeatGapSeconds &&
+			strings.EqualFold(out[n-1].text(), c.text()) {
+			out[n-1].End = min(c.End, out[n-1].Start+maxCueSeconds)
 			continue
 		}
 		out = append(out, c)
