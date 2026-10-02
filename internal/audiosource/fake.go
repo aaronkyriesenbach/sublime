@@ -31,6 +31,16 @@ type FakeSource struct {
 	// DurationErr, if set, is returned by Duration instead of VideoDuration.
 	DurationErr error
 
+	// SilenceIntervals is returned by Silences for every video path.
+	SilenceIntervals []Silence
+
+	// SilencesErr, if set, is returned by Silences instead of
+	// SilenceIntervals.
+	SilencesErr error
+
+	// SilencesCalls counts Silences invocations.
+	SilencesCalls int
+
 	// Audio, if non-nil, is returned verbatim by Extract. Left nil, Extract
 	// returns silence of the requested Range.Duration as a valid WAV.
 	Audio []byte
@@ -56,6 +66,22 @@ func (f *FakeSource) Duration(_ context.Context, _ string) (time.Duration, error
 		return 0, f.DurationErr
 	}
 	return f.VideoDuration, nil
+}
+
+// Silences implements Source. Like the real implementation, it reports
+// ErrNoAudioStream for an index that is not in Streams.
+func (f *FakeSource) Silences(_ context.Context, _ string, streamIndex int) ([]Silence, error) {
+	f.mu.Lock()
+	f.SilencesCalls++
+	f.mu.Unlock()
+
+	if f.SilencesErr != nil {
+		return nil, f.SilencesErr
+	}
+	if !hasStream(f.Streams, streamIndex) {
+		return nil, fmt.Errorf("%w: fake has no audio stream at index %d", ErrNoAudioStream, streamIndex)
+	}
+	return append([]Silence(nil), f.SilenceIntervals...), nil
 }
 
 // Extract implements Source. Like the real implementation, it reports

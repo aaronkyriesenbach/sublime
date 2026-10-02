@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -264,6 +265,61 @@ func TestStream_MatchesLanguage_BaseLanguageIncludingRegionVariants(t *testing.T
 		if got := tc.stream.MatchesLanguage(target); got != tc.want {
 			t.Errorf("Stream{%q}.MatchesLanguage(%s) = %v, want %v", tc.stream.Language, tc.target, got, tc.want)
 		}
+	}
+}
+
+// toneWithSilences builds a video-less Matroska file of a 440 Hz tone that
+// is muted over each given [start, end) second span.
+func toneWithSilences(t *testing.T, total int, muted ...[2]int) string {
+	t.Helper()
+	out := filepath.Join(t.TempDir(), "tone.mkv")
+	filter := "volume=1"
+	for _, span := range muted {
+		filter += fmt.Sprintf(",volume=enable='between(t,%d,%d)':volume=0", span[0], span[1])
+	}
+	runFFmpeg(t, "-f", "lavfi", "-t", strconv.Itoa(total), "-i", "sine=frequency=440", "-af", filter, out)
+	return out
+}
+
+func TestFFSource_Silences_ReportsMutedStretches(t *testing.T) {
+	requireBinary(t, "ffmpeg")
+	requireBinary(t, "ffprobe")
+	video := toneWithSilences(t, 10, [2]int{3, 5}, [2]int{8, 10})
+
+	got, err := audiosource.NewFFSource().Silences(context.Background(), video, 0)
+	if err != nil {
+		t.Fatalf("Silences: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("Silences = %+v, want 2 intervals", got)
+	}
+	assertDuration(t, got[0].Start, 3*time.Second)
+	assertDuration(t, got[0].End, 5*time.Second)
+	assertDuration(t, got[1].Start, 8*time.Second)
+	// The second silence runs to the end of the stream.
+	assertDuration(t, got[1].End, 10*time.Second)
+}
+
+func TestFFSource_Silences_ContinuousToneHasNone(t *testing.T) {
+	requireBinary(t, "ffmpeg")
+	requireBinary(t, "ffprobe")
+
+	got, err := audiosource.NewFFSource().Silences(context.Background(), muxAudioTracks(t, "eng"), 0)
+	if err != nil {
+		t.Fatalf("Silences: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("Silences = %+v, want none", got)
+	}
+}
+
+func TestFFSource_Silences_MissingAudioStreamIsClearError(t *testing.T) {
+	requireBinary(t, "ffmpeg")
+	requireBinary(t, "ffprobe")
+
+	_, err := audiosource.NewFFSource().Silences(context.Background(), fixtureVideo, 0)
+	if !errors.Is(err, audiosource.ErrNoAudioStream) {
+		t.Errorf("Silences(video stream index) error = %v, want ErrNoAudioStream", err)
 	}
 }
 

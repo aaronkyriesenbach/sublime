@@ -121,7 +121,7 @@ var providerConstructors = map[string]providerConstructor{
 		return subdl.New(subdl.Config{APIKey: secrets.SubDL.APIKey, Paid: entry.Paid})
 	},
 	"whisper": func(_ config.ProviderSecrets, entry config.ProviderConfig) (provider.Provider, error) {
-		return whisper.New(whisper.Config{Endpoint: entry.Endpoint, Audio: audiosource.NewFFSource()})
+		return whisper.New(whisper.Config{Endpoint: entry.Endpoint, Audio: audiosource.NewFFSource(), ChunkLength: entry.ChunkLength})
 	},
 }
 

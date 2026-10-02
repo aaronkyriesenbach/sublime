@@ -41,6 +41,11 @@ type Config struct {
 	// sidecar. Required; production wiring passes audiosource.NewFFSource().
 	Audio audiosource.Source
 
+	// ChunkLength is the target audio length of each request: a video is
+	// transcribed as a series of chunks about this long, cut at silence.
+	// Zero means 10 minutes; negative is rejected.
+	ChunkLength time.Duration
+
 	// HTTPClient overrides the client used for sidecar requests; defaults
 	// to http.DefaultClient.
 	HTTPClient *http.Client
@@ -65,6 +70,8 @@ type Provider struct {
 	executor *retry.Executor
 	now      func() time.Time
 
+	chunkLength time.Duration
+
 	mu sync.Mutex
 	// suspendedUntil is when an Unavailable Suspension ends; zero when the
 	// Provider is not suspended.
@@ -84,6 +91,13 @@ func New(cfg Config) (*Provider, error) {
 	if cfg.Audio == nil {
 		return nil, errors.New("whisper: Config.Audio is required")
 	}
+	if cfg.ChunkLength < 0 {
+		return nil, fmt.Errorf("whisper: Config.ChunkLength cannot be negative, got %s", cfg.ChunkLength)
+	}
+	chunkLength := cfg.ChunkLength
+	if chunkLength == 0 {
+		chunkLength = defaultChunkLength
+	}
 	endpoint, err := url.Parse(cfg.Endpoint)
 	if err != nil {
 		return nil, fmt.Errorf("whisper: invalid endpoint %q: %w", cfg.Endpoint, err)
@@ -101,11 +115,12 @@ func New(cfg Config) (*Provider, error) {
 		now = time.Now
 	}
 	return &Provider{
-		client:   &client{baseURL: strings.TrimRight(endpoint.String(), "/"), httpClient: httpClient},
-		audio:    cfg.Audio,
-		log:      cfg.Logger,
-		executor: retry.NewExecutor(clock),
-		now:      now,
+		client:      &client{baseURL: strings.TrimRight(endpoint.String(), "/"), httpClient: httpClient},
+		audio:       cfg.Audio,
+		log:         cfg.Logger,
+		executor:    retry.NewExecutor(clock),
+		now:         now,
+		chunkLength: chunkLength,
 	}, nil
 }
 
@@ -249,9 +264,10 @@ func missCause(streams []audiosource.Stream, target string) string {
 	return fmt.Sprintf("audio is %s, target is %s", strings.Join(tags, "/"), target)
 }
 
-// Download generates the subtitle for candidate: it extracts the audio
-// stream in one piece, transcribes it, and returns the words shaped into SRT
-// cues.
+// Download generates the subtitle for candidate: it transcribes the audio
+// stream chunk by chunk, each extracted straight from the video, and returns
+// the assembled segments as SRT. The transcript is held in memory only, so
+// an interrupted run starts over.
 func (p *Provider) Download(ctx context.Context, candidate domain.Candidate) ([]byte, error) {
 	var id candidateID
 	if err := json.Unmarshal([]byte(candidate.ID), &id); err != nil || id.VideoPath == "" || id.Language == "" {
@@ -262,19 +278,60 @@ func (p *Provider) Download(ctx context.Context, candidate domain.Candidate) ([]
 		return nil, err
 	}
 
-	audio, err := p.audio.Extract(ctx, id.VideoPath, id.StreamIndex, audiosource.Range{})
+	total, err := p.audio.Duration(ctx, id.VideoPath)
 	if err != nil {
-		return nil, fmt.Errorf("whisper: extracting audio: %w", err)
+		return nil, fmt.Errorf("whisper: reading video duration: %w", err)
+	}
+	chunks, err := planChunks(total, p.chunkLength, func() ([]audiosource.Silence, error) {
+		silences, err := p.audio.Silences(ctx, id.VideoPath, id.StreamIndex)
+		if err != nil {
+			return nil, fmt.Errorf("whisper: detecting silence: %w", err)
+		}
+		return silences, nil
+	})
+	if err != nil {
+		return nil, err
 	}
 
-	segments, err := p.transcribe(ctx, audio, id.Language)
-	if err != nil {
-		return nil, fmt.Errorf("whisper: transcribing: %w", err)
+	var transcript []segment
+	for i, c := range chunks {
+		p.logger().Info(fmt.Sprintf("whisper: chunk %d of %d", i+1, len(chunks)),
+			"path", id.VideoPath, "start", c.extract.Start)
+
+		segments, err := p.transcribeChunk(ctx, id, c, total)
+		if err != nil {
+			return nil, fmt.Errorf("whisper: chunk %d of %d: %w", i+1, len(chunks), err)
+		}
+
+		segments = trim(segments, c.keepFrom, c.keepUntil)
+		if c.keepFrom > -unbounded {
+			segments = dropRepeatedSeam(transcript, segments)
+		}
+		transcript = append(transcript, segments...)
 	}
 
-	srt := formatSRT(shapeCues(segments))
+	srt := formatSRT(shapeCues(transcript))
 	if len(srt) == 0 {
 		return nil, errors.New("whisper: transcript contains no speech")
 	}
 	return srt, nil
+}
+
+// transcribeChunk extracts one chunk's audio and returns its segments with
+// timestamps on the whole video's timeline.
+func (p *Provider) transcribeChunk(ctx context.Context, id candidateID, c chunk, total time.Duration) ([]segment, error) {
+	audio, err := p.audio.Extract(ctx, id.VideoPath, id.StreamIndex, c.extract)
+	if err != nil {
+		return nil, fmt.Errorf("extracting audio: %w", err)
+	}
+
+	segments, err := p.transcribe(ctx, audio, id.Language, c.timeout(total))
+	if err != nil {
+		return nil, fmt.Errorf("transcribing: %w", err)
+	}
+
+	for i := range segments {
+		segments[i] = segments[i].offset(c.extract.Start)
+	}
+	return segments, nil
 }

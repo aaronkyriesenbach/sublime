@@ -67,6 +67,22 @@ type Range struct {
 	Duration time.Duration
 }
 
+// Silence is a stretch of a stream's timeline with no audible sound.
+type Silence struct {
+	Start time.Duration
+	End   time.Duration
+}
+
+// Mid is the point halfway through the silence, the safest place to cut.
+func (s Silence) Mid() time.Duration {
+	return s.Start + (s.End-s.Start)/2
+}
+
+// Length is how long the silence lasts.
+func (s Silence) Length() time.Duration {
+	return s.End - s.Start
+}
+
 // Source reads a video's audio streams. The real implementation shells out
 // to ffprobe/ffmpeg; FakeSource substitutes for it in tests.
 type Source interface {
@@ -77,6 +93,12 @@ type Source interface {
 	// Duration returns the length of the video's container, which bounds
 	// the ranges Extract can serve.
 	Duration(ctx context.Context, videoPath string) (time.Duration, error)
+
+	// Silences lists, in timeline order, the silent stretches of the audio
+	// stream at streamIndex. It decodes the whole stream but keeps nothing
+	// on disk. It returns ErrNoAudioStream if the video has no stream at
+	// streamIndex.
+	Silences(ctx context.Context, videoPath string, streamIndex int) ([]Silence, error)
 
 	// Extract returns the given range of the audio stream at streamIndex
 	// as a WAV file: 16 kHz, mono, 16-bit PCM. The audio is decoded

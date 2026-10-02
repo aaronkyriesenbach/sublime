@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/aaronkyriesenbach/sublime/internal/config"
 	"github.com/aaronkyriesenbach/sublime/internal/domain"
@@ -683,5 +684,59 @@ providers:
 
 	if _, err := config.Load(path); err != nil {
 		t.Fatalf("Load returned error: %v", err)
+	}
+}
+
+func whisperConfigWith(t *testing.T, settings string) (*config.Config, error) {
+	t.Helper()
+	return config.Load(writeConfig(t, `
+libraries:
+  - name: movies
+    path: /media/movies
+    languages: [en]
+providers:
+  chain: [whisper]
+  whisper:
+    endpoint: http://whisper:8080
+`+settings))
+}
+
+func TestLoad_WhisperChunkLengthDefaultsToTenMinutes(t *testing.T) {
+	cfg, err := whisperConfigWith(t, "")
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if got := cfg.ProviderChain[0].ChunkLength; got != 10*time.Minute {
+		t.Errorf("ChunkLength = %v, want 10m", got)
+	}
+}
+
+func TestLoad_WhisperChunkLengthIsConfigurable(t *testing.T) {
+	cfg, err := whisperConfigWith(t, "    chunk_length: 5m30s\n")
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if got := cfg.ProviderTiers[0].Providers[0].ChunkLength; got != 5*time.Minute+30*time.Second {
+		t.Errorf("ChunkLength = %v, want 5m30s", got)
+	}
+}
+
+func TestLoad_WhisperChunkLengthMustBePositive(t *testing.T) {
+	for _, value := range []string{"0s", "-5m"} {
+		t.Run(value, func(t *testing.T) {
+			_, err := whisperConfigWith(t, "    chunk_length: "+value+"\n")
+			if err == nil || !strings.Contains(err.Error(), "chunk_length") {
+				t.Fatalf("Load error = %v, want one rejecting chunk_length", err)
+			}
+		})
+	}
+}
+
+func TestLoad_WhisperChunkLengthMustBeADuration(t *testing.T) {
+	// A bare number has no unit, so it is rejected rather than guessed at.
+	for _, value := range []string{"ten minutes", "600"} {
+		if _, err := whisperConfigWith(t, "    chunk_length: "+value+"\n"); err == nil {
+			t.Errorf("Load accepted chunk_length %q", value)
+		}
 	}
 }

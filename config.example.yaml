@@ -53,3 +53,5 @@ providers:
   # whisper:
   #   endpoint: http://whisper:8080 # required
   #   worker_count: 1 # default; the sidecar serves one request at a time
+  #   chunk_length: 10m # default; audio is transcribed in chunks about this
+  #   long, cut at silence. Use a shorter value on a slow CPU. Must be positive.
