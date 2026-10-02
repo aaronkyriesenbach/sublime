@@ -18,6 +18,7 @@ import (
 	"golang.org/x/text/language"
 
 	"github.com/aaronkyriesenbach/sublime/internal/domain"
+	"github.com/aaronkyriesenbach/sublime/internal/langcode"
 )
 
 // SubtitleStream describes one embedded subtitle stream found by ffprobe.
@@ -103,7 +104,7 @@ func (s *FFStripper) StripEmbedded(ctx context.Context, videoPath string, scope 
 
 	var drop []int
 	for _, st := range streams {
-		if scope == domain.StripScopePerLanguage && !MatchesISO6392(st.Language, lang) {
+		if scope == domain.StripScopePerLanguage && !langcode.MatchesISO6392(st.Language, lang) {
 			continue
 		}
 		drop = append(drop, st.Index)

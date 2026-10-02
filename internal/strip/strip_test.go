@@ -6,10 +6,21 @@ import (
 	"path/filepath"
 	"testing"
 
+	"golang.org/x/text/language"
+
 	"github.com/aaronkyriesenbach/sublime/internal/domain"
 	"github.com/aaronkyriesenbach/sublime/internal/media"
 	"github.com/aaronkyriesenbach/sublime/internal/strip"
 )
+
+func mustLang(t *testing.T, tag string) language.Tag {
+	t.Helper()
+	parsed, err := language.Parse(tag)
+	if err != nil {
+		t.Fatalf("parsing language tag %q: %v", tag, err)
+	}
+	return parsed
+}
 
 func TestSwap_WritesNewSidecarAndRemovesForeignSidecar(t *testing.T) {
 	dir := t.TempDir()
