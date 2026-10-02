@@ -3,6 +3,7 @@ package config_test
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/aaronkyriesenbach/sublime/internal/config"
@@ -542,5 +543,145 @@ providers:
 	_, err := config.Load(path)
 	if err == nil {
 		t.Fatal("expected an error for an unrecognized key inside a provider block, got nil")
+	}
+}
+
+func TestLoad_WhisperBareInChainWithEndpointDefaultsToOneWorker(t *testing.T) {
+	path := writeConfig(t, `
+libraries:
+  - name: movies
+    path: /media/movies
+    languages: [en]
+providers:
+  chain: [whisper]
+  whisper:
+    endpoint: http://whisper:8080
+`)
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+
+	if len(cfg.ProviderChain) != 1 || cfg.ProviderChain[0].Name != "whisper" {
+		t.Fatalf("ProviderChain = %+v, want a single whisper entry", cfg.ProviderChain)
+	}
+	got := cfg.ProviderChain[0]
+	if got.Endpoint != "http://whisper:8080" {
+		t.Errorf("Endpoint = %q, want %q", got.Endpoint, "http://whisper:8080")
+	}
+	if got.WorkerCount != 1 {
+		t.Errorf("WorkerCount = %d, want default 1", got.WorkerCount)
+	}
+}
+
+func TestLoad_WhisperWorkerCountOverridesDefault(t *testing.T) {
+	path := writeConfig(t, `
+libraries:
+  - name: movies
+    path: /media/movies
+    languages: [en]
+providers:
+  chain: [whisper]
+  whisper:
+    endpoint: http://whisper:8080
+    worker_count: 3
+`)
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if got := cfg.ProviderChain[0].WorkerCount; got != 3 {
+		t.Errorf("WorkerCount = %d, want 3", got)
+	}
+}
+
+func TestLoad_WhisperInsideTierWithOnlineProvider(t *testing.T) {
+	path := writeConfig(t, `
+libraries:
+  - name: movies
+    path: /media/movies
+    languages: [en]
+providers:
+  chain: [[whisper, opensubtitles]]
+  whisper:
+    endpoint: http://whisper:8080
+`)
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if len(cfg.ProviderTiers) != 1 || len(cfg.ProviderTiers[0].Providers) != 2 {
+		t.Fatalf("ProviderTiers = %+v, want one tier of two providers", cfg.ProviderTiers)
+	}
+	whisper := cfg.ProviderTiers[0].Providers[0]
+	if whisper.Name != "whisper" || whisper.Endpoint != "http://whisper:8080" || whisper.WorkerCount != 1 {
+		t.Errorf("tier whisper entry = %+v, want endpoint set and worker count 1", whisper)
+	}
+	if online := cfg.ProviderTiers[0].Providers[1]; online.Endpoint != "" || online.WorkerCount != 0 {
+		t.Errorf("tier opensubtitles entry = %+v, want whisper defaults not applied", online)
+	}
+}
+
+func TestLoad_WhisperEndpointIsRequired(t *testing.T) {
+	for name, providers := range map[string]string{
+		"no settings block": "chain: [whisper]",
+		"empty block":       "chain: [whisper]\n  whisper:\n    worker_count: 2",
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := writeConfig(t, `
+libraries:
+  - name: movies
+    path: /media/movies
+    languages: [en]
+providers:
+  `+providers+"\n")
+
+			_, err := config.Load(path)
+			if err == nil || !strings.Contains(err.Error(), "endpoint") {
+				t.Fatalf("Load error = %v, want one mentioning the missing endpoint", err)
+			}
+		})
+	}
+}
+
+func TestLoad_WhisperEndpointMustBeAURL(t *testing.T) {
+	for _, endpoint := range []string{"whisper:8080", "not a url", "ftp://whisper", "http://"} {
+		t.Run(endpoint, func(t *testing.T) {
+			path := writeConfig(t, `
+libraries:
+  - name: movies
+    path: /media/movies
+    languages: [en]
+providers:
+  chain: [whisper]
+  whisper:
+    endpoint: "`+endpoint+`"
+`)
+
+			_, err := config.Load(path)
+			if err == nil || !strings.Contains(err.Error(), "endpoint") {
+				t.Fatalf("Load error = %v, want one rejecting the endpoint", err)
+			}
+		})
+	}
+}
+
+func TestLoad_WhisperSettingsIgnoredWhenNotInChain(t *testing.T) {
+	path := writeConfig(t, `
+libraries:
+  - name: movies
+    path: /media/movies
+    languages: [en]
+providers:
+  chain: [opensubtitles]
+  whisper:
+    worker_count: 2
+`)
+
+	if _, err := config.Load(path); err != nil {
+		t.Fatalf("Load returned error: %v", err)
 	}
 }

@@ -1,0 +1,44 @@
+{
+  "task": "transcribe",
+  "language": "en",
+  "duration": 7.2,
+  "text": " Hello there. General Kenobi!",
+  "segments": [
+    {
+      "id": 0,
+      "text": " Hello there.",
+      "start": 0.5,
+      "end": 2.25,
+      "tokens": [50364, 2425, 456, 13],
+      "temperature": 0.0,
+      "avg_logprob": -0.21,
+      "no_speech_prob": 0.01,
+      "words": [
+        {"word": " Hello", "start": 0.5, "end": 1.1, "probability": 0.98, "t_dtw": -1},
+        {"word": " there.", "start": 1.1, "end": 2.25, "probability": 0.97, "t_dtw": -1}
+      ]
+    },
+    {
+      "id": 1,
+      "text": "  General Kenobi!",
+      "start": 3.0,
+      "end": 3661.789,
+      "tokens": [50364, 3980, 591, 268, 18795, 0],
+      "temperature": 0.0,
+      "avg_logprob": -0.18,
+      "no_speech_prob": 0.02,
+      "words": []
+    },
+    {
+      "id": 2,
+      "text": "   ",
+      "start": 3662.0,
+      "end": 3663.0,
+      "tokens": [],
+      "temperature": 0.0,
+      "avg_logprob": -0.9,
+      "no_speech_prob": 0.8,
+      "words": []
+    }
+  ]
+}
