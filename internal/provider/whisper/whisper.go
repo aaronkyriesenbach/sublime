@@ -43,7 +43,7 @@ type Config struct {
 
 	// ChunkLength is the target audio length of each request: a video is
 	// transcribed as a series of chunks about this long, cut at silence.
-	// Zero means 10 minutes; negative is rejected.
+	// Required and positive; the default belongs to configuration.
 	ChunkLength time.Duration
 
 	// HTTPClient overrides the client used for sidecar requests; defaults
@@ -72,6 +72,9 @@ type Provider struct {
 
 	chunkLength time.Duration
 
+	// detectionTimeout bounds one language-detection request.
+	detectionTimeout time.Duration
+
 	mu sync.Mutex
 	// suspendedUntil is when an Unavailable Suspension ends; zero when the
 	// Provider is not suspended.
@@ -91,12 +94,8 @@ func New(cfg Config) (*Provider, error) {
 	if cfg.Audio == nil {
 		return nil, errors.New("whisper: Config.Audio is required")
 	}
-	if cfg.ChunkLength < 0 {
-		return nil, fmt.Errorf("whisper: Config.ChunkLength cannot be negative, got %s", cfg.ChunkLength)
-	}
-	chunkLength := cfg.ChunkLength
-	if chunkLength == 0 {
-		chunkLength = defaultChunkLength
+	if cfg.ChunkLength <= 0 {
+		return nil, fmt.Errorf("whisper: Config.ChunkLength must be positive, got %s", cfg.ChunkLength)
 	}
 	endpoint, err := url.Parse(cfg.Endpoint)
 	if err != nil {
@@ -114,21 +113,19 @@ func New(cfg Config) (*Provider, error) {
 	if now == nil {
 		now = time.Now
 	}
-	return &Provider{
-		client:      &client{baseURL: strings.TrimRight(endpoint.String(), "/"), httpClient: httpClient},
-		audio:       cfg.Audio,
-		log:         cfg.Logger,
-		executor:    retry.NewExecutor(clock),
-		now:         now,
-		chunkLength: chunkLength,
-	}, nil
-}
-
-func (p *Provider) logger() *slog.Logger {
-	if p.log != nil {
-		return p.log
+	log := cfg.Logger
+	if log == nil {
+		log = slog.Default()
 	}
-	return slog.Default()
+	return &Provider{
+		client:           &client{baseURL: strings.TrimRight(endpoint.String(), "/"), httpClient: httpClient},
+		audio:            cfg.Audio,
+		log:              log,
+		executor:         retry.NewExecutor(clock),
+		now:              now,
+		chunkLength:      cfg.ChunkLength,
+		detectionTimeout: detectionTimeout,
+	}, nil
 }
 
 // NeverSynced reports that a Generated Subtitle is never Synced: its timing
@@ -153,6 +150,11 @@ type candidateID struct {
 // detecting the language of an untagged stream: long enough for a reliable
 // guess, short enough to stay cheap.
 const detectionClipLength = 30 * time.Second
+
+// detectionTimeout bounds one detection request. The sidecar serializes
+// inference, so a request queued behind a long transcription can wait, but
+// a sidecar that never answers must not hold a worker until shutdown.
+const detectionTimeout = 3 * time.Minute
 
 // Search decides eligibility from the video's audio. The first stream
 // tagged with query.Language's base language yields exactly one hash-match
@@ -191,13 +193,13 @@ func (p *Provider) Search(ctx context.Context, query provider.Query) ([]domain.C
 		if detectedMatches(detected, base) {
 			return p.candidateFor(query, stream, target)
 		}
-		p.logger().Info("whisper: no candidate",
+		p.log.Info("whisper: no candidate",
 			"cause", fmt.Sprintf("detected language is %s, target is %s", detected, target),
 			"path", query.Path, "language", query.Language.String())
 		return nil, nil
 	}
 
-	p.logger().Info("whisper: no candidate",
+	p.log.Info("whisper: no candidate",
 		"cause", missCause(streams, target), "path", query.Path, "language", query.Language.String())
 	return nil, nil
 }
@@ -295,7 +297,7 @@ func (p *Provider) Download(ctx context.Context, candidate domain.Candidate) ([]
 
 	var transcript []segment
 	for i, c := range chunks {
-		p.logger().Info(fmt.Sprintf("whisper: chunk %d of %d", i+1, len(chunks)),
+		p.log.Info(fmt.Sprintf("whisper: chunk %d of %d", i+1, len(chunks)),
 			"path", id.VideoPath, "start", c.extract.Start)
 
 		segments, err := p.transcribeChunk(ctx, id, c, total)
@@ -304,7 +306,7 @@ func (p *Provider) Download(ctx context.Context, candidate domain.Candidate) ([]
 		}
 
 		segments = trim(segments, c.keepFrom, c.keepUntil)
-		if c.keepFrom > -unbounded {
+		if c.keepFrom != nil {
 			segments = dropRepeatedSeam(transcript, segments)
 		}
 		transcript = append(transcript, segments...)
@@ -331,7 +333,7 @@ func (p *Provider) chunkError(id candidateID, index, count int, err error) error
 // miss logs why the Provider could not produce a subtitle and returns the
 // signal that advances the Provider Chain.
 func (p *Provider) miss(id candidateID, cause error) error {
-	p.logger().Info("whisper: no candidate", "cause", cause, "path", id.VideoPath, "language", id.Language)
+	p.log.Info("whisper: no candidate", "cause", cause, "path", id.VideoPath, "language", id.Language)
 	return &provider.MissError{Cause: cause}
 }
 
@@ -347,14 +349,17 @@ func (p *Provider) miss(id candidateID, cause error) error {
 //
 // A chunk that stays empty is accepted as holding no speech: a long film
 // can have a wordless stretch, and a transcript that is empty overall is
-// caught after assembly.
+// caught after assembly. That holds only if no attempt looped: a sidecar
+// that hallucinated and then returned nothing has not shown the chunk to
+// be wordless, and a request failure after a loop is still a hallucinating
+// sidecar's miss.
 func (p *Provider) transcribeChunk(ctx context.Context, id candidateID, c chunk, total time.Duration) ([]segment, error) {
 	audio, err := p.audio.Extract(ctx, id.VideoPath, id.StreamIndex, c.extract)
 	if err != nil {
 		return nil, fmt.Errorf("extracting audio: %w", err)
 	}
 
-	var problem error
+	var problem, looped error
 	requestFailed := false
 	for attempt := range maxChunkAttempts {
 		segments, err := p.transcribe(ctx, audio, id.Language, temperatureFor(attempt), c.timeout(total))
@@ -374,18 +379,24 @@ func (p *Provider) transcribeChunk(ctx context.Context, id candidateID, c chunk,
 			}
 			return segments, nil
 		}
+		if errors.Is(problem, errRepeatedOutput) {
+			looped = problem
+		}
 
-		p.logger().Warn("whisper: chunk output rejected",
+		p.log.Warn("whisper: chunk output rejected",
 			"path", id.VideoPath, "start", c.extract.Start, "attempt", attempt+1, "of", maxChunkAttempts, "cause", problem)
-		// A rejected request is deterministic: raising the temperature
-		// cannot make the sidecar accept it.
-		var rejected *sidecarError
-		if errors.As(problem, &rejected) && rejected.status < 500 {
+		// An answered error is final: a 4xx is deterministic, and a 5xx
+		// has already been retried with backoff, so raising the
+		// temperature would only multiply the requests.
+		var answered *sidecarError
+		if errors.As(problem, &answered) {
 			break
 		}
 	}
 
 	switch {
+	case looped != nil:
+		return nil, &provider.MissError{Cause: looped}
 	case requestFailed:
 		return nil, problem
 	case errors.Is(problem, errEmptyChunk):

@@ -49,10 +49,12 @@ func (p *Provider) transcribe(ctx context.Context, audio []byte, languageCode st
 	})
 }
 
-// detectSidecarLanguage sends a clip to the sidecar for language detection;
-// see requestSidecar for how failures are handled.
+// detectSidecarLanguage sends a clip to the sidecar for language detection,
+// giving each attempt at most detectionTimeout; see requestSidecar for how failures are handled.
 func (p *Provider) detectSidecarLanguage(ctx context.Context, clip []byte) (string, error) {
 	return requestSidecar(ctx, p, func(ctx context.Context) (string, error) {
+		ctx, cancel := context.WithTimeout(ctx, p.detectionTimeout)
+		defer cancel()
 		return p.client.detectLanguage(ctx, clip)
 	})
 }
@@ -95,7 +97,7 @@ func (p *Provider) enterUnavailable(cause error) error {
 	p.unavailable = true
 	p.mu.Unlock()
 
-	p.logger().Warn("whisper: sidecar unreachable; suspending as unavailable", "cause", cause, "resume_at", resumeAt)
+	p.log.Warn("whisper: sidecar unreachable; suspending as unavailable", "cause", cause, "resume_at", resumeAt)
 	return &provider.UnavailableError{ResumeAt: resumeAt, Cause: cause}
 }
 
@@ -107,6 +109,6 @@ func (p *Provider) recoverFromOutage() {
 	p.mu.Unlock()
 
 	if wasUnavailable {
-		p.logger().Info("whisper: sidecar reachable again; leaving unavailable suspension")
+		p.log.Info("whisper: sidecar reachable again; leaving unavailable suspension")
 	}
 }

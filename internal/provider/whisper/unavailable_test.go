@@ -79,12 +79,13 @@ func newOutageFixture(t *testing.T) *outageFixture {
 	*f.now = time.Date(2025, 1, 1, 12, 0, 0, 0, time.UTC)
 
 	p, err := whisper.New(whisper.Config{
-		Endpoint:   f.sidecar.URL,
-		Audio:      &audiosource.FakeSource{Streams: []audiosource.Stream{{Index: 1, Language: "eng"}}},
-		HTTPClient: &http.Client{Transport: f.transport},
-		Logger:     slog.New(slog.NewTextHandler(f.logs, nil)),
-		Clock:      &recordingClock{},
-		Now:        func() time.Time { return *f.now },
+		Endpoint:    f.sidecar.URL,
+		ChunkLength: testChunkLength,
+		Audio:       &audiosource.FakeSource{Streams: []audiosource.Stream{{Index: 1, Language: "eng"}}},
+		HTTPClient:  &http.Client{Transport: f.transport},
+		Logger:      slog.New(slog.NewTextHandler(f.logs, nil)),
+		Clock:       &recordingClock{},
+		Now:         func() time.Time { return *f.now },
 	})
 	if err != nil {
 		t.Fatalf("whisper.New: %v", err)
@@ -125,9 +126,10 @@ func TestDownload_UnreachableSidecarSuspendsAsUnavailable(t *testing.T) {
 func TestDownload_ConnectionRefusedByAStoppedSidecarSuspendsAsUnavailable(t *testing.T) {
 	sidecar := newFakeWhisperServer(t, sampleResponse(t))
 	p, err := whisper.New(whisper.Config{
-		Endpoint: sidecar.URL,
-		Audio:    &audiosource.FakeSource{Streams: []audiosource.Stream{{Index: 1, Language: "eng"}}},
-		Clock:    &recordingClock{},
+		Endpoint:    sidecar.URL,
+		ChunkLength: testChunkLength,
+		Audio:       &audiosource.FakeSource{Streams: []audiosource.Stream{{Index: 1, Language: "eng"}}},
+		Clock:       &recordingClock{},
 	})
 	if err != nil {
 		t.Fatalf("whisper.New: %v", err)
@@ -227,9 +229,10 @@ func TestDownload_ReachableSidecarReturning5xxIsRetriedThenFailsWithoutSuspendin
 	sidecar.status = http.StatusInternalServerError
 	clock := &recordingClock{}
 	p, err := whisper.New(whisper.Config{
-		Endpoint: sidecar.URL,
-		Audio:    &audiosource.FakeSource{Streams: []audiosource.Stream{{Index: 1, Language: "eng"}}},
-		Clock:    clock,
+		Endpoint:    sidecar.URL,
+		ChunkLength: testChunkLength,
+		Audio:       &audiosource.FakeSource{Streams: []audiosource.Stream{{Index: 1, Language: "eng"}}},
+		Clock:       clock,
 	})
 	if err != nil {
 		t.Fatalf("whisper.New: %v", err)
@@ -251,12 +254,13 @@ func TestDownload_ReachableSidecarReturning5xxIsRetriedThenFailsWithoutSuspendin
 	if _, suspended := p.Suspension(); suspended {
 		t.Error("Suspension() = suspended by a reachable sidecar's 5xx, want not suspended")
 	}
-	// Each of the chunk's 3 attempts is the first try plus 3 backed-off retries.
-	if got := len(sidecar.Requests()); got != 12 {
-		t.Errorf("sidecar saw %d requests, want 12", got)
+	// The backed-off retries are the only ones: a 5xx that survived them is
+	// not retried again at chunk level, which would multiply the requests.
+	if got := len(sidecar.Requests()); got != 4 {
+		t.Errorf("sidecar saw %d requests, want 4 (the first try plus 3 backed-off retries)", got)
 	}
-	if got := len(clock.Sleeps()); got != 9 {
-		t.Errorf("backed off %d times, want 9", got)
+	if got := len(clock.Sleeps()); got != 3 {
+		t.Errorf("backed off %d times, want 3", got)
 	}
 }
 

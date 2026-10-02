@@ -7,9 +7,6 @@ import (
 )
 
 const (
-	// defaultChunkLength applies when Config.ChunkLength is left unset.
-	defaultChunkLength = 10 * time.Minute
-
 	// cutWindowFraction sizes the window around the target length in which
 	// a silence is accepted as a cut, as a fraction of the target. Wide
 	// enough that a feature film nearly always offers a pause, narrow
@@ -35,12 +32,11 @@ type chunk struct {
 	extract audiosource.Range
 
 	// keepFrom and keepUntil bound the speech this chunk contributes to the
-	// transcript. They are only bounded at a fixed cut, where neighbouring
-	// chunks hear the same audio; a silence cut has nothing to trim.
-	keepFrom, keepUntil time.Duration
+	// transcript. They are only set at a fixed cut, where neighbouring
+	// chunks hear the same audio; nil means no bound, as a silence cut has
+	// nothing to trim.
+	keepFrom, keepUntil *time.Duration
 }
-
-const unbounded = time.Duration(1<<63 - 1)
 
 // planChunks cuts a video of the given total length into chunks of about
 // target. A cut lands at the silence nearest the target within a window
@@ -50,7 +46,7 @@ const unbounded = time.Duration(1<<63 - 1)
 func planChunks(total, target time.Duration, silences func() ([]audiosource.Silence, error)) ([]chunk, error) {
 	window := target / cutWindowFraction
 	if total <= target+window {
-		return []chunk{{keepFrom: -unbounded, keepUntil: unbounded}}, nil
+		return []chunk{{}}, nil
 	}
 
 	found, err := silences()
@@ -61,23 +57,25 @@ func planChunks(total, target time.Duration, silences func() ([]audiosource.Sile
 	var chunks []chunk
 	start := time.Duration(0)
 	extractStart := time.Duration(0)
-	keepFrom := -unbounded
+	var keepFrom *time.Duration
 	for total-start > target+window {
-		c := chunk{keepFrom: keepFrom, keepUntil: unbounded}
+		c := chunk{keepFrom: keepFrom}
 		if cut, ok := silenceCut(found, start+target-window, start+target+window, start+target); ok {
 			c.extract = audiosource.Range{Start: extractStart, Duration: cut - extractStart}
-			start, extractStart, keepFrom = cut, cut, -unbounded
+			start, extractStart, keepFrom = cut, cut, nil
 		} else {
 			cut := start + target
 			c.extract = audiosource.Range{Start: extractStart, Duration: cut + seamOverlap/2 - extractStart}
-			c.keepUntil = cut + seamSlack
-			start, extractStart, keepFrom = cut, cut-seamOverlap/2, cut-seamSlack
+			keepUntil := cut + seamSlack
+			c.keepUntil = &keepUntil
+			from := cut - seamSlack
+			start, extractStart, keepFrom = cut, cut-seamOverlap/2, &from
 		}
 		chunks = append(chunks, c)
 	}
 	return append(chunks, chunk{
 		extract:  audiosource.Range{Start: extractStart},
-		keepFrom: keepFrom, keepUntil: unbounded,
+		keepFrom: keepFrom,
 	}), nil
 }
 
