@@ -17,15 +17,13 @@ services:
   #   docker compose --profile whisper up -d
   # and point config.yaml at it with `endpoint: http://whisper:8080`.
   # See docs/whisper.md for model choice, GPU image variants and throughput.
-  #
-  # UNVERIFIED until spike #100 completes: the image tag, the whisper-server
-  # entrypoint and flags, and the model file names below are written from
-  # whisper.cpp's documentation and have not been run against a real server.
 
   # One-shot download of the speech model and the VAD (voice activity
   # detection) model into ./whisper-models. Existing files are kept, so
-  # re-running is cheap. To change model, edit MODEL here and the `-m` flag
-  # on the whisper service below.
+  # re-running is cheap. To change model, edit the file name here and the `-m`
+  # flag on the whisper service below. The speech models live in
+  # ggerganov/whisper.cpp; ggml-org/whisper.cpp does not exist. The VAD model
+  # is only read when --vad is enabled below.
   whisper-models:
     profiles: [whisper]
     image: curlimages/curl:8.11.1
@@ -37,13 +35,14 @@ services:
     command:
       - |
         set -e
-        [ -f ggml-small-q5_1.bin ] || curl -fL -o ggml-small-q5_1.bin https://huggingface.co/ggml-org/whisper.cpp/resolve/main/ggml-small-q5_1.bin
+        [ -f ggml-small-q5_1.bin ] || curl -fL -o ggml-small-q5_1.bin https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small-q5_1.bin
         [ -f ggml-silero-v5.1.2.bin ] || curl -fL -o ggml-silero-v5.1.2.bin https://huggingface.co/ggml-org/whisper-vad/resolve/main/ggml-silero-v5.1.2.bin
 
   whisper:
     profiles: [whisper]
     # CPU image. For a GPU, swap the tag and add the device access shown in
     # docs/whisper.md; nothing on the Sublime side changes.
+    # `main` is a moving tag; pin by digest for reproducibility.
     image: ghcr.io/ggml-org/whisper.cpp:main
     entrypoint: ["whisper-server"]
     command:
@@ -53,14 +52,29 @@ services:
       - "8080"
       - -m
       - /models/ggml-small-q5_1.bin
-      # VAD skips silence and music, the main defence against hallucinated
-      # text; --suppress-nst drops non-speech tokens such as [MUSIC].
-      - --vad
-      - --vad-model
-      - /models/ggml-silero-v5.1.2.bin
+      # Defaults to min(4, cores); set it to the cores you can spare. Speed
+      # scales almost linearly to about 4 threads, then flattens.
+      - -t
+      - "4"
+      # Drops non-speech tokens such as [MUSIC].
       - --suppress-nst
+      # Without it a request with no speech (long credits) can fail with 500
+      # when --vad is on.
+      - -nlp
+      # Optional, about 25% faster and fewer repeated-line loops. Uncomment
+      # both lines to enable; see docs/whisper.md.
+      # - --vad
+      # - --vad-model
+      # - /models/ggml-silero-v5.1.2.bin
     volumes:
       - ./whisper-models:/models:ro
+    healthcheck:
+      # 503 while the model loads.
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 20s
     depends_on:
       whisper-models:
         condition: service_completed_successfully
