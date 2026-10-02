@@ -93,7 +93,7 @@ func sampleResponse(t *testing.T) []byte {
 
 func newProvider(t *testing.T, server *fakeWhisperServer, audio audiosource.Source, logOut io.Writer) *whisper.Provider {
 	t.Helper()
-	cfg := whisper.Config{Endpoint: server.URL, Audio: audio}
+	cfg := whisper.Config{Endpoint: server.URL, Audio: audio, Clock: &recordingClock{}}
 	if logOut != nil {
 		cfg.Logger = slog.New(slog.NewTextHandler(logOut, nil))
 	}

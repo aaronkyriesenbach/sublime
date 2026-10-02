@@ -18,10 +18,13 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/aaronkyriesenbach/sublime/internal/audiosource"
 	"github.com/aaronkyriesenbach/sublime/internal/domain"
 	"github.com/aaronkyriesenbach/sublime/internal/provider"
+	"github.com/aaronkyriesenbach/sublime/internal/retry"
 )
 
 // Config configures a Provider.
@@ -38,16 +41,33 @@ type Config struct {
 	// to http.DefaultClient.
 	HTTPClient *http.Client
 
-	// Logger receives the Provider's miss-cause logging; defaults to
-	// slog.Default() if nil.
+	// Logger receives the Provider's miss-cause and Suspension logging;
+	// defaults to slog.Default() if nil.
 	Logger *slog.Logger
+
+	// Clock awaits the backoff between retries of a failing sidecar
+	// request; defaults to retry.RealClock{}. Tests inject a fake.
+	Clock retry.Clock
+
+	// Now overrides the time source for Suspension; defaults to time.Now.
+	Now func() time.Time
 }
 
 // Provider is Sublime's whisper Provider.
 type Provider struct {
-	client *client
-	audio  audiosource.Source
-	log    *slog.Logger
+	client   *client
+	audio    audiosource.Source
+	log      *slog.Logger
+	executor *retry.Executor
+	now      func() time.Time
+
+	mu sync.Mutex
+	// suspendedUntil is when an Unavailable Suspension ends; zero when the
+	// Provider is not suspended.
+	suspendedUntil time.Time
+	// unavailable stays set from the outage until a request is answered
+	// again, which is what clears the Suspension and is logged as recovery.
+	unavailable bool
 }
 
 var _ provider.Provider = (*Provider)(nil)
@@ -68,10 +88,20 @@ func New(cfg Config) (*Provider, error) {
 	if httpClient == nil {
 		httpClient = http.DefaultClient
 	}
+	clock := cfg.Clock
+	if clock == nil {
+		clock = retry.RealClock{}
+	}
+	now := cfg.Now
+	if now == nil {
+		now = time.Now
+	}
 	return &Provider{
-		client: &client{baseURL: strings.TrimRight(endpoint.String(), "/"), httpClient: httpClient},
-		audio:  cfg.Audio,
-		log:    cfg.Logger,
+		client:   &client{baseURL: strings.TrimRight(endpoint.String(), "/"), httpClient: httpClient},
+		audio:    cfg.Audio,
+		log:      cfg.Logger,
+		executor: retry.NewExecutor(clock),
+		now:      now,
 	}, nil
 }
 
@@ -105,6 +135,9 @@ type candidateID struct {
 // one hash-match Candidate, so scoring selects it unconditionally.
 // Otherwise it is an ordinary miss, with the specific cause logged.
 func (p *Provider) Search(ctx context.Context, query provider.Query) ([]domain.Candidate, error) {
+	if err := p.suspendedError(); err != nil {
+		return nil, err
+	}
 	streams, err := p.audio.AudioStreams(ctx, query.Path)
 	if err != nil {
 		return nil, fmt.Errorf("whisper: probing audio streams: %w", err)
@@ -160,12 +193,16 @@ func (p *Provider) Download(ctx context.Context, candidate domain.Candidate) ([]
 		return nil, fmt.Errorf("whisper: candidate ID %q is not a whisper candidate", candidate.ID)
 	}
 
+	if err := p.suspendedError(); err != nil {
+		return nil, err
+	}
+
 	audio, err := p.audio.Extract(ctx, id.VideoPath, id.StreamIndex, audiosource.Range{})
 	if err != nil {
 		return nil, fmt.Errorf("whisper: extracting audio: %w", err)
 	}
 
-	segments, err := p.client.transcribe(ctx, audio, id.Language)
+	segments, err := p.transcribe(ctx, audio, id.Language)
 	if err != nil {
 		return nil, fmt.Errorf("whisper: transcribing: %w", err)
 	}
