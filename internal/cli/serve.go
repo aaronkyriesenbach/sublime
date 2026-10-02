@@ -126,6 +126,16 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 	}
 	defer func() { _ = st.Close() }()
 
+	// No worker can own an In Progress pair this early, so any found were
+	// stranded by a crash or hard kill.
+	recovered, err := st.RecoverInProgress(ctx)
+	if err != nil {
+		return fmt.Errorf("recovering in-progress pairs: %w", err)
+	}
+	if recovered > 0 {
+		logger.Info("reset stale in-progress pairs to pending", "count", recovered)
+	}
+
 	secrets := config.LoadProviderSecrets()
 	p, providerStatuses, tierStatuses, err := pipeline.NewProduction(pipeline.ProductionConfig{
 		Store:         st,

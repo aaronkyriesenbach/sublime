@@ -97,7 +97,9 @@ CREATE TABLE IF NOT EXISTS file_language_states (
 	-- than an ordinary Found/Changed event, so the Dispatcher — which now
 	-- claims and processes this row on its own, asynchronously from the
 	-- Trigger call that reset it — knows to bypass the Marker+Content-Hash
-	-- gate for it. Cleared once the Dispatcher claims the row (MarkInProgress).
+	-- gate for it. Kept across the claim (MarkInProgress) so an interrupted
+	-- forced pair is still forced when claimed again; cleared once the
+	-- cycle ends (MarkSynced, MarkFailed) or a reset starts a new one.
 	force INTEGER NOT NULL DEFAULT 0,
 	-- attempted_providers is a comma-separated set of Provider names
 	-- already tried and missed (no Candidate cleared the scoring cutoff)

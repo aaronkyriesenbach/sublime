@@ -30,7 +30,9 @@ type PendingPair struct {
 
 	// Force means this pair was reset to Pending by a manual reprocess
 	// request (see ResetToPendingForced) and its Marker+Content-Hash gate
-	// must be bypassed for this attempt.
+	// must be bypassed for this attempt. It stays set until the pair ends
+	// the cycle Synced or Failed, so a recovered or interrupted pair is
+	// still forced.
 	Force bool
 }
 

@@ -1633,3 +1633,212 @@ func TestDeleteFile_ScopesByLibraryName(t *testing.T) {
 		t.Errorf("tv library's file wrongly affected: found=%v err=%v, want found=true", found, err)
 	}
 }
+
+func TestRecoverInProgress_ResetsOnlyInProgressRowsToPending(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	en := mustLang(t, "en")
+	pt := mustLang(t, "pt")
+
+	file, err := s.ObserveFileContentHash(ctx, "movies", "/media/movies/a.mkv", "hash-1")
+	if err != nil {
+		t.Fatalf("ObserveFileContentHash returned error: %v", err)
+	}
+	for _, lang := range []language.Tag{en, pt} {
+		if err := s.EnsureLanguage(ctx, file.ID, lang); err != nil {
+			t.Fatalf("EnsureLanguage returned error: %v", err)
+		}
+	}
+	other, err := s.ObserveFileContentHash(ctx, "movies", "/media/movies/b.mkv", "hash-2")
+	if err != nil {
+		t.Fatalf("ObserveFileContentHash returned error: %v", err)
+	}
+	if err := s.EnsureLanguage(ctx, other.ID, en); err != nil {
+		t.Fatalf("EnsureLanguage returned error: %v", err)
+	}
+
+	if err := s.MarkInProgress(ctx, file.ID, en); err != nil {
+		t.Fatalf("MarkInProgress returned error: %v", err)
+	}
+	if err := s.MarkInProgress(ctx, file.ID, pt); err != nil {
+		t.Fatalf("MarkInProgress returned error: %v", err)
+	}
+	if err := s.MarkInProgress(ctx, other.ID, en); err != nil {
+		t.Fatalf("MarkInProgress returned error: %v", err)
+	}
+	if err := s.MarkSynced(ctx, other.ID, other.ContentHash, en); err != nil {
+		t.Fatalf("MarkSynced returned error: %v", err)
+	}
+
+	n, err := s.RecoverInProgress(ctx)
+	if err != nil {
+		t.Fatalf("RecoverInProgress returned error: %v", err)
+	}
+	if n != 2 {
+		t.Errorf("RecoverInProgress = %d, want 2", n)
+	}
+
+	got, _, err := s.GetFile(ctx, "movies", "/media/movies/a.mkv")
+	if err != nil {
+		t.Fatalf("GetFile returned error: %v", err)
+	}
+	for _, state := range got.Languages {
+		if state.Status != domain.StatusPending {
+			t.Errorf("language %s status = %q, want pending", state.Language, state.Status)
+		}
+	}
+	gotOther, _, err := s.GetFile(ctx, "movies", "/media/movies/b.mkv")
+	if err != nil {
+		t.Fatalf("GetFile returned error: %v", err)
+	}
+	if gotOther.Languages[0].Status != domain.StatusSynced {
+		t.Errorf("synced row status = %q, want it untouched", gotOther.Languages[0].Status)
+	}
+
+	again, err := s.RecoverInProgress(ctx)
+	if err != nil {
+		t.Fatalf("second RecoverInProgress returned error: %v", err)
+	}
+	if again != 0 {
+		t.Errorf("second RecoverInProgress = %d, want 0", again)
+	}
+}
+
+func TestRecoverInProgress_KeepsAttemptedProvidersAndForce(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	en := mustLang(t, "en")
+
+	file, err := s.ObserveFileContentHash(ctx, "movies", "/media/movies/a.mkv", "hash-1")
+	if err != nil {
+		t.Fatalf("ObserveFileContentHash returned error: %v", err)
+	}
+	if err := s.EnsureLanguage(ctx, file.ID, en); err != nil {
+		t.Fatalf("EnsureLanguage returned error: %v", err)
+	}
+	if err := s.ResetToPendingForced(ctx, file.ID); err != nil {
+		t.Fatalf("ResetToPendingForced returned error: %v", err)
+	}
+	if err := s.RecordProviderMiss(ctx, file.ID, file.ContentHash, en, "opensubtitles"); err != nil {
+		t.Fatalf("RecordProviderMiss returned error: %v", err)
+	}
+	if err := s.MarkInProgress(ctx, file.ID, en); err != nil {
+		t.Fatalf("MarkInProgress returned error: %v", err)
+	}
+
+	if _, err := s.RecoverInProgress(ctx); err != nil {
+		t.Fatalf("RecoverInProgress returned error: %v", err)
+	}
+
+	attempted, err := s.AttemptedProviders(ctx, file.ID, en)
+	if err != nil {
+		t.Fatalf("AttemptedProviders returned error: %v", err)
+	}
+	if !slices.Equal(attempted, []string{"opensubtitles"}) {
+		t.Errorf("attempted = %v, want [opensubtitles]", attempted)
+	}
+	pairs, err := s.PendingPairs(ctx)
+	if err != nil {
+		t.Fatalf("PendingPairs returned error: %v", err)
+	}
+	if len(pairs) != 1 || !pairs[0].Force {
+		t.Errorf("PendingPairs = %+v, want one forced pair", pairs)
+	}
+}
+
+func TestMarkInProgress_KeepsForceUntilCycleEnds(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	en := mustLang(t, "en")
+
+	file, err := s.ObserveFileContentHash(ctx, "movies", "/media/movies/a.mkv", "hash-1")
+	if err != nil {
+		t.Fatalf("ObserveFileContentHash returned error: %v", err)
+	}
+	if err := s.EnsureLanguage(ctx, file.ID, en); err != nil {
+		t.Fatalf("EnsureLanguage returned error: %v", err)
+	}
+	if err := s.ResetToPendingForced(ctx, file.ID); err != nil {
+		t.Fatalf("ResetToPendingForced returned error: %v", err)
+	}
+	if err := s.MarkInProgress(ctx, file.ID, en); err != nil {
+		t.Fatalf("MarkInProgress returned error: %v", err)
+	}
+
+	// An interrupted attempt gives its claim back; it must still be forced.
+	requeued, err := s.RequeueInProgress(ctx, file.ID, en)
+	if err != nil {
+		t.Fatalf("RequeueInProgress returned error: %v", err)
+	}
+	if !requeued {
+		t.Fatal("RequeueInProgress = false, want true for an In Progress row")
+	}
+	pairs, err := s.PendingPairs(ctx)
+	if err != nil {
+		t.Fatalf("PendingPairs returned error: %v", err)
+	}
+	if len(pairs) != 1 || !pairs[0].Force {
+		t.Fatalf("PendingPairs = %+v, want one forced pair after requeue", pairs)
+	}
+
+	// Ending the cycle clears force, so a later plain reset isn't forced.
+	for name, end := range map[string]func() error{
+		"MarkSynced": func() error { return s.MarkSynced(ctx, file.ID, file.ContentHash, en) },
+		"MarkFailed": func() error { return s.MarkFailed(ctx, file.ID, file.ContentHash, en, domain.FailureNoCandidate) },
+	} {
+		if err := s.MarkInProgress(ctx, file.ID, en); err != nil && !errors.Is(err, store.ErrClaimLost) {
+			t.Fatalf("%s: MarkInProgress returned error: %v", name, err)
+		}
+		if err := end(); err != nil {
+			t.Fatalf("%s returned error: %v", name, err)
+		}
+		if err := s.ResetLanguageToPending(ctx, file.ID, file.ContentHash, en); err != nil {
+			t.Fatalf("%s: ResetLanguageToPending returned error: %v", name, err)
+		}
+		pairs, err := s.PendingPairs(ctx)
+		if err != nil {
+			t.Fatalf("PendingPairs returned error: %v", err)
+		}
+		if len(pairs) != 1 || pairs[0].Force {
+			t.Errorf("after %s: PendingPairs = %+v, want one non-forced pair", name, pairs)
+		}
+		if err := s.ResetToPendingForced(ctx, file.ID); err != nil {
+			t.Fatalf("ResetToPendingForced returned error: %v", err)
+		}
+	}
+}
+
+func TestRequeueInProgress_LeavesOtherStatusesAlone(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	en := mustLang(t, "en")
+
+	file, err := s.ObserveFileContentHash(ctx, "movies", "/media/movies/a.mkv", "hash-1")
+	if err != nil {
+		t.Fatalf("ObserveFileContentHash returned error: %v", err)
+	}
+	if err := s.EnsureLanguage(ctx, file.ID, en); err != nil {
+		t.Fatalf("EnsureLanguage returned error: %v", err)
+	}
+	if err := s.MarkInProgress(ctx, file.ID, en); err != nil {
+		t.Fatalf("MarkInProgress returned error: %v", err)
+	}
+	if err := s.MarkFailed(ctx, file.ID, file.ContentHash, en, domain.FailureRetrievalFailed); err != nil {
+		t.Fatalf("MarkFailed returned error: %v", err)
+	}
+
+	requeued, err := s.RequeueInProgress(ctx, file.ID, en)
+	if err != nil {
+		t.Fatalf("RequeueInProgress returned error: %v", err)
+	}
+	if requeued {
+		t.Error("RequeueInProgress = true for a Failed row, want false")
+	}
+	got, _, err := s.GetFile(ctx, "movies", "/media/movies/a.mkv")
+	if err != nil {
+		t.Fatalf("GetFile returned error: %v", err)
+	}
+	if got.Languages[0].Status != domain.StatusFailed {
+		t.Errorf("status = %q, want failed", got.Languages[0].Status)
+	}
+}

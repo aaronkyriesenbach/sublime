@@ -580,6 +580,55 @@ func (p *Pipeline) processFile(
 	}
 	p.logStatusChange(ctx, lib, videoPath, lang, domain.StatusPending, domain.StatusInProgress, domain.FailureNone, nil)
 
+	result := p.fetchAndWrite(ctx, lib, file, videoPath, lang, providerName)
+	if ctx.Err() != nil && result.Outcome == OutcomeFailed {
+		return p.requeueInterrupted(ctx, lib, file.ID, videoPath, lang, result)
+	}
+	return result
+}
+
+// requeueInterrupted gives back the claim of a pair whose in-flight work was
+// cut short by ctx's cancellation (graceful shutdown or a Changed event), so
+// it lands Pending and retryable rather than Failed or stuck In Progress.
+// Cancellation surfaces as an arbitrary error from whichever step was
+// running (Provider, Sync, Strip), so it is recognised by ctx itself rather
+// than by error type. The write uses a context detached from ctx's
+// cancellation or it would fail for the same reason the work did. If the
+// pair already left In Progress (an outcome was recorded before the cancel
+// landed), that outcome stands and result is returned unchanged.
+func (p *Pipeline) requeueInterrupted(
+	ctx context.Context,
+	lib domain.Library,
+	fileID int64,
+	videoPath string,
+	lang language.Tag,
+	result ProcessResult,
+) ProcessResult {
+	requeued, err := p.Store.RequeueInProgress(context.WithoutCancel(ctx), fileID, lang)
+	if err != nil {
+		return ProcessResult{Outcome: OutcomeFailed, Err: errors.Join(result.Err, fmt.Errorf("requeueing interrupted pair: %w", err))}
+	}
+	if !requeued {
+		return result
+	}
+	p.logger().Info("work interrupted by cancellation; pair left pending",
+		"library", lib.Name, "path", videoPath, "language", lang.String(), "cause", result.Err)
+	p.logStatusChange(ctx, lib, videoPath, lang, domain.StatusInProgress, domain.StatusPending, domain.FailureNone, nil)
+	return ProcessResult{Outcome: OutcomePending}
+}
+
+// fetchAndWrite runs the claimed pair's Search/Score/Download/Sync/Strip/Swap
+// work and records its outcome. The pair must already be In Progress.
+func (p *Pipeline) fetchAndWrite(
+	ctx context.Context,
+	lib domain.Library,
+	file domain.File,
+	videoPath string,
+	lang language.Tag,
+	providerName string,
+) ProcessResult {
+	hash := media.ContentHash(file.ContentHash)
+
 	query, queryErr := queryFromPath(videoPath, lang)
 	if queryErr != nil {
 		p.logger().Warn("filename metadata unparseable; falling back to hash-only search",
