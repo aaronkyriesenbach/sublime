@@ -10,6 +10,8 @@ import (
 	"mime/multipart"
 	"net/http"
 	"strings"
+
+	"github.com/aaronkyriesenbach/sublime/internal/retry"
 )
 
 // client is the HTTP transport for a whisper.cpp server's /inference
@@ -25,6 +27,17 @@ type segment struct {
 	Start float64 `json:"start"`
 	End   float64 `json:"end"`
 	Text  string  `json:"text"`
+}
+
+// sidecarError is a non-2xx answer from the sidecar. Receiving one proves
+// the sidecar is reachable, so it is a request failure, never an outage.
+type sidecarError struct {
+	status  int
+	message string
+}
+
+func (e *sidecarError) Error() string {
+	return fmt.Sprintf("sidecar returned status %d: %s", e.status, e.message)
 }
 
 // verboseResponse mirrors the parts of whisper.cpp's /inference response
@@ -115,7 +128,11 @@ func (c *client) inference(ctx context.Context, audio []byte, fields map[string]
 	decodeErr := json.Unmarshal(data, &parsed)
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return verboseResponse{}, fmt.Errorf("sidecar returned status %d: %s", resp.StatusCode, parsed.Error)
+		statusErr := &sidecarError{status: resp.StatusCode, message: parsed.Error}
+		if resp.StatusCode >= 500 {
+			return verboseResponse{}, retry.Transient(statusErr)
+		}
+		return verboseResponse{}, statusErr
 	}
 	if decodeErr != nil {
 		return verboseResponse{}, fmt.Errorf("decoding response: %w", decodeErr)
