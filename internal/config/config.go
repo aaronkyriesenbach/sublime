@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"time"
 
 	"golang.org/x/text/language"
 	"gopkg.in/yaml.v3"
@@ -49,6 +50,10 @@ type ProviderConfig struct {
 	// Endpoint is whisper-specific: the base URL of the whisper.cpp
 	// sidecar. It is meaningless for other Providers.
 	Endpoint string
+
+	// ChunkLength is whisper-specific: the target length of each audio
+	// chunk transcribed as one request. It is zero for other Providers.
+	ChunkLength time.Duration
 }
 
 // ProviderTier is a named rank within the Provider Chain, holding one or
@@ -105,10 +110,18 @@ var knownProviderNames = map[string]struct{}{
 // would only queue multi-hour requests behind it.
 const whisperDefaultWorkerCount = 1
 
+// whisperDefaultChunkLength is about as long as a CPU-only sidecar handles
+// comfortably in one request while keeping a hallucination loop confined.
+const whisperDefaultChunkLength = 10 * time.Minute
+
 type rawProviderSettings struct {
 	WorkerCount int    `yaml:"worker_count"`
 	Paid        bool   `yaml:"paid"`
 	Endpoint    string `yaml:"endpoint"`
+
+	// ChunkLength is a pointer so an explicit zero can be told apart from
+	// an absent key and rejected.
+	ChunkLength *time.Duration `yaml:"chunk_length"`
 }
 
 // Load reads, parses, and validates the config file at path.
@@ -217,6 +230,11 @@ func providerChainFromRaw(raw *rawProviders) ([]ProviderConfig, []ProviderTier, 
 				if provider.WorkerCount == 0 {
 					provider.WorkerCount = whisperDefaultWorkerCount
 				}
+				chunkLength, err := whisperChunkLength(settings.ChunkLength)
+				if err != nil {
+					return nil, nil, err
+				}
+				provider.ChunkLength = chunkLength
 			}
 			chain = append(chain, provider)
 			tierProviders = append(tierProviders, provider)
@@ -226,6 +244,18 @@ func providerChainFromRaw(raw *rawProviders) ([]ProviderConfig, []ProviderTier, 
 	}
 
 	return chain, tiers, nil
+}
+
+// whisperChunkLength applies the default for an absent chunk_length and
+// rejects a non-positive one.
+func whisperChunkLength(configured *time.Duration) (time.Duration, error) {
+	if configured == nil {
+		return whisperDefaultChunkLength, nil
+	}
+	if *configured <= 0 {
+		return 0, fmt.Errorf("providers.whisper: chunk_length must be positive, got %s", *configured)
+	}
+	return *configured, nil
 }
 
 // validateWhisperSettings requires an http(s) endpoint with a host, so a
