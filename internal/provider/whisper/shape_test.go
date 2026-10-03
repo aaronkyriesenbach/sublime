@@ -419,3 +419,22 @@ func TestDownload_DropsSegmentsOfOnlyPunctuation(t *testing.T) {
 		t.Errorf("real speech missing from SRT:\n%s", got)
 	}
 }
+
+func TestDownload_DropsBoilerplateHallucinationsButKeepsRealSentences(t *testing.T) {
+	segments := []wireSegment{
+		{Text: " Transcription by CastingWords", Start: 0, End: 3, Words: say(0, 0.5, "Transcription by CastingWords")},
+		{Text: " The End.", Start: 4, End: 6, Words: say(4, 0.5, "The End.")},
+		{Text: " The end of the world is near.", Start: 30, End: 34, Words: say(30, 0.6, "The end of the world is near.")},
+	}
+
+	got := downloadSRT(t, segments)
+
+	for _, junk := range []string{"CastingWords", "The End."} {
+		if strings.Contains(got, junk) {
+			t.Errorf("hallucinated %q kept in SRT:\n%s", junk, got)
+		}
+	}
+	if !strings.Contains(got, "The end of the world is near.") {
+		t.Errorf("real sentence missing from SRT:\n%s", got)
+	}
+}

@@ -65,6 +65,32 @@ func (s segment) isHallucinatedOverSilence() bool {
 	return false
 }
 
+// boilerplateHallucinations are whole-segment phrases the model produces for
+// music, logos and silence because its training data ended that way. Seen on
+// a real library as lone cues at the start of 1 in 10 files.
+var boilerplateHallucinations = map[string]bool{
+	"the end":                             true,
+	"end the":                             true,
+	"the":                                 true,
+	"transcription":                       true,
+	"by castingwords":                     true,
+	"transcription by castingwords":       true,
+	"thanks for watching":                 true,
+	"thank you for watching":              true,
+	"subtitles by the amaraorg community": true,
+}
+
+func (s segment) isBoilerplateHallucination() bool {
+	var words []string
+	for _, u := range s.units() {
+		words = append(words, u.text)
+	}
+	normalized := strings.Join(strings.FieldsFunc(strings.ToLower(strings.Join(words, "")), func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsDigit(r) && r != ' '
+	}), "")
+	return boilerplateHallucinations[strings.Join(strings.Fields(normalized), " ")]
+}
+
 // hasSpokenText is false for a segment of only punctuation, such as the lone
 // "." the model emits for silence at the start of a file.
 func (s segment) hasSpokenText() bool {
@@ -145,7 +171,7 @@ func (c *client) transcribe(ctx context.Context, audio []byte, languageCode stri
 	}
 	kept := parsed.Segments[:0]
 	for _, seg := range parsed.Segments {
-		if seg.isHallucinatedOverSilence() || !seg.hasSpokenText() {
+		if seg.isHallucinatedOverSilence() || !seg.hasSpokenText() || seg.isBoilerplateHallucination() {
 			continue
 		}
 		kept = append(kept, seg.withWordsAtSegmentStart())
