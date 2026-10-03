@@ -369,3 +369,37 @@ func TestDownload_LongTranscriptKeepsEveryCueWithinLimits(t *testing.T) {
 		t.Errorf("got %d cues for %d sentences, want at least one per sentence", len(cues), len(sentences))
 	}
 }
+
+func TestDownload_DropsAConfidentPhraseStretchedOverASilentWindow(t *testing.T) {
+	// whisper turbo fills a whole 30 s window of logos or music with
+	// "The End" and reports it as speech.
+	segments := []wireSegment{
+		{Text: " The End", Start: 0, End: 30, Words: []wireToken{
+			{Word: " The", Start: 0, End: 0.4}, {Word: " End", Start: 12, End: 12.4},
+		}},
+		{Text: " Hello there, general Kenobi.", Start: 40, End: 43, Words: say(40, 0.6, "Hello there, general Kenobi.")},
+		{Text: " Yes.", Start: 44, End: 44.5, Words: say(44, 0.5, "Yes.")},
+	}
+
+	got := downloadSRT(t, segments)
+
+	if strings.Contains(got, "The End") || strings.Contains(got, "\nThe\n") {
+		t.Errorf("hallucinated window kept in SRT:\n%s", got)
+	}
+	for _, want := range []string{"Hello there, general Kenobi.", "Yes."} {
+		if !strings.Contains(got, want) {
+			t.Errorf("real speech %q missing from SRT:\n%s", want, got)
+		}
+	}
+}
+
+func TestDownload_KeepsALongSegmentOfRealSpeech(t *testing.T) {
+	text := "We hold these truths to be self evident that all people are created equal"
+	segments := []wireSegment{{Text: " " + text, Start: 1, End: 14, Words: say(1, 1.0, text)}}
+
+	got := downloadSRT(t, segments)
+
+	if !strings.Contains(got, "We hold these truths") {
+		t.Errorf("long real segment dropped:\n%s", got)
+	}
+}

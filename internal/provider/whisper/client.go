@@ -46,6 +46,29 @@ type token struct {
 // maps segment times back to the original timeline but leaves token times
 // on the shortened one (whisper.cpp#3174), so only the spacing between a
 // segment's tokens can be trusted, not their position.
+// isHallucinatedOverSilence spots the model's habit of filling a whole 30 s
+// window of music or logos with a confident two-word phrase ("The End") whose
+// words it places many seconds apart, and reports as speech with
+// no_speech_prob 0, so that field cannot be used. Real speech does not leave
+// ten seconds of silence inside a few tokens. The gap is measured between word
+// starts so a final word whose end is merely stretched is not mistaken for it.
+func (s segment) isHallucinatedOverSilence() bool {
+	if len(s.units()) >= hallucinationMinTokens {
+		return false
+	}
+	for i := 1; i < len(s.Words); i++ {
+		if s.Words[i].Start-s.Words[i-1].Start > hallucinationMinGap {
+			return true
+		}
+	}
+	return false
+}
+
+const (
+	hallucinationMinGap    = 8.0
+	hallucinationMinTokens = 4
+)
+
 func (s segment) withWordsAtSegmentStart() segment {
 	if len(s.Words) == 0 {
 		return s
@@ -108,10 +131,14 @@ func (c *client) transcribe(ctx context.Context, audio []byte, languageCode stri
 	if err != nil {
 		return nil, err
 	}
-	for i := range parsed.Segments {
-		parsed.Segments[i] = parsed.Segments[i].withWordsAtSegmentStart()
+	kept := parsed.Segments[:0]
+	for _, seg := range parsed.Segments {
+		if seg.isHallucinatedOverSilence() {
+			continue
+		}
+		kept = append(kept, seg.withWordsAtSegmentStart())
 	}
-	return parsed.Segments, nil
+	return kept, nil
 }
 
 // detectLanguage asks the sidecar which language is spoken in a short clip
