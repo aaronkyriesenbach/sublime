@@ -403,3 +403,19 @@ func TestDownload_KeepsALongSegmentOfRealSpeech(t *testing.T) {
 		t.Errorf("long real segment dropped:\n%s", got)
 	}
 }
+
+func TestDownload_DropsSegmentsOfOnlyPunctuation(t *testing.T) {
+	segments := []wireSegment{
+		{Text: " .", Start: 0, End: 2, Words: []wireToken{{Word: " .", Start: 0, End: 2}}},
+		{Text: " It's too risky.", Start: 30, End: 31, Words: say(30, 0.3, "It's too risky.")},
+	}
+
+	got := downloadSRT(t, segments)
+
+	if strings.Contains(got, "\n.\n") {
+		t.Errorf("punctuation-only cue kept in SRT:\n%s", got)
+	}
+	if !strings.Contains(got, "It's too risky.") {
+		t.Errorf("real speech missing from SRT:\n%s", got)
+	}
+}

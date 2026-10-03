@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"unicode"
 
 	"github.com/aaronkyriesenbach/sublime/internal/retry"
 )
@@ -58,6 +59,17 @@ func (s segment) isHallucinatedOverSilence() bool {
 	}
 	for i := 1; i < len(s.Words); i++ {
 		if s.Words[i].Start-s.Words[i-1].Start > hallucinationMinGap {
+			return true
+		}
+	}
+	return false
+}
+
+// hasSpokenText is false for a segment of only punctuation, such as the lone
+// "." the model emits for silence at the start of a file.
+func (s segment) hasSpokenText() bool {
+	for _, u := range s.units() {
+		if strings.IndexFunc(u.text, func(r rune) bool { return unicode.IsLetter(r) || unicode.IsDigit(r) }) >= 0 {
 			return true
 		}
 	}
@@ -133,7 +145,7 @@ func (c *client) transcribe(ctx context.Context, audio []byte, languageCode stri
 	}
 	kept := parsed.Segments[:0]
 	for _, seg := range parsed.Segments {
-		if seg.isHallucinatedOverSilence() {
+		if seg.isHallucinatedOverSilence() || !seg.hasSpokenText() {
 			continue
 		}
 		kept = append(kept, seg.withWordsAtSegmentStart())
