@@ -628,6 +628,26 @@ func (p *Pipeline) requeueInterrupted(
 	return ProcessResult{Outcome: OutcomePending}
 }
 
+// selectCandidate picks the Candidate to download. A Provider that generates
+// its subtitle from the video's own audio offers one hash-match Candidate that
+// needs no identity scoring, so an unparseable filename is not an error for
+// it. Any other Provider's Candidates are scored against the parsed filename,
+// which must therefore parse.
+func (p *Pipeline) selectCandidate(videoPath string, candidates []domain.Candidate) (domain.Candidate, bool, error) {
+	info, parseErr := scoring.Parse(filepath.Base(videoPath))
+	if parseErr != nil {
+		if !p.skipsSync() {
+			return domain.Candidate{}, false, parseErr
+		}
+		if len(candidates) == 0 {
+			return domain.Candidate{}, false, nil
+		}
+		return candidates[0], true, nil
+	}
+	best, ok := scoring.Select(info, candidates)
+	return best, ok, nil
+}
+
 // fetchAndWrite runs the claimed pair's Search/Score/Download/Sync/Strip/Swap
 // work and records its outcome. The pair must already be In Progress.
 func (p *Pipeline) fetchAndWrite(
@@ -661,20 +681,20 @@ func (p *Pipeline) fetchAndWrite(
 	}
 	p.logger().Debug("provider search", "provider", providerName, "library", lib.Name, "path", videoPath, "language", lang.String(), "candidates", len(candidates))
 
-	info, parseErr := scoring.Parse(filepath.Base(videoPath))
-	if parseErr != nil {
-		if markErr := p.markFailed(ctx, lib, videoPath, lang, file.ID, string(hash), domain.FailureInternalError, parseErr); markErr != nil {
-			return ProcessResult{Outcome: OutcomeFailed, Err: errors.Join(parseErr, markErr)}
+	best, ok, failure := p.selectCandidate(videoPath, candidates)
+	if failure != nil {
+		if markErr := p.markFailed(ctx, lib, videoPath, lang, file.ID, string(hash), domain.FailureInternalError, failure); markErr != nil {
+			return ProcessResult{Outcome: OutcomeFailed, Err: errors.Join(failure, markErr)}
 		}
-		return ProcessResult{Outcome: OutcomeFailed, Err: fmt.Errorf("parsing video filename: %w", parseErr)}
+		return ProcessResult{Outcome: OutcomeFailed, Err: fmt.Errorf("parsing video filename: %w", failure)}
 	}
-
-	best, ok := scoring.Select(info, candidates)
 	if !ok {
-		if topMiss, score, cutoff, found := scoring.Best(info, candidates); found {
-			p.logger().Debug("scoring miss", "provider", providerName, "library", lib.Name, "path", videoPath, "language", lang.String(),
-				"top_title", topMiss.Title, "top_year", topMiss.Year, "top_season", topMiss.Season, "top_episode", topMiss.Episode,
-				"score", score, "cutoff", cutoff)
+		if info, parseErr := scoring.Parse(filepath.Base(videoPath)); parseErr == nil {
+			if topMiss, score, cutoff, found := scoring.Best(info, candidates); found {
+				p.logger().Debug("scoring miss", "provider", providerName, "library", lib.Name, "path", videoPath, "language", lang.String(),
+					"top_title", topMiss.Title, "top_year", topMiss.Year, "top_season", topMiss.Season, "top_episode", topMiss.Episode,
+					"score", score, "cutoff", cutoff)
+			}
 		}
 		return p.recordMiss(ctx, lib, file.ID, videoPath, lang, string(hash), providerName, nil)
 	}

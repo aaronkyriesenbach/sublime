@@ -1778,8 +1778,13 @@ type neverSyncedFixture struct {
 
 func newNeverSyncedFixture(t *testing.T, generatesSubtitles bool) *neverSyncedFixture {
 	t.Helper()
+	return newNeverSyncedFixtureNamed(t, generatesSubtitles, "Test.Movie.2024.HDTV.x264-FAKEGROUP")
+}
+
+func newNeverSyncedFixtureNamed(t *testing.T, generatesSubtitles bool, baseName string) *neverSyncedFixture {
+	t.Helper()
 	libDir := t.TempDir()
-	videoPath := filepath.Join(libDir, "Test.Movie.2024.HDTV.x264-FAKEGROUP.mp4")
+	videoPath := filepath.Join(libDir, baseName+".mp4")
 	writeVideoFixture(t, videoPath)
 
 	downloads := new(int)
@@ -1803,7 +1808,7 @@ func newNeverSyncedFixture(t *testing.T, generatesSubtitles bool) *neverSyncedFi
 			StripScope: domain.StripScopeAll,
 		},
 		videoPath: videoPath,
-		sidecar:   filepath.Join(libDir, "Test.Movie.2024.HDTV.x264-FAKEGROUP.en.srt"),
+		sidecar:   filepath.Join(libDir, baseName+".en.srt"),
 		st:        st,
 		engine:    engine,
 		downloads: downloads,
@@ -1853,6 +1858,36 @@ func TestPipeline_NeverSyncedProviderSkipsSyncAndEndsSyncedWithMarker(t *testing
 		t.Errorf("SyncEngine.Calls = %d, want 0 for a never-Synced Provider", len(f.engine.Calls))
 	}
 	f.assertSyncedWithValidMarker(t)
+}
+
+// A generated subtitle depends only on the video's own audio, so a filename
+// the scorer cannot parse (a TV special such as "S10ES") must not fail it.
+func TestPipeline_NeverSyncedProviderIgnoresAnUnparseableFilename(t *testing.T) {
+	f := newNeverSyncedFixtureNamed(t, true, "Some Show - Twice Upon a Time")
+	ctx := context.Background()
+	if _, err := f.pipe.Run(ctx, f.lib); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	dispatchPending(t, ctx, f.pipe, f.st, f.lib)
+
+	f.assertSyncedWithValidMarker(t)
+}
+
+func TestPipeline_OrdinaryProviderStillFailsOnAnUnparseableFilename(t *testing.T) {
+	f := newNeverSyncedFixtureNamed(t, false, "Some Show - Twice Upon a Time")
+	ctx := context.Background()
+	if _, err := f.pipe.Run(ctx, f.lib); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	dispatchPending(t, ctx, f.pipe, f.st, f.lib)
+
+	file, found, err := f.st.GetFile(ctx, f.lib.Name, f.videoPath)
+	if err != nil || !found {
+		t.Fatalf("GetFile found=%v err=%v", found, err)
+	}
+	if got := file.Languages[0]; got.Status != domain.StatusFailed || got.FailureReason != domain.FailureInternalError {
+		t.Errorf("state = %q/%q, want failed/internal_error", got.Status, got.FailureReason)
+	}
 }
 
 func TestPipeline_DownloadMissRecordsProviderTriedAndWritesNothing(t *testing.T) {
